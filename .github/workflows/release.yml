@@ -91,7 +91,9 @@ jobs:
             GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build \
               -trimpath -ldflags "-s -w -X main.version=$VERSION" \
               -o "$out_dir/ormos" .
-            "$out_dir/ormos" --version | grep -Fx "$VERSION"
+            if [ "$goos/$goarch" = "linux/amd64" ]; then
+              "$out_dir/ormos" --version | grep -Fx "$VERSION"
+            fi
             cp README.md LICENSE "$out_dir/"
             tar -C "$out_dir" -czf "dist/$name.tar.gz" ormos README.md LICENSE
           }
