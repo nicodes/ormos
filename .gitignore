@@ -1,0 +1,6 @@
+/ormos
+/dist/
+/.ormos-dev/
+.env
+.env.local
+.DS_Store
