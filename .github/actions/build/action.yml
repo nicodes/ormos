@@ -1,0 +1,108 @@
+name: Build
+description: >
+  Everything a release ships: the binary for every platform, archived, with
+  checksums.
+
+  A composite action rather than a reusable workflow so it runs in the caller's
+  job, under the caller's name — ci / Build, release / Build — rather than as a
+  nested "caller / callee" check.
+
+  Shared by CI and Release so a pull request builds exactly what a release
+  builds, with no switches between them. The only difference is that one of them
+  goes on to publish.
+
+  This replaces two separate copies of the same cross-compile matrix: one in
+  ci.yml that built to /tmp and threw the result away, and one in release.yml
+  that archived it. They listed the same four targets and nothing kept them in
+  step — the CI copy could have gone on passing for a target the release copy
+  had stopped building, or the reverse.
+
+  NOTHING LEAVES THE RUNNER. The archives are left in ./dist. Creating the
+  release is a step the caller writes out, so nothing named "build" can publish
+  as a side effect of being reused — and it has no token to publish with.
+
+  Assumes Go is already set up. See ../test.
+
+inputs:
+  version:
+    description: >
+      What the binary reports for `ormos --version`, baked in with -X.
+
+      Defaults to "dev" rather than being required, because a pull request has
+      no version and should not have to invent one — and "dev" is the honest
+      answer for a binary built from a working tree that may match no tag.
+    required: false
+    default: dev
+
+runs:
+  using: composite
+  steps:
+    - name: Cross-compile
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        rm -rf dist
+        mkdir -p dist
+
+        build() {
+          goos="$1"; goarch="$2"; os_label="$3"; arch_label="$4"
+          name="ormos_${os_label}_${arch_label}"
+          out="dist/$name"
+          mkdir -p "$out"
+          # CGO off so the binary is static and runs on any distro; -trimpath so
+          # the archive does not carry the builder's paths.
+          GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build \
+            -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+            -o "$out/ormos" .
+          cp README.md LICENSE "$out/"
+          tar -C "$out" -czf "dist/$name.tar.gz" ormos README.md LICENSE
+          echo "  $name"
+        }
+
+        build linux  amd64 Linux  x86_64
+        build linux  arm64 Linux  arm64
+        build darwin amd64 Darwin x86_64
+        build darwin arm64 Darwin arm64
+
+        (cd dist && sha256sum -- *.tar.gz > checksums.txt)
+
+    # The archive is what people download, so the check is run against what came
+    # out of the archive rather than against the tree it was built from. Only
+    # the runner's own platform can be executed here; the others are proven to
+    # link by having compiled at all.
+    #
+    # This used to check the binary in the build directory, before it was
+    # tarred. That proves the compiler stamped it, not that the thing published
+    # under this version reports it.
+    - name: The built binary reports its version
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        tmp="$(mktemp -d)"
+        tar -xzf dist/ormos_Linux_x86_64.tar.gz -C "$tmp"
+        got="$("$tmp/ormos" --version)"
+        echo "$got"
+
+        # `ormos --version` prints the bare version and nothing else, so this is
+        # an exact string match rather than a prefix. A requested version must
+        # be reported exactly -- that is a release, and the archive claiming a
+        # different version than the tag is the whole failure this guards.
+        #
+        # The default is not checked against the literal "dev". main.go falls
+        # back to the module version in its build info when nothing was baked
+        # in, so a pull request can legitimately report a pseudo-version.
+        # Asserting "dev" here would be the check being wrong rather than the
+        # binary.
+        if [ "$VERSION" != "dev" ]; then
+          if [ "$got" != "$VERSION" ]; then
+            echo "::error::built binary reports '$got', expected '$VERSION'"
+            exit 1
+          fi
+        elif [ -z "$got" ]; then
+          echo "::error::built binary reported no version at all"
+          exit 1
+        fi

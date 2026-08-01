@@ -1,9 +1,23 @@
 name: ci
 
+# Every push and pull request: build, then test, on one runner.
+#
+# Nothing is published, so a green CI means one thing — this commit is good.
+#
+# One job, because a job is a machine: two would each pay their own checkout and
+# their own toolchain to split one green tick in two. The phases are separate
+# STEPS, so the log still shows which is which and a failure still says so.
+#
+# The steps are .github/actions/*, the same ones Release runs. There is one
+# definition of each, and it is the one guarding a release; two would drift in a
+# single direction, with the release-side copy trimmed for speed until it no
+# longer matched what people trust on a pull request.
+
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,30 +27,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  ci:
     runs-on: ubuntu-latest
+    # Bounded, so a step that hangs fails here rather than sitting until the
+    # runner's own timeout hours later.
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      # Third-party actions are pinned by SHA, with the tag in a trailing
+      # comment so the version is still readable. A tag is a moving reference:
+      # whoever can move it can run code in this job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
+          # Read from go.mod rather than pinned here, so the version lives in
+          # one place and a bump cannot leave CI testing the old one.
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Formatting
-        run: test -z "$(gofmt -l .)"
-
-      - name: Vet
-        run: go vet ./...
+      # Built first: a compile error should fail before a test suite spends
+      # minutes reaching the same conclusion more slowly.
+      - name: Build
+        uses: ./.github/actions/build
 
       - name: Test
-        run: go test -race -count=1 ./...
-
-      - name: Cross-build supported targets
-        run: |
-          set -euo pipefail
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            goos="${target%/*}"
-            goarch="${target#*/}"
-            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-              go build -trimpath -o /tmp/ormos-"$goos"-"$goarch" .
-          done
+        uses: ./.github/actions/test

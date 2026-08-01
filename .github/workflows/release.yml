@@ -1,4 +1,13 @@
-name: Release
+name: release
+
+# Cut a release: bump the tag, cross-compile, publish archives with checksums
+# and build provenance.
+#
+# The tag is a PLAIN v0.0.1, not a prefixed one. This repository is the Go
+# module, so `go install github.com/nicodes/ormos@v0.0.2` only resolves if the
+# tag is exactly that. A prefixed tag would publish a release nobody could
+# install by version, and `@latest` would go on resolving to a pseudo-version of
+# whatever main happened to be.
 
 on:
   workflow_dispatch:
@@ -19,13 +28,18 @@ concurrency: release-${{ github.repository }}
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Bounded, so a step that hangs fails here rather than sitting until the
+    # runner's own timeout hours later.
+    timeout-minutes: 20
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: write # create the tag and the release
+      id-token: write # OIDC identity for build provenance
+      attestations: write # record the provenance attestation
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # The version arithmetic below reads the tag history. A shallow clone
+          # does not have it.
           fetch-depth: 0
 
       - name: Determine release version
@@ -41,12 +55,11 @@ jobs:
           git fetch --tags --force
           latest="$(git tag --list 'v[0-9]*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
           if [ -z "$latest" ]; then
-            case "$BUMP" in
-              major) version="1.0.0" ;;
-              minor) version="0.1.0" ;;
-              patch) version="0.0.1" ;;
-              *) echo "Unsupported bump: $BUMP" >&2; exit 1 ;;
-            esac
+            # The first release is 0.0.1 whatever was asked for. Under 0.x a
+            # minor claims a milestone that has not happened, and a first
+            # release is not the place to claim one. The bump choice starts
+            # mattering once there is a tag to bump.
+            version="0.0.1"
           else
             IFS=. read -r major minor patch <<< "$latest"
             case "$BUMP" in
@@ -65,51 +78,37 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
+      # The same steps CI runs, from the same definition. Running them again
+      # against this exact commit is not redundant: CI passing on this SHA
+      # earlier is a claim about that run, and a release is the artefact people
+      # actually execute.
+      #
+      # Build before Test, as everywhere else. It costs a cross-compile of four
+      # platforms on a release whose tests then fail -- and buys one ordering
+      # with no exceptions to remember.
+      - name: Build
+        uses: ./.github/actions/build
+        with:
+          version: ${{ steps.release.outputs.version }}
+
       - name: Test
-        run: go test -race -count=1 ./...
+        uses: ./.github/actions/test
 
-      - name: Build release artifacts
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-
-          build() {
-            goos="$1"
-            goarch="$2"
-            os_label="$3"
-            arch_label="$4"
-            name="ormos_${os_label}_${arch_label}"
-            out_dir="dist/$name"
-            mkdir -p "$out_dir"
-            GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build \
-              -trimpath -ldflags "-s -w -X main.version=$VERSION" \
-              -o "$out_dir/ormos" .
-            if [ "$goos/$goarch" = "linux/amd64" ]; then
-              "$out_dir/ormos" --version | grep -Fx "$VERSION"
-            fi
-            cp README.md LICENSE "$out_dir/"
-            tar -C "$out_dir" -czf "dist/$name.tar.gz" ormos README.md LICENSE
-          }
-
-          build linux  amd64 Linux  x86_64
-          build linux  arm64 Linux  arm64
-          build darwin amd64 Darwin x86_64
-          build darwin arm64 Darwin arm64
-          (cd dist && sha256sum -- *.tar.gz > checksums.txt)
-
+      # checksums.txt only says the archives match a file uploaded by whoever
+      # uploaded them; provenance ties them to this workflow, this repository
+      # and this commit, and `gh attestation verify` checks that against a
+      # public transparency log.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/*.tar.gz
 
-      - name: Create GitHub release
+      - name: Create the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.release.outputs.tag }}
@@ -118,10 +117,17 @@ jobs:
           cat > dist/notes.md <<NOTES
           ormos $TAG
 
-          Verify the download before running it — this binary accepts remote
-          instructions to open shells on your machine:
+          \`\`\`sh
+          go install github.com/nicodes/ormos@$TAG
+          \`\`\`
 
-              gh attestation verify ormos_Linux_x86_64.tar.gz --repo $GITHUB_REPOSITORY
+          Or take an archive below. Verify the download before running it —
+          this binary accepts remote instructions to open shells on your
+          machine:
+
+          \`\`\`sh
+          gh attestation verify ormos_Linux_x86_64.tar.gz --repo $GITHUB_REPOSITORY
+          \`\`\`
           NOTES
           gh release create "$TAG" dist/*.tar.gz dist/checksums.txt \
             --target "$GITHUB_SHA" --title "$TAG" --notes-file dist/notes.md
