@@ -1,4 +1,4 @@
-name: ci
+name: CI
 
 # Every push and pull request: build, then test, on one runner.
 #
