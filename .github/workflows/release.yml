@@ -1,4 +1,4 @@
-name: release
+name: Release
 
 # Cut a release: bump the tag, cross-compile, publish archives with checksums
 # and build provenance.
