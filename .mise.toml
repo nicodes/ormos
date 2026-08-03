@@ -1,0 +1,13 @@
+[tools]
+# Must be >= the `go` directive in go.mod, which is currently 1.25.0.
+#
+# CI used to read the version straight out of go.mod via setup-go, so there was
+# only ever one place for it to live. Moving to mise makes the toolchain
+# consistent across the fleet but creates a second place -- and a pin that
+# silently disagrees with go.mod is not hypothetical here: astry ran 1.24.5
+# against a go.mod asking for 1.25, and it built only because GOTOOLCHAIN=auto
+# downloaded the real one behind the pin, so the pin described nothing.
+#
+# The "Toolchain pins agree" step in ci.yml is what stops that happening again.
+# If you bump go.mod, bump this too; CI will tell you if you forget.
+go = "1.25.0"
