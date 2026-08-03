@@ -36,7 +36,7 @@ jobs:
       id-token: write # OIDC identity for build provenance
       attestations: write # record the provenance attestation
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The version arithmetic below reads the tag history. A shallow clone
           # does not have it.
@@ -132,7 +132,7 @@ jobs:
       # and this commit, and `gh attestation verify` checks that against a
       # public transparency log.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: dist/*.tar.gz
 
