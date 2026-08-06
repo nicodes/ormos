@@ -6,6 +6,7 @@ package system
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -52,18 +53,18 @@ usage:
   ormos --version          print the version
 
 Just run ormos. If this machine isn't registered yet (or its credentials were
-revoked by forgetting it in the UI), you'll be prompted for your account
-email/password to register it, and then it starts. The dashboard appears when
-stdout is a terminal; otherwise it runs headless.
+revoked by forgetting it in the UI), it shows a short pairing code — approve it
+in the web app and the system starts. The dashboard appears when stdout is a
+terminal; otherwise it runs headless.
 
 environment:
   ORMOS_API_URL  ws base URL of the ormos API (default wss://api.ormos.dev)
   SHELL          shell for spawned terminals (default /bin/bash)
 
-Your email and password are typed in at the prompt and nowhere else — there is
-no flag and no environment variable for them. Arguments are readable by any
-local user via /proc and land in shell history; environment variables are
-inherited by every child process and tend to end up in dotfiles.
+Pairing never asks for a password in this terminal: the relay issues a
+short-lived code and a human approves it in the web app, so there is no flag
+and no environment variable for credentials — and nothing sensitive to leak
+through /proc, shell history, or child processes.
 
 --config points at the login config file, default ~/.config/ormos/config.json.
 policy.json and sessions.log live beside it, so a second config keeps a machine's
@@ -91,14 +92,24 @@ func runSystem() {
 		}
 	}
 
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
 	// Log in on demand: when there is no saved token, or the saved one was
-	// revoked (system forgotten in the UI).
+	// revoked (system forgotten in the UI). Pairing is a device-authorization
+	// flow — a code approved in the web app — so no credentials are ever typed
+	// here: never arguments (world-readable via /proc/<pid>/cmdline, and they
+	// land in shell history) and never the environment (inherited by every
+	// child, and it lives in dotfiles).
 	if cfg.PairingToken == "" || !tokenValid(cfg.RelayURL, cfg.PairingToken) {
-		// Credentials are always typed in: never arguments (world-readable via
-		// /proc/<pid>/cmdline, and they land in shell history) and never the
-		// environment (inherited by every child, and it lives in dotfiles).
-		li, err := performLogin(cfg.RelayURL)
+		li, err := performLogin(ctx, cfg.RelayURL)
 		if err != nil {
+			// The user walking away from the pairing screen is not a failure:
+			// say so plainly and exit with the conventional 128+SIGINT.
+			if errors.Is(err, errLoginCancelled) {
+				fmt.Fprintln(os.Stderr, "pairing cancelled")
+				os.Exit(130)
+			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
@@ -111,9 +122,6 @@ func runSystem() {
 		fmt.Fprintln(os.Stderr, "error: no pairing token")
 		os.Exit(1)
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	d := newSystem(cfg)
 	d.setCancel(cancel) // let the relay request a graceful shutdown (UI Stop/Forget)
