@@ -147,6 +147,119 @@ func TestDeviceLoginExpiredRestarts(t *testing.T) {
 	}
 }
 
+// A code the relay never expires but lets run past its expires_in lifetime is
+// treated as expired: the flow restarts with a fresh code.
+func TestDeviceLoginDeadlineExpiryRestarts(t *testing.T) {
+	f := &fakeDeviceRelay{
+		start: func(n int32) relay.DeviceStartResponse {
+			if n == 1 {
+				s := startResponse("SHORT-LIVED", "dev-short")
+				s.ExpiresIn = 1 // deadline passes while the relay says pending
+				return s
+			}
+			return startResponse("FRESH-CODE", "dev-fresh")
+		},
+		poll: func(deviceCode string, n int32, w http.ResponseWriter, r *http.Request) relay.DevicePollResponse {
+			if deviceCode == "dev-short" {
+				return relay.DevicePollResponse{Status: relay.DeviceStatusPending}
+			}
+			return relay.DevicePollResponse{
+				Status:            relay.DeviceStatusApproved,
+				ProvisionResponse: relay.ProvisionResponse{SystemID: "sys4", Token: "tok-4", Name: "System 4"},
+			}
+		},
+	}
+	newFakeDeviceRelay(t, f)
+
+	var restarts atomic.Int32
+	out, err := runDeviceLogin(context.Background(), f.srv.URL,
+		relay.DeviceStartRequest{ClientID: "c", Hostname: "h"},
+		func(s relay.DeviceStartResponse, restarted bool) {
+			if restarted {
+				restarts.Add(1)
+			}
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Token != "tok-4" {
+		t.Fatalf("token = %q, want tok-4", out.Token)
+	}
+	if restarts.Load() != 1 {
+		t.Fatalf("restarts = %d, want 1 (deadline expiry)", restarts.Load())
+	}
+}
+
+// A relay that expires every code instantly must be met with backoff, not a
+// hot loop: the second round starts at least a second after the first.
+func TestDeviceLoginInstantExpiryBacksOff(t *testing.T) {
+	f := &fakeDeviceRelay{
+		start: func(n int32) relay.DeviceStartResponse { return startResponse("ABCD-1234", "dev-1") },
+		poll: func(deviceCode string, n int32, w http.ResponseWriter, r *http.Request) relay.DevicePollResponse {
+			if n == 1 {
+				return relay.DevicePollResponse{Status: relay.DeviceStatusExpired}
+			}
+			return relay.DevicePollResponse{
+				Status:            relay.DeviceStatusApproved,
+				ProvisionResponse: relay.ProvisionResponse{SystemID: "sys5", Token: "tok-5", Name: "System 5"},
+			}
+		},
+	}
+	newFakeDeviceRelay(t, f)
+
+	began := time.Now()
+	out, err := runDeviceLogin(context.Background(), f.srv.URL,
+		relay.DeviceStartRequest{ClientID: "c", Hostname: "h"},
+		func(relay.DeviceStartResponse, bool) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Token != "tok-5" {
+		t.Fatalf("token = %q, want tok-5", out.Token)
+	}
+	if elapsed := time.Since(began); elapsed < time.Second {
+		t.Fatalf("instant-expiry restart happened after %s, want >= 1s of backoff", elapsed)
+	}
+}
+
+// A relay advertising a zero poll interval is clamped to minPollInterval, not
+// polled in a busy loop.
+func TestDeviceLoginClampsZeroInterval(t *testing.T) {
+	f := &fakeDeviceRelay{
+		start: func(n int32) relay.DeviceStartResponse {
+			s := startResponse("ABCD-1234", "dev-1")
+			s.Interval = 0
+			return s
+		},
+		poll: func(deviceCode string, n int32, w http.ResponseWriter, r *http.Request) relay.DevicePollResponse {
+			if n < 3 {
+				return relay.DevicePollResponse{Status: relay.DeviceStatusPending}
+			}
+			return relay.DevicePollResponse{
+				Status:            relay.DeviceStatusApproved,
+				ProvisionResponse: relay.ProvisionResponse{SystemID: "sys6", Token: "tok-6", Name: "System 6"},
+			}
+		},
+	}
+	newFakeDeviceRelay(t, f)
+
+	began := time.Now()
+	out, err := runDeviceLogin(context.Background(), f.srv.URL,
+		relay.DeviceStartRequest{ClientID: "c", Hostname: "h"},
+		func(relay.DeviceStartResponse, bool) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Token != "tok-6" {
+		t.Fatalf("token = %q, want tok-6", out.Token)
+	}
+	// Three polls with two clamped waits between them: anything meaningfully
+	// under 2s means the interval was not floored at a second.
+	if elapsed := time.Since(began); elapsed < 2*time.Second {
+		t.Fatalf("3 polls took %s, want >= 2s with the 1s clamp", elapsed)
+	}
+}
+
 // A poll that dies on the wire (connection closed mid-request) is retried on
 // the same code instead of aborting the pairing.
 func TestDeviceLoginNetworkErrorRetries(t *testing.T) {

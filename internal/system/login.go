@@ -77,16 +77,42 @@ func performLogin(ctx context.Context, relayWS string) (systemConfig, error) {
 var errLoginCancelled = errors.New("pairing cancelled")
 
 // minPollInterval floors the relay's poll interval so a broken (or hostile)
-// relay can't turn the pairing wait into a request hammer.
-const minPollInterval = time.Second
+// relay can't turn the pairing wait into a request hammer; maxPollInterval
+// caps it so an absurd interval can't overflow the duration arithmetic.
+const (
+	minPollInterval = time.Second
+	maxPollInterval = time.Hour
+)
+
+// maxDeviceFlowSeconds bounds the relay-supplied code lifetime: real device
+// flows live for minutes, and an unbounded ExpiresIn could overflow the
+// duration arithmetic into an instant (or never-ending) expiry.
+const maxDeviceFlowSeconds = 24 * 3600
+
+// maxRestartBackoff caps the wait between instantly-expired rounds.
+const maxRestartBackoff = 30 * time.Second
 
 // runDeviceLogin performs device-authorization rounds until one is approved or
 // ctx is cancelled: start a flow, show the code, poll, and — when the code
 // expires unapproved — start over with a fresh one. showCode is invoked each
 // time a code is issued; restarted reports that it replaces an expired one.
+//
+// A round that expires instantly is the relay misbehaving, not the user being
+// slow, so consecutive instant expiries back off (1s, 3s, 7s, … to
+// maxRestartBackoff) instead of hammering /device/start. A round that ran its
+// course resets the backoff.
 func runDeviceLogin(ctx context.Context, httpBase string, req relay.DeviceStartRequest, showCode func(start relay.DeviceStartResponse, restarted bool)) (*relay.ProvisionResponse, error) {
 	restarted := false
+	var backoff time.Duration
 	for {
+		if backoff > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		began := time.Now()
 		start, err := deviceStart(ctx, httpBase, req)
 		if err != nil {
 			return nil, err
@@ -100,6 +126,11 @@ func runDeviceLogin(ctx context.Context, httpBase string, req relay.DeviceStartR
 			return out, nil
 		}
 		restarted = true
+		if time.Since(began) < minPollInterval {
+			backoff = min(backoff*2+time.Second, maxRestartBackoff)
+		} else {
+			backoff = 0
+		}
 	}
 }
 
@@ -109,8 +140,9 @@ func deviceStart(ctx context.Context, httpBase string, req relay.DeviceStartRequ
 	if err := postRelayJSON(ctx, httpBase+"/device/start", req, &out); err != nil {
 		return out, fmt.Errorf("starting device flow: %w", err)
 	}
-	if out.UserCode == "" || out.DeviceCode == "" || out.VerificationURL == "" || out.ExpiresIn <= 0 {
-		return out, fmt.Errorf("relay returned an incomplete device flow (missing code, URL or expiry)")
+	if out.UserCode == "" || out.DeviceCode == "" || out.VerificationURL == "" ||
+		out.ExpiresIn <= 0 || out.ExpiresIn > maxDeviceFlowSeconds {
+		return out, fmt.Errorf("relay returned an implausible device flow (missing code, URL or expiry)")
 	}
 	return out, nil
 }
@@ -125,6 +157,9 @@ func devicePoll(ctx context.Context, httpBase string, start relay.DeviceStartRes
 	interval := time.Duration(start.Interval) * time.Second
 	if interval < minPollInterval {
 		interval = minPollInterval
+	}
+	if interval > maxPollInterval {
+		interval = maxPollInterval
 	}
 	deadline := time.Now().Add(time.Duration(start.ExpiresIn) * time.Second)
 	for {
@@ -161,7 +196,8 @@ func devicePoll(ctx context.Context, httpBase string, start relay.DeviceStartRes
 
 // postRelayJSON POSTs a JSON body to the relay and decodes the JSON response.
 // The device-flow endpoints answer 200 for every in-flow state, so there is no
-// status switching here; a non-200 is relay trouble and surfaced plainly.
+// status switching here; a non-200 is relay trouble, surfaced with the relay's
+// own error body (bounded) so a 4xx/5xx is debuggable from the agent's output.
 func postRelayJSON(ctx context.Context, url string, body, out any) error {
 	b, err := json.Marshal(body)
 	if err != nil {
@@ -178,6 +214,20 @@ func postRelayJSON(ctx context.Context, url string, body, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		var e struct {
+			Error  string `json:"error"`
+			Detail string `json:"detail"`
+		}
+		if json.Unmarshal(data, &e) == nil && e.Error != "" {
+			if e.Detail != "" {
+				return fmt.Errorf("%s: %s", e.Error, e.Detail)
+			}
+			return fmt.Errorf("%s", e.Error)
+		}
+		if s := strings.TrimSpace(string(data)); s != "" {
+			return fmt.Errorf("relay returned %s: %s", resp.Status, s)
+		}
 		return fmt.Errorf("relay returned %s", resp.Status)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)

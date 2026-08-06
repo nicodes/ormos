@@ -6,6 +6,7 @@ package system
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -103,6 +104,12 @@ func runSystem() {
 	if cfg.PairingToken == "" || !tokenValid(cfg.RelayURL, cfg.PairingToken) {
 		li, err := performLogin(ctx, cfg.RelayURL)
 		if err != nil {
+			// The user walking away from the pairing screen is not a failure:
+			// say so plainly and exit with the conventional 128+SIGINT.
+			if errors.Is(err, errLoginCancelled) {
+				fmt.Fprintln(os.Stderr, "pairing cancelled")
+				os.Exit(130)
+			}
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
