@@ -21,7 +21,7 @@ type systemConfig struct {
 	ClientID     string `json:"clientId"`     // stable per-config identity (generated once)
 	PairingToken string `json:"pairingToken"` // pairing token minted by the relay
 	SystemID     string `json:"systemId"`     // this system's system record id
-	Email        string `json:"email"`        // account the system was registered under
+	Email        string `json:"email"`        // account the system was registered under (empty for device-flow pairings)
 	Shell        string `json:"-"`            // shell for terminals; from $SHELL at runtime
 }
 
