@@ -43,18 +43,54 @@ type PortEntry struct {
 	Label string `json:"label"`
 }
 
-// ProvisionRequest is the body of POST /system/provision: account credentials
-// plus the calling system's stable client id and display info.
-type ProvisionRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-	ClientID string `json:"clientId"`
+// DeviceStartRequest is the body of POST /device/start, the unauthenticated
+// opening of a device-authorization round: the calling system's stable client
+// id and display hostname. No credentials travel here — a human approves the
+// pairing out of band in the web app.
+type DeviceStartRequest struct {
+	ClientID string `json:"client_id"`
 	Hostname string `json:"hostname"`
-	Name     string `json:"name"` // optional label; server defaults to "System N"
 }
 
-// ProvisionResponse is returned on a successful provision: the system id, a
-// freshly-minted pairing token (shown once, never persisted server-side), and
+// DeviceStartResponse is returned by POST /device/start: the short code the
+// user types into the web app, the opaque device code the agent polls with, the
+// page to visit, and the flow's timing (durations in seconds).
+type DeviceStartResponse struct {
+	UserCode        string `json:"user_code"`
+	DeviceCode      string `json:"device_code"`
+	VerificationURL string `json:"verification_url"`
+	ExpiresIn       int    `json:"expires_in"` // seconds until the codes expire
+	Interval        int    `json:"interval"`   // seconds the agent waits between polls
+}
+
+// DevicePollRequest is the body of POST /device/poll.
+type DevicePollRequest struct {
+	DeviceCode string `json:"device_code"`
+}
+
+// Device flow states reported in DevicePollResponse.Status.
+const (
+	// DeviceStatusPending means the code is live but not yet approved.
+	DeviceStatusPending = "pending"
+	// DeviceStatusExpired means the codes expired unapproved; start over.
+	DeviceStatusExpired = "expired"
+	// DeviceStatusApproved means the user approved the code; the pairing
+	// fields are set.
+	DeviceStatusApproved = "approved"
+)
+
+// DevicePollResponse is the response of POST /device/poll. The endpoint always
+// answers 200 — the flow state is carried in Status, not the HTTP status. When
+// Status is DeviceStatusApproved the embedded ProvisionResponse fields carry
+// exactly what a successful provision did: the pairing token, system id and
+// display name the agent saves to its config.
+type DevicePollResponse struct {
+	Status string `json:"status"`
+	ProvisionResponse
+}
+
+// ProvisionResponse is the approval payload of the device flow: the system id,
+// a freshly-minted pairing token (shown once, never persisted server-side), and
 // the resolved display name.
 type ProvisionResponse struct {
 	SystemID string `json:"systemId"`

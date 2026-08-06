@@ -35,10 +35,10 @@ download before running it:
 gh attestation verify ormos_Linux_x86_64.tar.gz --repo nicodes/ormos
 ```
 
-On first run, Ormos prompts for your account email and password, registers the
-machine, and saves only the resulting pairing token. The credentials are not
-accepted as flags or environment variables. Later runs reconnect using the
-saved pairing.
+On first run, Ormos shows a short pairing code and a URL. Approve the code in
+the web app and the machine registers itself, saving only the resulting pairing
+token. No credentials are typed into the terminal, and none are accepted as
+flags or environment variables. Later runs reconnect using the saved pairing.
 
 ```text
 ormos                    run the system
