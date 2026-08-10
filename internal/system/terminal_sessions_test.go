@@ -1,9 +1,12 @@
 package system
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -189,5 +192,47 @@ func TestTerminalSessionBroadcastsToMultipleClients(t *testing.T) {
 		if got := <-results; got != "shared output" {
 			t.Fatalf("broadcast output = %q", got)
 		}
+	}
+}
+
+// A session's id can be asked for with any cwd on the header: the requested
+// directory passes the policy check, then the lookup returns a shell rooted
+// somewhere the policy would never have allowed. Reattach has to re-decide
+// against the directory the session actually holds.
+func TestTerminalReattachRechecksSessionCwd(t *testing.T) {
+	dir := withTempConfigDir(t)
+	allowed := filepath.Join(dir, "allowed")
+	outside := t.TempDir()
+	if err := os.Mkdir(allowed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	policyJSON := fmt.Sprintf(`{"allowedRoots": [%q]}`, allowed)
+	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(policyJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &system{terminals: make(map[string]*terminalSession), audit: newAuditor()}
+	d.terminals["sess"] = &terminalSession{id: "sess", cwd: outside, done: make(chan struct{})}
+
+	// The request names an allowed directory; the pre-existing session is
+	// rooted outside it. Before the fix this returned the session.
+	header := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "sess", Cwd: allowed, Cols: 80, Rows: 24}
+	if _, err := d.terminal(header); err == nil {
+		t.Fatal("reattach to a session rooted outside allowedRoots must be refused")
+	} else if !strings.Contains(err.Error(), "does not allow terminals") {
+		t.Fatalf("reattach error = %v, want a policy refusal", err)
+	}
+	if s := d.terminals["sess"]; s == nil {
+		t.Fatal("a refused reattach must not drop the session")
+	}
+
+	// Sanity: a session rooted under the allowed root reattaches fine.
+	d.terminals["sess"].cwd = allowed
+	s, err := d.terminal(header)
+	if err != nil {
+		t.Fatalf("reattach under allowedRoots refused: %v", err)
+	}
+	if s != d.terminals["sess"] {
+		t.Fatal("reattach did not return the pre-existing session")
 	}
 }
