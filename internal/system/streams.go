@@ -8,9 +8,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nicodes/ormos/relay"
 )
+
+// headerReadTO bounds how long a freshly accepted stream may sit without a
+// header. ReadHeader blocks until a newline arrives, and stream slots are
+// finite (relay.MaxTunnelStreams), so without a deadline a relay that opens
+// streams and says nothing pins every slot the agent has. A var so tests can
+// shrink it.
+var headerReadTO = 10 * time.Second
 
 // expandHomeDir resolves a leading ~ (or ~/) to the agent's home directory —
 // the daemon sets cmd.Dir directly, so no shell is around to expand it.
@@ -51,7 +59,11 @@ func expandRelayCwd(p string) (string, error) {
 // serveStream reads a stream's header and dispatches to the right handler.
 func (d *system) serveStream(stream net.Conn) {
 	defer stream.Close()
+	// The deadline covers only the header; a stream that has announced itself
+	// gets its handler's own pacing (or none, for a proxy pipe).
+	_ = stream.SetReadDeadline(time.Now().Add(headerReadTO))
 	header, br, err := relay.ReadHeader(stream)
+	_ = stream.SetReadDeadline(time.Time{})
 	if err != nil {
 		d.logf("stream header error: %v", err)
 		return

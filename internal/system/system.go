@@ -198,6 +198,18 @@ const (
 // the worst case.
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
+// maxRelayResponse caps a relay response body. Real responses are a handful
+// of ports or projects — kilobytes — so 1 MiB is generous; it only has to be
+// finite, so a relay answering with an endless body cannot make the agent
+// buffer without limit (every decode of a relay response goes through here or
+// through a LimitReader with this cap).
+const maxRelayResponse = 1 << 20
+
+// decodeRelayJSON decodes one bounded JSON response body from the relay.
+func decodeRelayJSON(r io.Reader, v any) error {
+	return json.NewDecoder(io.LimitReader(r, maxRelayResponse)).Decode(v)
+}
+
 // pollPorts periodically fetches this system's configured ports from the
 // relay and cross-references them against the locally-listening ports to mark
 // each live/idle, for the TUI. Transient errors keep the last-good list.
@@ -268,7 +280,7 @@ func (d *system) fetchConfiguredPorts(ctx context.Context) ([]relay.PortInfo, er
 	var out struct {
 		Ports []relay.PortInfo `json:"ports"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := decodeRelayJSON(resp.Body, &out); err != nil {
 		return nil, err
 	}
 	return out.Ports, nil
@@ -357,7 +369,7 @@ func (d *system) relayDo(ctx context.Context, method, path string, body any) ([]
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxRelayResponse))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var e struct {
 			Error string `json:"error"`
