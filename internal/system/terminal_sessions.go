@@ -98,10 +98,16 @@ func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
 	}
 
 	// Resolve the directory first: local policy is decided on the path this
-	// machine would actually use, not the string the relay sent.
+	// machine would actually use, not the string the relay sent. Relay input
+	// gets ~ expansion only — never environment expansion (expandRelayCwd).
 	cwd := ""
 	if h.Cwd != "" {
-		expanded := expandHome(h.Cwd)
+		expanded, err := expandRelayCwd(h.Cwd)
+		if err != nil {
+			d.audit.record(auditEntry{Event: "terminal", Detail: h.Cwd, Allowed: false})
+			d.logf("terminal refused: %v", err)
+			return nil, err
+		}
 		if fi, err := os.Stat(expanded); err == nil && fi.IsDir() {
 			cwd = expanded
 		} else {
