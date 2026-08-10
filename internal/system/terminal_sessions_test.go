@@ -5,12 +5,15 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/nicodes/ormos/relay"
+	"golang.org/x/sys/unix"
 )
 
 // sealedPair builds both ends of one sealed connection over a net.Pipe, the way
@@ -235,4 +238,98 @@ func TestTerminalReattachRechecksSessionCwd(t *testing.T) {
 	if s != d.terminals["sess"] {
 		t.Fatal("reattach did not return the pre-existing session")
 	}
+}
+
+// processState reads a pid's state from /proc: "" if the process is gone,
+// "Z" if it is a zombie (dead, awaiting a reap that may never come under a
+// non-reaping init), anything else if it is alive.
+func processState(pid int) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return ""
+	}
+	// comm is parenthesised and may contain spaces; the state follows the
+	// final ')'.
+	return string(data[strings.LastIndexByte(string(data), ')')+2])
+}
+
+func processGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		switch state := processState(pid); state {
+		case "", "Z":
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pid %d still alive (%s) after terminal close", pid, processState(pid))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// startGroupSession launches a shell on a real PTY running script, which must
+// write the background child's pid to pidfile. It returns the session and the
+// child's pid.
+func startGroupSession(t *testing.T, script string) (*terminalSession, int) {
+	t.Helper()
+	dir := t.TempDir()
+	pidfile := filepath.Join(dir, "child.pid")
+	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf(script, pidfile))
+	ptmx, err := pty.Start(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pgid, err := unix.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &system{terminals: make(map[string]*terminalSession)}
+	s := &terminalSession{id: "grouptest", owner: d, ptmx: ptmx, cmd: cmd, pgid: pgid, done: make(chan struct{})}
+	d.terminals[s.id] = s
+
+	var child int
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if data, err := os.ReadFile(pidfile); err == nil {
+			if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &child); err == nil && child > 0 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child pid file never appeared")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// The background child of a non-interactive shell stays in the shell's
+	// process group — that is the property close relies on.
+	if childPgid, err := unix.Getpgid(child); err != nil || childPgid != pgid {
+		t.Fatalf("child pgid = %d (%v), want the shell's group %d", childPgid, err, pgid)
+	}
+	return s, child
+}
+
+// Killing only the shell leaves its children running; enforcePolicy then
+// "ends" a terminal whose processes are still alive.
+func TestTerminalCloseKillsProcessGroup(t *testing.T) {
+	s, child := startGroupSession(t, "sleep 600 & echo $! > %s; wait")
+	s.close()
+	processGone(t, s.cmd.Process.Pid)
+	processGone(t, child)
+}
+
+// A child that ignores SIGHUP must still die: after the grace period the
+// group gets SIGKILL.
+func TestTerminalCloseEscalatesToSIGKILL(t *testing.T) {
+	prev := terminalKillGrace
+	terminalKillGrace = 200 * time.Millisecond
+	t.Cleanup(func() { terminalKillGrace = prev })
+
+	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; exec sleep 600' & echo $! > %s; wait")
+	start := time.Now()
+	s.close()
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("close took %s; the grace period is not bounding it", elapsed)
+	}
+	processGone(t, child)
 }
