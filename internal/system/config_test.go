@@ -58,6 +58,126 @@ func TestSaveConfigFileRoundTripsAndIsOwnerOnly(t *testing.T) {
 	}
 }
 
+// A crash or power loss mid-write must not leave a truncated, half-written
+// config — #97 makes such a file fatal at startup, which would brick the agent.
+// The write is crash-atomic (temp + fsync + rename), so a failed save leaves the
+// previous complete config untouched rather than a partial one. We force the
+// save to fail after the old file exists by making its directory unwritable, so
+// the temp file cannot be created, then assert the old config survived intact and
+// no temp litter was left behind.
+func TestSaveConfigFileFailedWritePreservesOldConfig(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions, so the write cannot be forced to fail")
+	}
+	path := useTempConfig(t)
+	dir := filepath.Dir(path)
+
+	old := systemConfig{RelayURL: "wss://old.example.test", PairingToken: "old_secret"}
+	if err := saveConfigFile(old); err != nil {
+		t.Fatal(err)
+	}
+	oldBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	if err := saveConfigFile(systemConfig{RelayURL: "wss://new.example.test", PairingToken: "new_secret"}); err == nil {
+		t.Fatal("save into an unwritable directory must fail")
+	}
+
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gotBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotBytes) != string(oldBytes) {
+		t.Fatalf("failed save changed the config on disk:\n got %s\nwant %s", gotBytes, oldBytes)
+	}
+	cfg, err := loadConfigFile()
+	if err != nil || cfg.PairingToken != "old_secret" {
+		t.Fatalf("old config not recoverable after failed save: cfg=%#v err=%v", cfg, err)
+	}
+	assertNoTempLitter(t, dir)
+}
+
+// The save writes a fresh temp file and renames it over the target, so a symlink
+// planted at the config path is replaced, never followed — a planted link can't
+// redirect the secret-bearing write to another file the attacker can read.
+func TestSaveConfigFileReplacesSymlinkInsteadOfFollowing(t *testing.T) {
+	path := useTempConfig(t)
+	dir := filepath.Dir(path)
+
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("DO NOT TOUCH"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, path); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := systemConfig{RelayURL: "wss://relay.example.test", PairingToken: "tok"}
+	if err := saveConfigFile(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "DO NOT TOUCH" {
+		t.Fatalf("symlink target was followed and overwritten: got %q, err %v", got, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("config path is still a symlink; the write followed it instead of replacing it")
+	}
+	loaded, err := loadConfigFile()
+	if err != nil || loaded.PairingToken != "tok" {
+		t.Fatalf("config not written to the real path: %#v, err %v", loaded, err)
+	}
+	assertNoTempLitter(t, dir)
+}
+
+// The result always lands as a fresh 0600 file even when a prior file at the path
+// had a looser mode, so a hand-loosened config can't leak the pairing token.
+func TestSaveConfigFileCorrectsLoosePermissions(t *testing.T) {
+	path := useTempConfig(t)
+	if err := os.WriteFile(path, []byte("{}"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfigFile(systemConfig{RelayURL: "wss://relay.example.test", PairingToken: "tok"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config permissions = %o, want 600 (loose mode not corrected)", info.Mode().Perm())
+	}
+}
+
+// assertNoTempLitter fails if the save left any temp file behind in dir; only the
+// config file (and, in the symlink test, the victim) should remain.
+func assertNoTempLitter(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp-") {
+			t.Fatalf("temp file left behind: %s", e.Name())
+		}
+	}
+}
+
 // A machine with no saved config is simply not registered yet; that must be
 // distinguishable from a real read failure so the caller can log in instead.
 func TestLoadConfigFileMissingIsNotExist(t *testing.T) {
