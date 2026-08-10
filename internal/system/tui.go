@@ -564,6 +564,15 @@ var (
 	sectionStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("246"))
 )
 
+// divider draws a faint full-width horizontal rule, used to fence a screen's
+// footer off from its body.
+func divider(width int) string {
+	if width < 1 {
+		width = 1
+	}
+	return hintStyle.Render(strings.Repeat("─", width))
+}
+
 func (m model) View() string {
 	s := m.status
 	state := offStyle.Render("● offline")
@@ -648,17 +657,19 @@ func (m model) View() string {
 			b.WriteString(cursor + label + "\n")
 		}
 	}
-	b.WriteString("\n")
+	body := strings.TrimRight(b.String(), "\n")
 
-	// Footer: input wizard, confirm prompt, or key hints.
+	// Footer: input wizard, confirm prompt, or key hints — fenced from the body
+	// by a full-width divider and pinned to the bottom of the terminal.
+	var f strings.Builder
 	switch m.mode {
 	case modeInput:
-		f := m.wiz.fields[m.wiz.idx]
-		b.WriteString(titleStyle.Render(m.wiz.title) + labelStyle.Render(fmt.Sprintf("  (%s)", f.label)) + "\n")
-		b.WriteString(m.input.View() + "\n")
-		b.WriteString(hintStyle.Render("enter: ok · esc: cancel") + "\n")
+		fld := m.wiz.fields[m.wiz.idx]
+		f.WriteString(titleStyle.Render(m.wiz.title) + labelStyle.Render(fmt.Sprintf("  (%s)", fld.label)) + "\n")
+		f.WriteString(m.input.View() + "\n")
+		f.WriteString(hintStyle.Render("enter: ok · esc: cancel"))
 	case modeConfirm:
-		b.WriteString(errStyle.Render(m.conf.text) + hintStyle.Render("  (y/n)") + "\n")
+		f.WriteString(errStyle.Render(m.conf.text) + hintStyle.Render("  (y/n)"))
 	default:
 		// Show only the actions that apply to the selected row.
 		hints := "↑/↓ move"
@@ -677,16 +688,24 @@ func (m model) View() string {
 			}
 		}
 		hints += " · L sign out · q quit"
-		b.WriteString(hintStyle.Render(hints) + "\n")
+		f.WriteString(hintStyle.Render(hints))
 	}
-
-	// Status line: last error or success notice.
+	// Status line: last error or success notice, under the hints.
 	if m.err != "" {
-		b.WriteString(errStyle.Render("✗ " + m.err))
+		f.WriteString("\n" + errStyle.Render("✗ "+m.err))
 	} else if m.notice != "" {
-		b.WriteString(noticeStyle.Render("✓ " + m.notice))
+		f.WriteString("\n" + noticeStyle.Render("✓ "+m.notice))
 	}
-	return b.String()
+	footer := divider(m.width) + "\n" + f.String()
+
+	// Pin the footer to the bottom when the body fits; otherwise let it follow
+	// the content so nothing is clipped on a short terminal.
+	if m.width > 0 && m.height > 0 {
+		if avail := m.height - lipgloss.Height(footer); avail >= 1 && lipgloss.Height(body) <= avail {
+			return lipgloss.Place(m.width, avail, lipgloss.Left, lipgloss.Top, body) + "\n" + footer
+		}
+	}
+	return body + "\n" + footer
 }
 
 // portSummary describes a project's port count and how many are live.
