@@ -25,7 +25,6 @@ type loginModel struct {
 	code      string
 	url       string
 	expiresIn int
-	restarts  int // codes that expired unapproved before this one
 	ticking   bool
 	width     int
 	height    int
@@ -35,8 +34,7 @@ type loginModel struct {
 
 // loginCodeMsg carries a freshly issued device code to the pairing screen.
 type loginCodeMsg struct {
-	start     relay.DeviceStartResponse
-	restarted bool
+	start relay.DeviceStartResponse
 }
 
 // loginFinishedMsg ends the screen: out is set on approval, err on failure.
@@ -45,7 +43,7 @@ type loginFinishedMsg struct {
 	err error
 }
 
-// tickMsg drives the one-per-second expiry countdown.
+// loginTickMsg drives the one-per-second expiry countdown.
 type loginTickMsg struct{}
 
 func loginTick() tea.Cmd {
@@ -68,9 +66,6 @@ func (m loginModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.code = msg.start.UserCode
 		m.url = msg.start.VerificationURL
 		m.expiresIn = msg.start.ExpiresIn
-		if msg.restarted {
-			m.restarts++
-		}
 		// Start the countdown exactly once; a re-issued code just resets the
 		// number the single ticker is counting down.
 		if !m.ticking {
@@ -151,9 +146,21 @@ func blockOrmos() string {
 }
 
 // hyperlink wraps text in an OSC 8 escape so supporting terminals make it
-// clickable; the rest just print the label.
+// clickable; the rest just print the label. Both the URI and the label are
+// stripped of control characters first so a compromised relay can't smuggle
+// terminal escapes out of the hyperlink and into the user's terminal.
 func hyperlink(url, label string) string {
-	return "\x1b]8;;" + url + "\x1b\\" + label + "\x1b]8;;\x1b\\"
+	return "\x1b]8;;" + stripCtl(url) + "\x1b\\" + stripCtl(label) + "\x1b]8;;\x1b\\"
+}
+
+// stripCtl removes C0 control characters (and DEL) from s.
+func stripCtl(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // runLoginTUI shows the device code on the pairing screen while running the
@@ -164,8 +171,8 @@ func runLoginTUI(ctx context.Context, httpBase string, req relay.DeviceStartRequ
 
 	p := tea.NewProgram(loginModel{}, tea.WithContext(ctx), tea.WithAltScreen())
 	go func() {
-		out, err := runDeviceLogin(ctx, httpBase, req, func(s relay.DeviceStartResponse, restarted bool) {
-			p.Send(loginCodeMsg{start: s, restarted: restarted})
+		out, err := runDeviceLogin(ctx, httpBase, req, func(s relay.DeviceStartResponse, _ bool) {
+			p.Send(loginCodeMsg{start: s})
 		})
 		p.Send(loginFinishedMsg{out: out, err: err})
 	}()

@@ -427,7 +427,7 @@ func TestLoginModelRendersCode(t *testing.T) {
 		t.Fatalf("pairing screen missing code or URL:\n%s", v)
 	}
 
-	upd, _ = m.Update(loginCodeMsg{restarted: true, start: relay.DeviceStartResponse{
+	upd, _ = m.Update(loginCodeMsg{start: relay.DeviceStartResponse{
 		UserCode: "NEXT-0001", VerificationURL: "https://app.example.test/pair", ExpiresIn: 600,
 	}})
 	m = upd.(loginModel)
