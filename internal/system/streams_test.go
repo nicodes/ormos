@@ -1,10 +1,13 @@
 package system
 
 import (
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nicodes/ormos/relay"
 )
@@ -66,5 +69,55 @@ func TestTerminalRefusesDollarCwd(t *testing.T) {
 	}
 	if d.terminals["probe"] != nil {
 		t.Fatal("a refused cwd must not leave a session behind")
+	}
+}
+
+// A stream that never sends a header used to hold its slot forever:
+// ReadHeader blocks until a newline, and slots are capped. With the deadline
+// the stream is dropped and the slot freed.
+func TestServeStreamDropsHeaderlessStream(t *testing.T) {
+	prev := headerReadTO
+	headerReadTO = 100 * time.Millisecond
+	t.Cleanup(func() { headerReadTO = prev })
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	d := &system{}
+	done := make(chan struct{})
+	go func() {
+		d.serveStream(agent)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stream that never sent a header was not dropped")
+	}
+}
+
+// The deadline covers the header only: a stream that announced itself
+// promptly must keep working past it (a proxy pipe has no pacing of its own).
+func TestServeStreamClearsHeaderDeadline(t *testing.T) {
+	prev := headerReadTO
+	headerReadTO = 150 * time.Millisecond
+	t.Cleanup(func() { headerReadTO = prev })
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	d := &system{}
+	go d.serveStream(agent) // KindPing echoes until closed
+	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindPing}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * headerReadTO)
+	msg := []byte("still alive")
+	go func() { _, _ = client.Write(msg) }() // net.Pipe write blocks until read
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(client, buf); err != nil {
+		t.Fatalf("ping echo after the header deadline: %v", err)
+	}
+	if string(buf) != string(msg) {
+		t.Fatalf("echo = %q, want %q", buf, msg)
 	}
 }
