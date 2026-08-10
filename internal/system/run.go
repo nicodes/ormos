@@ -143,6 +143,10 @@ func runSystem() {
 
 	if !isTTY() {
 		d.EchoToStderr(true)
+		// Print the sealing-key fingerprint once, up front: headless has no
+		// dashboard to show it, and it is what a user reads against the app to
+		// confirm the relay has not swapped the key.
+		fmt.Fprintf(os.Stderr, "sealing key fingerprint: %s (verify this in the app)\n", d.Fingerprint())
 		d.Run(ctx) // blocks until ctx done
 		return
 	}
