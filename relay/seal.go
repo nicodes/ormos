@@ -1,15 +1,18 @@
 package relay
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -46,14 +49,20 @@ const (
 	// SealKeySize is the length of an X25519 public key, and of each derived
 	// direction key.
 	SealKeySize = 32
+	// SealSaltSize is the length of the per-connection server salt (see
+	// GenerateServerSalt).
+	SealSaltSize = 32
 	// sealOverhead is the ChaCha20-Poly1305 authentication tag.
 	sealOverhead = chacha20poly1305.Overhead
 	// MaxSealedRecord bounds a single sealed record on the wire. A record holds
-	// one terminal frame plus the tag, so this tracks MaxFrameSize.
-	MaxSealedRecord = MaxFrameSize + 5 + sealOverhead
+	// one terminal frame plus the tag, so this tracks MaxFrameSize. frameHeaderSize
+	// is the single spelling of the frame's tag+length prefix (see protocol.go).
+	MaxSealedRecord = MaxFrameSize + frameHeaderSize + sealOverhead
 	// sealInfo domain-separates this key schedule from any other use of the same
-	// agreement. Bump the version if the schedule changes.
-	sealInfo = "ormos terminal seal v1"
+	// agreement. Bump the version whenever the schedule changes: v2 binds both
+	// public keys and a per-connection server salt (scheduleInfo), so a client
+	// derives a key against the exact agent it thinks it is talking to.
+	sealInfo = "ormos terminal seal v2"
 )
 
 // ErrSealFailed is returned when a record does not authenticate. It is
@@ -77,12 +86,26 @@ type SessionKeys struct {
 // DeriveSessionKeys performs the X25519 agreement and expands it into the two
 // directional keys.
 //
-// sessionID is bound in as the HKDF salt so two streams that somehow agreed on
-// the same secret still derive different keys, and a record captured from one
-// stream cannot be replayed into another.
-func DeriveSessionKeys(priv *ecdh.PrivateKey, peerPub []byte, sessionID string) (*SessionKeys, error) {
+// Three things are bound into the schedule beyond the shared secret itself:
+//
+//   - Both public keys (scheduleInfo). A relay distributes the agent's public
+//     key to the client; if it substitutes one of its own, the client derives
+//     against that substituted key while the real agent derives against its own,
+//     so the two never agree and the stream fails closed. The seal alone already
+//     stops the relay reading traffic; binding the key is what stops it standing
+//     in as the endpoint against a client that pins the fingerprint.
+//   - The per-connection server salt, as the HKDF salt. A fresh salt each
+//     connection guarantees a distinct key/nonce space even if a client reuses
+//     its ephemeral key across reattaches — the counter-nonce scheme is only
+//     safe while no key is ever reused.
+//   - sessionID, so two tabs between the same two parties derive different keys
+//     and a record from one cannot be replayed into another.
+func DeriveSessionKeys(priv *ecdh.PrivateKey, peerPub, salt []byte, sessionID string) (*SessionKeys, error) {
 	if len(peerPub) != SealKeySize {
 		return nil, fmt.Errorf("peer public key must be %d bytes, got %d", SealKeySize, len(peerPub))
+	}
+	if len(salt) != SealSaltSize {
+		return nil, fmt.Errorf("server salt must be %d bytes, got %d", SealSaltSize, len(salt))
 	}
 	pub, err := ecdh.X25519().NewPublicKey(peerPub)
 	if err != nil {
@@ -92,7 +115,7 @@ func DeriveSessionKeys(priv *ecdh.PrivateKey, peerPub []byte, sessionID string) 
 	if err != nil {
 		return nil, fmt.Errorf("key agreement failed: %w", err)
 	}
-	out, err := hkdf.Key(sha256.New, shared, []byte(sessionID), sealInfo, 2*SealKeySize)
+	out, err := hkdf.Key(sha256.New, shared, salt, scheduleInfo(priv.PublicKey().Bytes(), peerPub, sessionID), 2*SealKeySize)
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
@@ -100,6 +123,48 @@ func DeriveSessionKeys(priv *ecdh.PrivateKey, peerPub []byte, sessionID string) 
 		ClientToAgent: out[:SealKeySize],
 		AgentToClient: out[SealKeySize:],
 	}, nil
+}
+
+// scheduleInfo builds the HKDF info that binds the protocol version, both
+// public keys, and the session id into the key schedule.
+//
+// The two keys are ordered by value rather than by role, so both ends build the
+// identical info without the function needing to know which of the pair is the
+// agent and which is the client — the agent calls it with (its own pub, the
+// client's pub) and the client with (its own pub, the agent's pub), and the
+// sorted result is the same. sessionID is last and variable-length, so the
+// framing is unambiguous.
+func scheduleInfo(a, b []byte, sessionID string) string {
+	lo, hi := a, b
+	if bytes.Compare(lo, hi) > 0 {
+		lo, hi = hi, lo
+	}
+	var buf []byte
+	buf = append(buf, sealInfo...)
+	buf = append(buf, 0)
+	buf = append(buf, lo...)
+	buf = append(buf, hi...)
+	buf = append(buf, sessionID...)
+	return string(buf)
+}
+
+// Fingerprint renders a short, human-comparable base32 fingerprint of an agent
+// public key for out-of-band verification: the agent prints it on startup and
+// the app pins it, so a user can read one against the other and catch a relay
+// that swapped the key. It is the RFC 4648 base32 of the first 10 bytes of
+// SHA-256(pub) — 80 bits — grouped in fours. seal.ts's fingerprint() must
+// produce the identical string.
+func Fingerprint(pub []byte) string {
+	sum := sha256.Sum256(pub)
+	raw := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:10])
+	var b strings.Builder
+	for i := 0; i < len(raw); i += 4 {
+		if i > 0 {
+			b.WriteByte('-')
+		}
+		b.WriteString(raw[i:min(i+4, len(raw))])
+	}
+	return b.String()
 }
 
 // Sealer seals and opens records for one direction of one stream.
@@ -210,6 +275,49 @@ func ReadClientHello(r io.Reader) ([]byte, error) {
 	}
 	if len(rec) != ClientHelloSize {
 		return nil, fmt.Errorf("client hello must be %d bytes, got %d", ClientHelloSize, len(rec))
+	}
+	return rec, nil
+}
+
+// ServerHelloSize is the length of the agent's reply to the client hello: the
+// per-connection server salt, sent in the clear because it is a public random
+// value that reveals nothing on its own.
+const ServerHelloSize = SealSaltSize
+
+// GenerateServerSalt returns a fresh per-connection salt. A new one every
+// connection is what makes the counter-nonce scheme safe across reattaches: the
+// salt goes into the key schedule (DeriveSessionKeys), so even a client that
+// reuses its ephemeral key lands in a distinct key/nonce space each time.
+func GenerateServerSalt() ([]byte, error) {
+	salt := make([]byte, SealSaltSize)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, fmt.Errorf("generating server salt: %w", err)
+	}
+	return salt, nil
+}
+
+// WriteServerHello sends the agent's per-connection salt as its reply to the
+// client hello. It is unsealed — there is no shared key yet, and the salt is
+// public by construction.
+func WriteServerHello(w io.Writer, salt []byte) error {
+	if len(salt) != ServerHelloSize {
+		return fmt.Errorf("server hello must be %d bytes, got %d", ServerHelloSize, len(salt))
+	}
+	return WriteRecord(w, salt)
+}
+
+// ReadServerHello reads the agent's per-connection salt. A reply of the wrong
+// length is refused rather than used, for the same reason ReadClientHello
+// refuses a malformed hello: it only comes from a peer that does not speak this
+// protocol, and mixing nonsense into the schedule turns a version mismatch into
+// a confusing failure much later.
+func ReadServerHello(r io.Reader) ([]byte, error) {
+	rec, err := ReadRecord(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(rec) != ServerHelloSize {
+		return nil, fmt.Errorf("server hello must be %d bytes, got %d", ServerHelloSize, len(rec))
 	}
 	return rec, nil
 }

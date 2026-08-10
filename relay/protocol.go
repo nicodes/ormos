@@ -32,6 +32,12 @@ const (
 	MaxHeaderSize = 64 << 10 // 64 KiB
 )
 
+// frameHeaderSize is the fixed prefix on every terminal frame: a one-byte tag
+// and a four-byte big-endian payload length. It is the single spelling of that
+// 5 — encodeFrame writes it, DecodeFrame reads it, and MaxSealedRecord budgets
+// for it (seal.go).
+const frameHeaderSize = 1 + 4
+
 // StreamKind identifies what a newly opened yamux stream is for.
 type StreamKind string
 
