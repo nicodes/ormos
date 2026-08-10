@@ -24,9 +24,11 @@ import (
 // Called on demand from `ormos` when there's no valid session. PocketBase is
 // never contacted directly — provisioning is relay-mediated.
 func performLogin(ctx context.Context, relayWS string) (systemConfig, error) {
-	if insecureRemoteRelay(relayWS) {
-		return systemConfig{}, fmt.Errorf(
-			"refusing to pair over a cleartext connection to remote relay %s — use a wss:// URL", relayWS)
+	// Pairing is where the token is minted; it must not cross cleartext either.
+	// runSystem refuses this earlier and fatally — this guard keeps the flow
+	// honest wherever it is entered, and shares the ORMOS_INSECURE=1 hatch.
+	if err := checkRelayTransport(relayWS); err != nil {
+		return systemConfig{}, err
 	}
 	fmt.Fprintf(os.Stderr, "relay: %s\n", relayWS)
 
