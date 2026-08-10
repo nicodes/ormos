@@ -51,7 +51,166 @@ func sealedPair(t *testing.T, sessionID string) (agent *sealedConn, client *rela
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { server.Close(); browser.Close() })
-	return &sealedConn{Conn: server, stream: agentStream}, clientStream
+	return newSealedConn(server, agentStream), clientStream
+}
+
+// waitConns blocks until the session holds exactly n connections.
+func waitConns(t *testing.T, s *terminalSession, n int) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		s.mu.Lock()
+		got := len(s.conns)
+		s.mu.Unlock()
+		if got == n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session holds %d connections, want %d", got, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A browser that stops draining must cost itself and nothing else. Before the
+// per-connection writer this loop went through the session lock and a blocking
+// socket write: the first output parked for terminalWriteTO with the PTY
+// undrained, so the shell's own write() blocked and every other attached client
+// stopped receiving too.
+func TestTerminalOutputNeverBlocksOnAStalledClient(t *testing.T) {
+	s := &terminalSession{id: "stall", done: make(chan struct{})}
+
+	// net.Pipe is unbuffered and nobody reads the stalled client's end, so its
+	// very first write parks until the deadline.
+	stalled, _ := sealedPair(t, "stall")
+	live, counter := countingConn(t)
+	go s.attach(stalled)
+	go s.attach(live)
+	waitConns(t, s, 2)
+
+	// Enough to overrun terminalSendBytes on the stalled connection — 8 KiB a
+	// frame fills the 1 MiB budget in 128 — without making the draining one do
+	// more sealing than a two-vCPU runner can finish promptly under -race.
+	const chunks, chunkSize = 150, 8 << 10
+	data := make([]byte, chunkSize)
+	start := time.Now()
+	for range chunks {
+		s.output(data)
+	}
+	elapsed := time.Since(start)
+	// One blocking write on the stalled connection would already have cost
+	// terminalWriteTO; the whole workload has to finish well inside it.
+	if elapsed > terminalWriteTO/2 {
+		t.Fatalf("%d PTY chunks took %s with one stalled client; the reader is still waiting on a socket", chunks, elapsed)
+	}
+
+	// The stalled connection goes, but on its own write deadline rather than on
+	// its backlog — so this waits out terminalWriteTO — and the draining one is
+	// what is left.
+	waitConns(t, s, 1)
+	s.mu.Lock()
+	_, stalledKept := s.conns[stalled]
+	_, liveKept := s.conns[live]
+	s.mu.Unlock()
+	if stalledKept || !liveKept {
+		t.Fatalf("survivors: stalled=%v draining=%v; the wrong connection was ended", stalledKept, liveKept)
+	}
+
+	// And the survivor is still being served: whatever it missed while the
+	// other one stalled, it takes new output now.
+	before, _, _ := counter.totals()
+	s.output([]byte("still here"))
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if records, _, _ := counter.totals(); records > before {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the draining connection stopped receiving after another client stalled")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	s.mu.Lock()
+	if s.expires != nil {
+		s.expires.Stop()
+	}
+	s.mu.Unlock()
+}
+
+// A connection that falls behind must be resynchronised, not disconnected. The
+// queue bound measures backlog, and a backlog means either a stuck socket or a
+// writer goroutine that has not been scheduled — indistinguishable from here,
+// and on a single-core host the second is ordinary. Dropping that kind costs a
+// healthy session a fresh handshake and a full replay at the exact moment the
+// link is busiest.
+func TestTerminalSlowClientIsResyncedNotDropped(t *testing.T) {
+	s := &terminalSession{id: "slow", done: make(chan struct{})}
+	// History first, so the attach replay is NOT a bare reset and cannot be
+	// mistaken for the catch-up frame this test is looking for.
+	s.output([]byte("before the burst"))
+
+	slow, client := sealedPair(t, "slow")
+	go s.attach(slow)
+	waitConns(t, s, 1)
+
+	// A client that reads, but far slower than the PTY produces.
+	seen := make(chan string, 512)
+	go func() {
+		for {
+			frame, err := client.ReadFrame()
+			if err != nil {
+				return
+			}
+			if frame.Data != nil {
+				select {
+				case seen <- string(frame.Data):
+				default:
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	// Comfortably more than terminalSendBytes, so the backlog must collapse.
+	data := make([]byte, 8<<10)
+	for i := range data {
+		data[i] = 'x'
+	}
+	for range 300 {
+		s.output(data)
+	}
+
+	// It is still attached — this is the whole point.
+	s.mu.Lock()
+	_, kept := s.conns[slow]
+	s.mu.Unlock()
+	if !kept {
+		t.Fatal("a client that was merely slow was disconnected instead of resynchronised")
+	}
+
+	// And it was handed a catch-up frame: a screen reset followed by history,
+	// so it redraws rather than resuming against a screen that moved on
+	// without it.
+	deadline := time.After(30 * time.Second)
+	for {
+		select {
+		case frame := <-seen:
+			// A catch-up carries the reset AND the burst; the attach replay
+			// carries the reset and only what preceded it. Requiring a byte
+			// from the burst is what tells the two apart.
+			if strings.HasPrefix(frame, terminalResyncPrefix) && strings.Contains(frame, "xxxxxxxx") {
+				s.mu.Lock()
+				if s.expires != nil {
+					s.expires.Stop()
+				}
+				s.mu.Unlock()
+				return
+			}
+		case <-deadline:
+			t.Fatal("a client that fell a whole budget behind never received a catch-up frame")
+		}
+	}
 }
 
 func TestTerminalSessionReattachesWithReplay(t *testing.T) {
@@ -65,8 +224,10 @@ func TestTerminalSessionReattachesWithReplay(t *testing.T) {
 	firstAgent, firstClient := sealedPair(t, "test")
 	go s.attach(firstAgent)
 
-	if _, err := firstClient.ReadFrame(); err != nil {
+	if frame, err := firstClient.ReadFrame(); err != nil {
 		t.Fatalf("read initial replay: %v", err)
+	} else if got := string(frame.Data); got != terminalResyncPrefix {
+		t.Fatalf("initial replay = %q, want a bare screen reset", got)
 	}
 	if _, err := firstClient.ReadFrame(); err != nil {
 		t.Fatalf("read initial activity: %v", err)
@@ -105,8 +266,10 @@ func TestTerminalSessionReattachesWithReplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read replay after reattach: %v", err)
 	}
-	if got := string(frame.Data); got != "survives disconnect" {
-		t.Fatalf("reattached replay = %q", got)
+	// The replay is preceded by a screen reset so the browser redraws rather
+	// than appending it to whatever it still had on screen.
+	if got, want := string(frame.Data), terminalResyncPrefix+"survives disconnect"; got != want {
+		t.Fatalf("reattached replay = %q, want %q", got, want)
 	}
 	if _, err := secondClient.ReadFrame(); err != nil {
 		t.Fatalf("read reattached activity: %v", err)
@@ -336,4 +499,66 @@ func TestTerminalCloseEscalatesToSIGKILL(t *testing.T) {
 		t.Fatalf("close took %s; the grace period is not bounding it", elapsed)
 	}
 	processGone(t, child)
+}
+
+// kill has to wake a reader parked on the transport this actually runs over.
+// net.Pipe, which every other test here uses, unblocks a pending Read on Close;
+// a yamux stream does not — Close on an established stream only moves it to
+// streamLocalClose, which prohibits further local writes while reads carry on.
+// Without the read deadline in kill, a killed connection's attach goroutine,
+// its relay.MaxTunnelStreams slot and everything still queued on it survive
+// until the peer sends a FIN or StreamCloseTimeout fires two minutes later.
+func TestSealedConnKillWakesAReaderOnAYamuxStream(t *testing.T) {
+	clientTransport, serverTransport := net.Pipe()
+	t.Cleanup(func() { clientTransport.Close(); serverTransport.Close() })
+	client, err := relay.ClientSession(clientTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := relay.ServerSession(serverTransport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close(); server.Close() })
+
+	opened := make(chan error, 1)
+	go func() {
+		_, err := client.Open()
+		opened <- err
+	}()
+	stream, err := server.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-opened; err != nil {
+		t.Fatal(err)
+	}
+
+	key := make([]byte, relay.SealKeySize)
+	sealed, err := relay.NewSealedStream(stream, stream, key, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := newSealedConn(stream, sealed)
+
+	parked := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 1)
+		_, err := stream.Read(buf)
+		parked <- err
+	}()
+	// Let the read reach the point of parking; nothing is ever sent on it.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-parked:
+		t.Fatalf("the read returned before kill (%v); this test proves nothing", err)
+	default:
+	}
+
+	conn.kill()
+	select {
+	case <-parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("kill did not wake a reader parked on a yamux stream; the connection would hold its slot until StreamCloseTimeout")
+	}
 }
