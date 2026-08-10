@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hkdf"
@@ -24,8 +25,16 @@ import (
 // Key agreement is one-pass. The agent has a long-lived X25519 keypair whose
 // public half is published on its `systems` record, so the browser can fetch it
 // over the ordinary authenticated record API. The browser generates an
-// ephemeral keypair per stream, sends the public half as the stream's first
-// record, and both sides derive the same secret.
+// ephemeral keypair per stream and sends the public half as the stream's first
+// record; the agent answers with a fresh per-connection salt, and both sides
+// derive the same secret.
+//
+// v2 binds the whole handshake transcript into the key schedule: both public
+// keys go into the HKDF info, so a relay that substitutes the agent's published
+// key with its own produces a derivation the pinning client rejects rather than
+// a session it can read; and the agent's salt goes in as the HKDF salt, so two
+// connections derive different keys and counters even if a client ever reused
+// its ephemeral key.
 //
 // # What this protects against, and what it does not
 //
@@ -53,7 +62,16 @@ const (
 	MaxSealedRecord = MaxFrameSize + 5 + sealOverhead
 	// sealInfo domain-separates this key schedule from any other use of the same
 	// agreement. Bump the version if the schedule changes.
-	sealInfo = "ormos terminal seal v1"
+	//
+	// v2: both public keys are bound into the HKDF info and the agent's
+	// per-connection salt becomes the HKDF salt. v1 derived from the shared
+	// secret and the session id alone, so a relay that substituted the agent's
+	// public key sat undetected in the middle of every session.
+	sealInfo = "ormos terminal seal v2"
+	// ServerSaltSize is the length of the per-connection salt the agent returns
+	// in its server hello. Fresh per connection, it guarantees key/nonce
+	// separation between connections regardless of client ephemeral reuse.
+	ServerSaltSize = 32
 )
 
 // ErrSealFailed is returned when a record does not authenticate. It is
@@ -77,14 +95,40 @@ type SessionKeys struct {
 // DeriveSessionKeys performs the X25519 agreement and expands it into the two
 // directional keys.
 //
-// sessionID is bound in as the HKDF salt so two streams that somehow agreed on
-// the same secret still derive different keys, and a record captured from one
-// stream cannot be replayed into another.
-func DeriveSessionKeys(priv *ecdh.PrivateKey, peerPub []byte, sessionID string) (*SessionKeys, error) {
-	if len(peerPub) != SealKeySize {
-		return nil, fmt.Errorf("peer public key must be %d bytes, got %d", SealKeySize, len(peerPub))
+// The transcript is bound into the schedule: agentPub and clientPub — in that
+// order, on both ends — go into the HKDF info, so a key substituted in transit
+// (a hostile relay answering for the agent) yields keys the two honest ends do
+// not share, instead of a session the middle can read. The agent's fresh
+// per-connection salt is the HKDF salt, so two connections never share keys or
+// nonce counters, whatever the client ephemeral does. The session id rides
+// along in the info, so a record captured from one tab still cannot be replayed
+// into another.
+//
+// priv must be the private half of one of the two public keys; which one
+// decides nothing about the output, only who the agreement is with.
+func DeriveSessionKeys(priv *ecdh.PrivateKey, agentPub, clientPub []byte, sessionID string, salt []byte) (*SessionKeys, error) {
+	if len(agentPub) != SealKeySize {
+		return nil, fmt.Errorf("agent public key must be %d bytes, got %d", SealKeySize, len(agentPub))
 	}
-	pub, err := ecdh.X25519().NewPublicKey(peerPub)
+	if len(clientPub) != SealKeySize {
+		return nil, fmt.Errorf("client public key must be %d bytes, got %d", SealKeySize, len(clientPub))
+	}
+	if len(salt) != ServerSaltSize {
+		return nil, fmt.Errorf("server salt must be %d bytes, got %d", ServerSaltSize, len(salt))
+	}
+	// Work out the peer from the private key rather than trusting the caller to
+	// pass the pubs in matching roles: a swapped pair would derive a key the
+	// other end does not hold and fail only at the first record.
+	var peer []byte
+	switch own := priv.PublicKey().Bytes(); {
+	case bytes.Equal(own, agentPub):
+		peer = clientPub
+	case bytes.Equal(own, clientPub):
+		peer = agentPub
+	default:
+		return nil, fmt.Errorf("private key matches neither public key")
+	}
+	pub, err := ecdh.X25519().NewPublicKey(peer)
 	if err != nil {
 		return nil, fmt.Errorf("invalid peer public key: %w", err)
 	}
@@ -92,7 +136,12 @@ func DeriveSessionKeys(priv *ecdh.PrivateKey, peerPub []byte, sessionID string) 
 	if err != nil {
 		return nil, fmt.Errorf("key agreement failed: %w", err)
 	}
-	out, err := hkdf.Key(sha256.New, shared, []byte(sessionID), sealInfo, 2*SealKeySize)
+	info := make([]byte, 0, len(sealInfo)+2*SealKeySize+len(sessionID))
+	info = append(info, sealInfo...)
+	info = append(info, agentPub...)
+	info = append(info, clientPub...)
+	info = append(info, sessionID...)
+	out, err := hkdf.Key(sha256.New, shared, salt, string(info), 2*SealKeySize)
 	if err != nil {
 		return nil, fmt.Errorf("key derivation failed: %w", err)
 	}
@@ -210,6 +259,44 @@ func ReadClientHello(r io.Reader) ([]byte, error) {
 	}
 	if len(rec) != ClientHelloSize {
 		return nil, fmt.Errorf("client hello must be %d bytes, got %d", ClientHelloSize, len(rec))
+	}
+	return rec, nil
+}
+
+// ServerHelloSize is the length of the agent's reply to the client hello: the
+// per-connection salt, sent in the clear because it is not secret — its job is
+// freshness, not confidentiality.
+const ServerHelloSize = ServerSaltSize
+
+// GenerateServerSalt returns the fresh salt the agent mixes into the key
+// schedule for one connection and sends back as its server hello.
+func GenerateServerSalt() ([]byte, error) {
+	salt := make([]byte, ServerSaltSize)
+	if _, err := rand.Read(salt); err != nil {
+		return nil, fmt.Errorf("generating server salt: %w", err)
+	}
+	return salt, nil
+}
+
+// WriteServerHello sends the agent's per-connection salt as the stream's second
+// record. It is unsealed — the shared key does not exist until both ends hold
+// this value, and a salt needs no confidentiality.
+func WriteServerHello(w io.Writer, salt []byte) error {
+	if len(salt) != ServerHelloSize {
+		return fmt.Errorf("server hello must be %d bytes, got %d", ServerHelloSize, len(salt))
+	}
+	return WriteRecord(w, salt)
+}
+
+// ReadServerHello reads the agent's per-connection salt, refusing a record of
+// any other length for the same reason ReadClientHello does.
+func ReadServerHello(r io.Reader) ([]byte, error) {
+	rec, err := ReadRecord(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(rec) != ServerHelloSize {
+		return nil, fmt.Errorf("server hello must be %d bytes, got %d", ServerHelloSize, len(rec))
 	}
 	return rec, nil
 }

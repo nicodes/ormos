@@ -71,9 +71,22 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 		d.logf("terminal refused: %v", err)
 		return
 	}
-	// The session id is bound into the key schedule, so a record captured from
-	// one tab cannot be replayed into another even between the same two ends.
-	keys, err := relay.DeriveSessionKeys(d.key, peer, h.SessionID)
+	// Answer with a fresh per-connection salt. Mixed into the key schedule, it
+	// guarantees this connection's keys and nonce counters are its own even if
+	// the client ever reused an ephemeral key.
+	salt, err := relay.GenerateServerSalt()
+	if err != nil {
+		d.logf("terminal refused: %v", err)
+		return
+	}
+	if err := relay.WriteServerHello(stream, salt); err != nil {
+		d.logf("terminal refused: %v", err)
+		return
+	}
+	// Both public keys and the salt are bound into the key schedule, so a record
+	// captured from one tab cannot be replayed into another, and a relay that
+	// substituted the published agent key derives keys the client rejects.
+	keys, err := relay.DeriveSessionKeys(d.key, d.key.PublicKey().Bytes(), peer, h.SessionID, salt)
 	if err != nil {
 		d.logf("terminal refused: key agreement failed: %v", err)
 		return
