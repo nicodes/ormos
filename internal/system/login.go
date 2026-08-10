@@ -30,7 +30,6 @@ func performLogin(ctx context.Context, relayWS string) (systemConfig, error) {
 	if err := checkRelayTransport(relayWS); err != nil {
 		return systemConfig{}, err
 	}
-	fmt.Fprintf(os.Stderr, "relay: %s\n", relayWS)
 
 	hostname, _ := os.Hostname() // display-only; best effort
 
@@ -52,6 +51,9 @@ func performLogin(ctx context.Context, relayWS string) (systemConfig, error) {
 	if isTTY() {
 		out, err = runLoginTUI(ctx, httpBase, req)
 	} else {
+		// The pairing screen owns the terminal in TTY mode, so the relay it is
+		// pairing against is only worth announcing here, in the plain path.
+		fmt.Fprintf(os.Stderr, "relay: %s\n", relayWS)
 		out, err = runDeviceLogin(ctx, httpBase, req, headlessCodeDisplay(os.Stdout))
 	}
 	if errors.Is(err, context.Canceled) {
