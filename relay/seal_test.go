@@ -29,19 +29,28 @@ const (
 	clientSeed = "6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80"
 )
 
+// testSalt is a fixed per-connection salt so derivations in tests are
+// reproducible (and matchable against the app's cross-language vectors).
+var testSalt = bytes.Repeat([]byte{0x5a}, ServerSaltSize)
+
+// derive calls DeriveSessionKeys from either side of the fixed test agreement.
+func derive(t *testing.T, priv *ecdh.PrivateKey, agentPub, clientPub []byte, sessionID string, salt []byte) *SessionKeys {
+	t.Helper()
+	keys, err := DeriveSessionKeys(priv, agentPub, clientPub, sessionID, salt)
+	if err != nil {
+		t.Fatalf("derive: %v", err)
+	}
+	return keys
+}
+
 // Both ends must derive the same two keys from opposite sides of the agreement.
 func TestDeriveSessionKeysAgree(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	client := fixedKey(t, clientSeed)
+	agentPub, clientPub := agent.PublicKey().Bytes(), client.PublicKey().Bytes()
 
-	a, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-1")
-	if err != nil {
-		t.Fatalf("agent derive: %v", err)
-	}
-	c, err := DeriveSessionKeys(client, agent.PublicKey().Bytes(), "tab-1")
-	if err != nil {
-		t.Fatalf("client derive: %v", err)
-	}
+	a := derive(t, agent, agentPub, clientPub, "tab-1", testSalt)
+	c := derive(t, client, agentPub, clientPub, "tab-1", testSalt)
 	if !bytes.Equal(a.ClientToAgent, c.ClientToAgent) || !bytes.Equal(a.AgentToClient, c.AgentToClient) {
 		t.Fatal("the two ends derived different keys")
 	}
@@ -55,11 +64,65 @@ func TestDeriveSessionKeysAgree(t *testing.T) {
 func TestSessionIDSeparatesStreams(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	client := fixedKey(t, clientSeed)
+	agentPub, clientPub := agent.PublicKey().Bytes(), client.PublicKey().Bytes()
 
-	one, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-1")
-	two, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-2")
+	one := derive(t, agent, agentPub, clientPub, "tab-1", testSalt)
+	two := derive(t, agent, agentPub, clientPub, "tab-2", testSalt)
 	if bytes.Equal(one.ClientToAgent, two.ClientToAgent) {
 		t.Fatal("different sessions derived the same key")
+	}
+}
+
+// The per-connection salt is the HKDF salt, so two connections between the same
+// peers in the same session never share a key — and with it a nonce counter —
+// even if the client reused its ephemeral key.
+func TestServerSaltSeparatesConnections(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+	agentPub, clientPub := agent.PublicKey().Bytes(), client.PublicKey().Bytes()
+
+	other := bytes.Repeat([]byte{0x41}, ServerSaltSize)
+	one := derive(t, agent, agentPub, clientPub, "tab-1", testSalt)
+	two := derive(t, agent, agentPub, clientPub, "tab-1", other)
+	if bytes.Equal(one.ClientToAgent, two.ClientToAgent) || bytes.Equal(one.AgentToClient, two.AgentToClient) {
+		t.Fatal("different server salts derived the same key")
+	}
+}
+
+// Both public keys are bound into the schedule: a relay that substitutes the
+// agent's published key with its own derives — with the browser — keys the real
+// agent does not hold, so the first record fails authentication instead of
+// opening a session the middle can read.
+func TestSubstitutedAgentKeyDerivesDifferently(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	impostor := fixedKey(t, clientSeed) // any key that is not the agent's
+	client := fixedKey(t, "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f")
+	clientPub := client.PublicKey().Bytes()
+
+	honest := derive(t, client, agent.PublicKey().Bytes(), clientPub, "tab-1", testSalt)
+	pinned := derive(t, client, impostor.PublicKey().Bytes(), clientPub, "tab-1", testSalt)
+	if bytes.Equal(honest.ClientToAgent, pinned.ClientToAgent) {
+		t.Fatal("a substituted agent key derived the same client-to-agent key")
+	}
+
+	// And the agent's own derivation under its real key matches only the honest
+	// client's, never the substituted transcript.
+	agentKeys := derive(t, agent, agent.PublicKey().Bytes(), clientPub, "tab-1", testSalt)
+	if !bytes.Equal(agentKeys.ClientToAgent, honest.ClientToAgent) {
+		t.Fatal("agent and honest client disagree")
+	}
+}
+
+// The private key must be the half of one of the two public keys; otherwise the
+// caller has swapped or mismatched the transcript and would derive a key the
+// peer does not hold.
+func TestDeriveRejectsMismatchedOwnKey(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+	stranger := fixedKey(t, "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff000102030405060708090a0b0c0d0e0f")
+
+	if _, err := DeriveSessionKeys(stranger, agent.PublicKey().Bytes(), client.PublicKey().Bytes(), "tab", testSalt); err == nil {
+		t.Fatal("a private key matching neither public key was accepted")
 	}
 }
 
@@ -118,7 +181,7 @@ func TestOpenRejectsTampering(t *testing.T) {
 func TestRecordCannotBeReplayedBackAtSender(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	client := fixedKey(t, clientSeed)
-	keys, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-1")
+	keys := derive(t, agent, agent.PublicKey().Bytes(), client.PublicKey().Bytes(), "tab-1", testSalt)
 
 	clientSide, _ := NewSealer(keys.ClientToAgent)
 	agentReading, _ := NewSealer(keys.ClientToAgent)
@@ -151,9 +214,19 @@ func TestOutOfOrderRecordsFail(t *testing.T) {
 
 func TestDeriveRejectsBadPeerKey(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+	good := agent.PublicKey().Bytes()
 	for _, bad := range [][]byte{nil, {}, bytes.Repeat([]byte{1}, 31), bytes.Repeat([]byte{1}, 33)} {
-		if _, err := DeriveSessionKeys(agent, bad, "tab"); err == nil {
-			t.Errorf("peer key of %d bytes was accepted", len(bad))
+		if _, err := DeriveSessionKeys(agent, good, bad, "tab", testSalt); err == nil {
+			t.Errorf("client key of %d bytes was accepted", len(bad))
+		}
+		if _, err := DeriveSessionKeys(agent, bad, client.PublicKey().Bytes(), "tab", testSalt); err == nil {
+			t.Errorf("agent key of %d bytes was accepted", len(bad))
+		}
+	}
+	for _, bad := range [][]byte{nil, {}, bytes.Repeat([]byte{1}, 31)} {
+		if _, err := DeriveSessionKeys(agent, good, client.PublicKey().Bytes(), "tab", bad); err == nil {
+			t.Errorf("salt of %d bytes was accepted", len(bad))
 		}
 	}
 }
@@ -192,15 +265,10 @@ func TestReadRecordRefusesOversizedLength(t *testing.T) {
 func TestSealedStreamRoundTrip(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	client := fixedKey(t, clientSeed)
+	agentPub, clientPub := agent.PublicKey().Bytes(), client.PublicKey().Bytes()
 
-	agentKeys, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	clientKeys, err := DeriveSessionKeys(client, agent.PublicKey().Bytes(), "tab-1")
-	if err != nil {
-		t.Fatal(err)
-	}
+	agentKeys := derive(t, agent, agentPub, clientPub, "tab-1", testSalt)
+	clientKeys := derive(t, client, agentPub, clientPub, "tab-1", testSalt)
 
 	// One pipe per direction, so neither end reads its own writes.
 	toAgent, fromClient := net.Pipe()
@@ -252,5 +320,38 @@ func TestClientHelloRejectsWrongLength(t *testing.T) {
 	}
 	if err := WriteClientHello(&buf, []byte{1, 2, 3}); err == nil {
 		t.Fatal("writing a short client hello must be refused")
+	}
+}
+
+// The server hello carries the per-connection salt and answers to the same
+// discipline as the client hello: exactly one salt-sized record, or refusal.
+func TestServerHelloRoundTrip(t *testing.T) {
+	salt, err := GenerateServerSalt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(salt) != ServerSaltSize {
+		t.Fatalf("salt is %d bytes, want %d", len(salt), ServerSaltSize)
+	}
+	var buf bytes.Buffer
+	if err := WriteServerHello(&buf, salt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadServerHello(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, salt) {
+		t.Fatal("server hello did not round-trip")
+	}
+	if err := WriteServerHello(&buf, []byte{1, 2, 3}); err == nil {
+		t.Fatal("writing a short server hello must be refused")
+	}
+	buf.Reset()
+	if err := WriteRecord(&buf, bytes.Repeat([]byte{1}, ServerSaltSize+1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadServerHello(&buf); err == nil {
+		t.Fatal("a long server hello must be refused")
 	}
 }
