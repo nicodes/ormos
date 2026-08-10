@@ -1,6 +1,7 @@
 package system
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -314,11 +315,68 @@ func TestTerminalReplayIsBounded(t *testing.T) {
 		data[i] = byte(i)
 	}
 	s.output(data)
-	if len(s.buffer) != terminalReplayBytes {
-		t.Fatalf("replay length = %d, want %d", len(s.buffer), terminalReplayBytes)
+	got := s.replay.snapshot()
+	if len(got) != terminalReplayBytes {
+		t.Fatalf("replay length = %d, want %d", len(got), terminalReplayBytes)
 	}
-	if s.buffer[0] != data[100] {
+	if !bytes.Equal(got, data[100:]) {
 		t.Fatal("replay did not retain the newest output")
+	}
+}
+
+// The ring has to hand back exactly the last cap bytes in order, whatever
+// mixture of chunk sizes produced them and however many times it has wrapped.
+func TestReplayRingKeepsTheNewestBytesInOrder(t *testing.T) {
+	const capacity = 64
+	var written []byte
+	r := &replayRing{buf: make([]byte, capacity)}
+	// Chunk sizes that divide the capacity unevenly, so writes straddle the
+	// wrap point rather than landing on it.
+	for i, n := range []int{7, 13, 5, 40, 3, 64, 1, 100, 29, 31} {
+		chunk := make([]byte, n)
+		for j := range chunk {
+			chunk[j] = byte(i*251 + j)
+		}
+		r.append(chunk)
+		written = append(written, chunk...)
+
+		want := written
+		if len(want) > capacity {
+			want = want[len(want)-capacity:]
+		}
+		if got := r.snapshot(); !bytes.Equal(got, want) {
+			t.Fatalf("after appending %d bytes: snapshot = %v, want %v", n, got, want)
+		}
+		// The prefixed form is what the hot path actually calls, and it walks
+		// the ring itself rather than deferring to snapshot.
+		if got, wantPrefixed := r.snapshotAfter("RST"), append([]byte("RST"), want...); !bytes.Equal(got, wantPrefixed) {
+			t.Fatalf("after appending %d bytes: snapshotAfter = %v, want %v", n, got, wantPrefixed)
+		}
+	}
+}
+
+// The point of the ring: steady-state append costs the chunk, not the bound.
+// The old append-and-compact shifted the whole buffer on every PTY read once it
+// was full, so these two capacities used to differ by their ratio.
+//
+// The chunk size is coprime with both capacities on purpose, so every append
+// straddles the wrap point — which is what production chunks, arriving at
+// arbitrary sizes up to terminalCoalesceMax, actually do.
+func BenchmarkReplayRingAppend(b *testing.B) {
+	chunk := make([]byte, 4093)
+	for _, capacity := range []int{terminalReplayBytes, 4 * terminalReplayBytes} {
+		b.Run(fmt.Sprintf("%dKiB", capacity>>10), func(b *testing.B) {
+			r := &replayRing{buf: make([]byte, capacity)}
+			// Fill it first: the steady state being measured is the one where
+			// every append wraps and overwrites.
+			for filled := 0; filled < capacity; filled += len(chunk) {
+				r.append(chunk)
+			}
+			b.SetBytes(int64(len(chunk)))
+			for b.Loop() {
+				r.append(chunk)
+			}
+		})
 	}
 }
 

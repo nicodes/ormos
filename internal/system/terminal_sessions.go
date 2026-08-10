@@ -82,6 +82,80 @@ const (
 // die from SIGHUP before escalating to SIGKILL. A var so tests can shrink it.
 var terminalKillGrace = 2 * time.Second
 
+// replayRing is the bounded terminal history a reattaching or resynchronising
+// xterm redraws from.
+//
+// A fixed ring rather than a slice that is appended to and trimmed, because the
+// trim was a memmove of the whole bound on every single PTY read once the
+// buffer was full. A megabyte of `cat` against a full 256 KiB buffer shifted
+// roughly 64 MB for 1 MB of real output — under the session lock, compounding
+// the head-of-line problem, and running even with no client attached at all, so
+// a detached build spamming logs burned CPU indefinitely. Steady-state append
+// is now O(chunk) and independent of the bound.
+//
+// Not safe for concurrent use: terminalSession.mu covers every call, in the
+// same way it covers broadcast.
+//
+// A zero value is usable and sizes itself to terminalReplayBytes on first
+// append. Capacity is len(buf) rather than a field of its own, so there is no
+// second copy of it to disagree; tests and the benchmark shrink it by
+// constructing the ring with a buffer of the size they want.
+type replayRing struct {
+	buf   []byte
+	start int // index of the oldest byte held
+	size  int // bytes held
+}
+
+func (r *replayRing) append(p []byte) {
+	if r.buf == nil {
+		r.buf = make([]byte, terminalReplayBytes)
+	}
+	capacity := len(r.buf)
+	// A chunk at least as large as the whole ring replaces it outright; only
+	// its tail could survive anyway.
+	if len(p) >= capacity {
+		copy(r.buf, p[len(p)-capacity:])
+		r.start, r.size = 0, capacity
+		return
+	}
+	end := (r.start + r.size) % capacity
+	n := copy(r.buf[end:], p)
+	copy(r.buf, p[n:])
+	if r.size += len(p); r.size > capacity {
+		r.start = (r.start + r.size - capacity) % capacity
+		r.size = capacity
+	}
+}
+
+// snapshotAfter returns prefix followed by the history, oldest-first, in a
+// single allocation and a single pass.
+//
+// One copy rather than two, because this runs under the session lock on the PTY
+// read path: snapshot-then-concatenate moved the whole bound twice, which is
+// most of what the ring exists to stop doing.
+func (r *replayRing) snapshotAfter(prefix string) []byte {
+	out := make([]byte, 0, len(prefix)+r.size)
+	out = append(out, prefix...)
+	out = append(out, r.buf[r.start:min(r.start+r.size, len(r.buf))]...)
+	if tail := r.size - (len(out) - len(prefix)); tail > 0 {
+		out = append(out, r.buf[:tail]...)
+	}
+	return out
+}
+
+// snapshot returns the history oldest-first as one contiguous slice.
+//
+// It copies, which is both what lets the ring keep wrapping underneath and what
+// makes the result safe to hand to a connection's writer goroutine. That copy
+// is paid per attach or per resynchronisation — both rare — rather than once
+// per PTY read.
+func (r *replayRing) snapshot() []byte {
+	out := make([]byte, r.size)
+	n := copy(out, r.buf[r.start:min(r.start+r.size, len(r.buf))])
+	copy(out[n:], r.buf)
+	return out
+}
+
 // terminalSession owns the PTY independently of any one tunnel stream. A
 // browser disconnect only replaces conn; the shell and buffered output remain.
 type terminalSession struct {
@@ -95,7 +169,7 @@ type terminalSession struct {
 	mu        sync.Mutex
 	inputMu   sync.Mutex
 	conns     map[*sealedConn]struct{}
-	buffer    []byte
+	replay    replayRing
 	active    bool
 	closed    bool
 	expires   *time.Timer
@@ -625,11 +699,7 @@ func (s *terminalSession) output(data []byte) {
 		s.mu.Unlock()
 		return
 	}
-	s.buffer = append(s.buffer, data...)
-	if len(s.buffer) > terminalReplayBytes {
-		copy(s.buffer, s.buffer[len(s.buffer)-terminalReplayBytes:])
-		s.buffer = s.buffer[:terminalReplayBytes]
-	}
+	s.replay.append(data)
 	var dropped []*sealedConn
 	if len(s.conns) > 0 {
 		// Encoded here, under the lock, rather than before it. encodeFrame
@@ -658,9 +728,7 @@ func (s *terminalSession) output(data []byte) {
 // catchUp is the replay history behind a screen reset: what a connection needs
 // in order to redraw, whether it is new or has just missed frames.
 func (s *terminalSession) catchUp() []byte {
-	out := make([]byte, 0, len(terminalResyncPrefix)+len(s.buffer))
-	out = append(out, terminalResyncPrefix...)
-	return append(out, s.buffer...)
+	return s.replay.snapshotAfter(terminalResyncPrefix)
 }
 
 // broadcast queues one encoded frame on every attached connection, collapsing
