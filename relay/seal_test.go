@@ -29,16 +29,21 @@ const (
 	clientSeed = "6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80"
 )
 
-// Both ends must derive the same two keys from opposite sides of the agreement.
+// testSalt is a deterministic stand-in for the per-connection server salt so
+// derivations in tests are reproducible.
+var testSalt = bytes.Repeat([]byte{0x5a}, SealSaltSize)
+
+// Both ends must derive the same two keys from opposite sides of the agreement,
+// given the same server salt.
 func TestDeriveSessionKeysAgree(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	client := fixedKey(t, clientSeed)
 
-	a, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-1")
+	a, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), testSalt, "tab-1")
 	if err != nil {
 		t.Fatalf("agent derive: %v", err)
 	}
-	c, err := DeriveSessionKeys(client, agent.PublicKey().Bytes(), "tab-1")
+	c, err := DeriveSessionKeys(client, agent.PublicKey().Bytes(), testSalt, "tab-1")
 	if err != nil {
 		t.Fatalf("client derive: %v", err)
 	}
@@ -56,10 +61,58 @@ func TestSessionIDSeparatesStreams(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	client := fixedKey(t, clientSeed)
 
-	one, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-1")
-	two, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-2")
+	one, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), testSalt, "tab-1")
+	two, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), testSalt, "tab-2")
 	if bytes.Equal(one.ClientToAgent, two.ClientToAgent) {
 		t.Fatal("different sessions derived the same key")
+	}
+}
+
+// A fresh server salt separates connections even when everything else — both
+// keypairs and the session id — is identical, which is what keeps the counter
+// nonces safe across a reattach that reuses a client ephemeral.
+func TestServerSaltSeparatesConnections(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+
+	saltA := bytes.Repeat([]byte{0x01}, SealSaltSize)
+	saltB := bytes.Repeat([]byte{0x02}, SealSaltSize)
+	one, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), saltA, "tab-1")
+	two, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), saltB, "tab-1")
+	if bytes.Equal(one.ClientToAgent, two.ClientToAgent) || bytes.Equal(one.AgentToClient, two.AgentToClient) {
+		t.Fatal("different server salts derived the same key")
+	}
+}
+
+// Both ends must use the same salt to agree: a mismatched salt breaks the
+// derivation, which is what makes the server hello a required handshake step
+// rather than advisory.
+func TestSaltMismatchBreaksAgreement(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+
+	saltA := bytes.Repeat([]byte{0x01}, SealSaltSize)
+	saltB := bytes.Repeat([]byte{0x02}, SealSaltSize)
+	a, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), saltA, "tab-1")
+	c, _ := DeriveSessionKeys(client, agent.PublicKey().Bytes(), saltB, "tab-1")
+	if bytes.Equal(a.ClientToAgent, c.ClientToAgent) {
+		t.Fatal("the two ends agreed on a key despite different salts")
+	}
+}
+
+// The client's view of the agent's public key is bound into the schedule, so a
+// relay that hands the client a substituted key makes the client derive a key
+// the real agent never shares — the stream fails closed rather than being read.
+func TestAgentKeyIsBoundIntoSchedule(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+	imposter := fixedKey(t, "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc")
+
+	real, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), testSalt, "tab-1")
+	// The client, fed the imposter's key by a hostile relay, derives against it.
+	swapped, _ := DeriveSessionKeys(client, imposter.PublicKey().Bytes(), testSalt, "tab-1")
+	if bytes.Equal(real.ClientToAgent, swapped.ClientToAgent) {
+		t.Fatal("a substituted agent key still derived the agent's own key")
 	}
 }
 
@@ -118,7 +171,7 @@ func TestOpenRejectsTampering(t *testing.T) {
 func TestRecordCannotBeReplayedBackAtSender(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	client := fixedKey(t, clientSeed)
-	keys, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-1")
+	keys, _ := DeriveSessionKeys(agent, client.PublicKey().Bytes(), testSalt, "tab-1")
 
 	clientSide, _ := NewSealer(keys.ClientToAgent)
 	agentReading, _ := NewSealer(keys.ClientToAgent)
@@ -152,9 +205,67 @@ func TestOutOfOrderRecordsFail(t *testing.T) {
 func TestDeriveRejectsBadPeerKey(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	for _, bad := range [][]byte{nil, {}, bytes.Repeat([]byte{1}, 31), bytes.Repeat([]byte{1}, 33)} {
-		if _, err := DeriveSessionKeys(agent, bad, "tab"); err == nil {
+		if _, err := DeriveSessionKeys(agent, bad, testSalt, "tab"); err == nil {
 			t.Errorf("peer key of %d bytes was accepted", len(bad))
 		}
+	}
+}
+
+// A salt of the wrong length is refused rather than stretched or truncated: it
+// feeds the key schedule, and silently accepting a malformed one would let a
+// broken peer derive an agreed-but-unintended key.
+func TestDeriveRejectsBadSalt(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+	for _, bad := range [][]byte{nil, {}, bytes.Repeat([]byte{1}, SealSaltSize-1), bytes.Repeat([]byte{1}, SealSaltSize+1)} {
+		if _, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), bad, "tab"); err == nil {
+			t.Errorf("salt of %d bytes was accepted", len(bad))
+		}
+	}
+}
+
+// The server hello round-trips as a length-prefixed record, and a reply that is
+// not exactly a salt is refused at the handshake.
+func TestServerHelloRoundTripAndLength(t *testing.T) {
+	var buf bytes.Buffer
+	salt := bytes.Repeat([]byte{0x33}, ServerHelloSize)
+	if err := WriteServerHello(&buf, salt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadServerHello(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, salt) {
+		t.Fatal("server hello did not round-trip")
+	}
+	if err := WriteServerHello(&buf, []byte{1, 2, 3}); err == nil {
+		t.Fatal("writing a short server hello must be refused")
+	}
+	var short bytes.Buffer
+	if err := WriteRecord(&short, bytes.Repeat([]byte{1}, ServerHelloSize-1)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadServerHello(&short); err == nil {
+		t.Fatal("a short server hello must be refused")
+	}
+}
+
+// The fingerprint is deterministic, formatted as four groups of four base32
+// characters, and distinguishes different keys — the whole point of showing it
+// for out-of-band verification.
+func TestFingerprint(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+	fp := Fingerprint(agent.PublicKey().Bytes())
+	if fp != Fingerprint(agent.PublicKey().Bytes()) {
+		t.Fatal("fingerprint is not deterministic")
+	}
+	if want := "XXXX-XXXX-XXXX-XXXX"; len(fp) != len(want) {
+		t.Fatalf("fingerprint %q is not the %d-char grouped form", fp, len(want))
+	}
+	if Fingerprint(agent.PublicKey().Bytes()) == Fingerprint(client.PublicKey().Bytes()) {
+		t.Fatal("different keys produced the same fingerprint")
 	}
 }
 
@@ -193,11 +304,11 @@ func TestSealedStreamRoundTrip(t *testing.T) {
 	agent := fixedKey(t, agentSeed)
 	client := fixedKey(t, clientSeed)
 
-	agentKeys, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), "tab-1")
+	agentKeys, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), testSalt, "tab-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientKeys, err := DeriveSessionKeys(client, agent.PublicKey().Bytes(), "tab-1")
+	clientKeys, err := DeriveSessionKeys(client, agent.PublicKey().Bytes(), testSalt, "tab-1")
 	if err != nil {
 		t.Fatal(err)
 	}

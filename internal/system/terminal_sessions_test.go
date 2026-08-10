@@ -29,11 +29,15 @@ func sealedPair(t *testing.T, sessionID string) (agent *sealedConn, client *rela
 	if err != nil {
 		t.Fatal(err)
 	}
-	agentKeys, err := relay.DeriveSessionKeys(agentKey, clientKey.PublicKey().Bytes(), sessionID)
+	salt, err := relay.GenerateServerSalt()
 	if err != nil {
 		t.Fatal(err)
 	}
-	clientKeys, err := relay.DeriveSessionKeys(clientKey, agentKey.PublicKey().Bytes(), sessionID)
+	agentKeys, err := relay.DeriveSessionKeys(agentKey, clientKey.PublicKey().Bytes(), salt, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientKeys, err := relay.DeriveSessionKeys(clientKey, agentKey.PublicKey().Bytes(), salt, sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
