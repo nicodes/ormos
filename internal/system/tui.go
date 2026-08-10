@@ -167,6 +167,7 @@ type model struct {
 	status  Status
 	info    *relay.SystemInfo // system's own name/etc. from the relay
 	machine string            // "<distro> - <host> - <goos>/<goarch>"
+	keyfp   string            // fingerprint of this machine's terminal key
 	notice  string            // last success line
 	err     string            // last error line
 	ticks   int
@@ -178,7 +179,7 @@ func newModel(d *system) model {
 	ti := textinput.New()
 	ti.Prompt = "› "
 	ti.CharLimit = 512
-	return model{d: d, status: d.Snapshot(), input: ti, live: map[int]bool{}, machine: machineName()}
+	return model{d: d, status: d.Snapshot(), input: ti, live: map[int]bool{}, machine: machineName(), keyfp: relay.Fingerprint(d.key.PublicKey().Bytes())}
 }
 
 func (m model) Init() tea.Cmd {
@@ -592,7 +593,11 @@ func (m model) View() string {
 		nameVal = selStyle.Render(name)
 	}
 	b.WriteString(nameCursor + labelStyle.Render("name     ") + nameVal + "\n")
-	b.WriteString("  " + labelStyle.Render("machine  ") + m.machine + "\n\n")
+	b.WriteString("  " + labelStyle.Render("machine  ") + m.machine + "\n")
+	// The terminal key's fingerprint, always on screen: it is the string the
+	// app pins and shows for this system, so a relay serving a substituted key
+	// is caught by comparing the two out of band.
+	b.WriteString("  " + labelStyle.Render("key      ") + m.keyfp + " " + hintStyle.Render("(compare with the app)") + "\n\n")
 
 	b.WriteString(sectionStyle.Render("PROJECTS") + "\n")
 	if len(m.projects) == 0 {
