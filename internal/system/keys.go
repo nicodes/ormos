@@ -77,3 +77,11 @@ const publicKeyHeader = "X-Ormos-Public-Key"
 func encodePublicKey(key *ecdh.PrivateKey) string {
 	return base64.StdEncoding.EncodeToString(key.PublicKey().Bytes())
 }
+
+// Fingerprint is the short base32 fingerprint of this machine's sealing key,
+// for out-of-band verification: it is printed on startup (headless) and shown
+// in the dashboard (TUI) so a user can read it against what the app pins and
+// catch a relay that swapped the key. See relay.Fingerprint.
+func (d *system) Fingerprint() string {
+	return relay.Fingerprint(d.key.PublicKey().Bytes())
+}
