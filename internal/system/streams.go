@@ -12,10 +12,9 @@ import (
 	"github.com/nicodes/ormos/relay"
 )
 
-// expandHome resolves a leading ~ (or ~/) to the agent's home directory and
-// expands $VARS, so a project root_dir like "~/code/app" works — the daemon
-// sets cmd.Dir directly, so no shell is around to expand it.
-func expandHome(p string) string {
+// expandHomeDir resolves a leading ~ (or ~/) to the agent's home directory —
+// the daemon sets cmd.Dir directly, so no shell is around to expand it.
+func expandHomeDir(p string) string {
 	if p == "~" {
 		if home, err := os.UserHomeDir(); err == nil {
 			return home
@@ -25,7 +24,28 @@ func expandHome(p string) string {
 			p = filepath.Join(home, p[2:])
 		}
 	}
-	return os.ExpandEnv(p)
+	return p
+}
+
+// expandHome resolves ~ and expands $VARS, so a local policy root like
+// "~/code/app" works. This is for LOCAL configuration only (policy
+// allowedRoots): anything the relay sends goes through expandRelayCwd, which
+// must not expand this machine's environment on the relay's behalf.
+func expandHome(p string) string {
+	return os.ExpandEnv(expandHomeDir(p))
+}
+
+// expandRelayCwd resolves a directory the relay asked for. It gets ~
+// expansion only: running os.ExpandEnv on relay input would be an oracle for
+// probing this machine's environment (did "$FOO/app" open a terminal where
+// "/literal/app" did not? then FOO expanded to something real). A path that
+// still contains a $ after the tilde pass is rejected outright.
+func expandRelayCwd(p string) (string, error) {
+	p = expandHomeDir(p)
+	if strings.ContainsRune(p, '$') {
+		return "", fmt.Errorf("directory %q contains a $ variable; the agent does not expand relay-supplied paths", p)
+	}
+	return p, nil
 }
 
 // serveStream reads a stream's header and dispatches to the right handler.
