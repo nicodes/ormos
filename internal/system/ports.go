@@ -12,10 +12,11 @@ import (
 
 // listeningPorts returns the set of TCP ports the host is currently listening on
 // via a loopback or wildcard address — i.e. ports reachable by dialing
-// 127.0.0.1. This set is reported to the relay (KindListPorts) for live-status
-// highlighting, so the system discloses its loopback listener set to the relay
-// it is paired with. Linux-only (parses /proc/net/tcp*); returns nil elsewhere,
-// so on macOS/other the TUI shows no live status.
+// 127.0.0.1. Callers disclose this set to the relay (KindListPorts) for
+// live-status highlighting, so they must filter it through local policy first
+// (see handleListPorts): the listing alone tells the relay which services
+// this machine runs. Linux-only (parses /proc/net/tcp*); returns nil
+// elsewhere, so on macOS/other the TUI shows no live status.
 // TODO(macos): fall back to `lsof -iTCP -sTCP:LISTEN` / netstat.
 func listeningPorts() []int {
 	set := map[int]struct{}{}
@@ -82,13 +83,29 @@ func isLoopbackOrWildcard(ipHex string) bool {
 	return false
 }
 
-// handleListPorts writes the current listening ports as a JSON array and returns.
+// handleListPorts writes the listening ports the relay may know about, as a
+// JSON array, and returns. The listing is itself a disclosure — it enumerates
+// the services this machine runs — so each port faces the same proxyAllowed
+// decision a dial would, the request is audited, and a policy that cannot be
+// read discloses nothing at all.
 func (d *system) handleListPorts(stream io.Writer) {
-	ports := listeningPorts()
-	if ports == nil {
-		ports = []int{}
+	pol, policyOK := d.livePolicy()
+	if !policyOK {
+		d.audit.record(auditEntry{Event: "list-ports", Detail: "policy unreadable", Allowed: false})
+		if err := json.NewEncoder(stream).Encode([]int{}); err != nil {
+			d.logf("list ports encode: %v", err)
+		}
+		return
 	}
-	if err := json.NewEncoder(stream).Encode(ports); err != nil {
+	ports := listeningPorts()
+	allowed := make([]int, 0, len(ports))
+	for _, port := range ports {
+		if ok, _ := pol.proxyAllowed(port); ok {
+			allowed = append(allowed, port)
+		}
+	}
+	d.audit.record(auditEntry{Event: "list-ports", Allowed: true})
+	if err := json.NewEncoder(stream).Encode(allowed); err != nil {
 		d.logf("list ports encode: %v", err)
 	}
 }
