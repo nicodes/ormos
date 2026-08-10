@@ -21,6 +21,10 @@ const (
 	maxTerminalSessions = 32
 )
 
+// terminalKillGrace is how long close waits for the shell's process group to
+// die from SIGHUP before escalating to SIGKILL. A var so tests can shrink it.
+var terminalKillGrace = 2 * time.Second
+
 // terminalSession owns the PTY independently of any one tunnel stream. A
 // browser disconnect only replaces conn; the shell and buffered output remain.
 type terminalSession struct {
@@ -29,6 +33,7 @@ type terminalSession struct {
 	cwd   string // the directory policy was evaluated against
 	ptmx  *os.File
 	cmd   *exec.Cmd
+	pgid  int // the shell's process group id (it leads it: pty.Start sets Setsid)
 
 	mu        sync.Mutex
 	inputMu   sync.Mutex
@@ -149,10 +154,21 @@ func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
 	if err != nil {
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
+	// pty.Start runs the shell with Setsid, so it leads a new session and its
+	// process group id equals its pid. Capture the pgid now — close needs it
+	// to signal the whole group, and by the time close runs the shell may
+	// already be gone.
+	pgid, err := unix.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, fmt.Errorf("read shell process group: %w", err)
+	}
 	if h.Cols > 0 && h.Rows > 0 {
 		_ = pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(h.Cols), Rows: uint16(h.Rows)})
 	}
-	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, conns: make(map[*sealedConn]struct{}), done: make(chan struct{})}
+	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[*sealedConn]struct{}), done: make(chan struct{})}
 	d.terminals[h.SessionID] = s
 	d.addSession(1)
 	d.logf("terminal session started (%s)", d.cfg.Shell)
@@ -332,6 +348,52 @@ func (s *terminalSession) setActivity(active bool) {
 	}
 }
 
+// killProcessGroup ends the shell and everything it spawned. Signalling only
+// the shell's pid leaves children behind — detached from the dead terminal but
+// still running — which is exactly what a policy revocation (enforcePolicy) is
+// meant to stop. The shell leads its own process group (pty.Start sets
+// Setsid), so signalling -pgid reaches the group.
+//
+// SIGHUP first: a well-behaved process group exits on it, and the PTY master
+// is closed right after so anything blocked on terminal I/O wakes with EIO.
+// Whatever of the group is still there once the shell has been reaped — a
+// child that ignores SIGHUP, a stopped job — gets the rest of a short grace
+// and then SIGKILL, because a close that returns with the group alive has not
+// closed anything that matters.
+func (s *terminalSession) killProcessGroup() {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return
+	}
+	if s.pgid > 0 {
+		_ = unix.Kill(-s.pgid, unix.SIGHUP)
+	} else {
+		_ = s.cmd.Process.Kill()
+	}
+	_ = s.ptmx.Close()
+	reaped := make(chan struct{})
+	go func() {
+		_, _ = s.cmd.Process.Wait()
+		close(reaped)
+	}()
+	grace := time.NewTimer(terminalKillGrace)
+	defer grace.Stop()
+	graced := false
+	select {
+	case <-reaped:
+	case <-grace.C:
+		graced = true
+	}
+	if s.pgid > 0 && unix.Kill(-s.pgid, 0) == nil {
+		// The group outlived the shell; let the grace run out before the
+		// SIGKILL, unless it already has.
+		if !graced {
+			<-grace.C
+		}
+		_ = unix.Kill(-s.pgid, unix.SIGKILL)
+	}
+	<-reaped
+}
+
 func (s *terminalSession) close() {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
@@ -342,9 +404,7 @@ func (s *terminalSession) close() {
 		for conn := range conns {
 			_ = conn.Close()
 		}
-		_ = s.ptmx.Close()
-		_ = s.cmd.Process.Kill()
-		_, _ = s.cmd.Process.Wait()
+		s.killProcessGroup()
 		close(s.done)
 
 		s.owner.terminalMu.Lock()
