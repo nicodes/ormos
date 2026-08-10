@@ -106,17 +106,27 @@ func (m loginModel) View() string {
 			"Open " + link + " and enter the code:",
 			selStyle.Render(m.code),
 			hintStyle.Render(fmt.Sprintf("expires in %d seconds", m.expiresIn)),
-			hintStyle.Render("ctrl-c to cancel"),
 		}, "\n")
 	}
-
-	// Centre every line under the block title, then place the whole block in
-	// the middle of the terminal (horizontally and vertically).
+	// Centre every line under the block title.
 	body = lipgloss.NewStyle().Align(lipgloss.Center).Render(body)
-	if m.width > 0 && m.height > 0 {
-		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, body)
+
+	// Without a known size yet, stack the block and the quit hint so the code is
+	// never hidden.
+	if m.width <= 0 || m.height <= 0 {
+		return body + "\n\n" + hintStyle.Render("ctrl-c to quit")
 	}
-	return body
+
+	// The quit hint lives in a footer fenced off by a full-width divider and
+	// pinned to the bottom; the code block fills the space above it, centred
+	// horizontally and vertically.
+	footer := divider(m.width) + "\n" +
+		lipgloss.PlaceHorizontal(m.width, lipgloss.Center, hintStyle.Render("ctrl-c to quit"))
+	if avail := m.height - lipgloss.Height(footer); avail >= 1 {
+		top := lipgloss.Place(m.width, avail, lipgloss.Center, lipgloss.Center, body)
+		return top + "\n" + footer
+	}
+	return body + "\n" + footer
 }
 
 // blockOrmos renders "ORMOS" as five-row block letters.
