@@ -107,7 +107,9 @@ func loadConfigFile() (systemConfig, error) {
 
 // saveConfigFile writes the config file, creating the directory. The file holds
 // the pairing token (a secret), so it is written 0600 in a 0700 directory,
-// analogous to ~/.aws/credentials.
+// analogous to ~/.aws/credentials. The write is crash-atomic (see
+// atomicWriteFile): now that #97 makes a corrupt or truncated saved config fatal
+// at startup, a crash or power loss mid-write must not brick the agent.
 func saveConfigFile(cfg systemConfig) error {
 	path, err := configPath()
 	if err != nil {
@@ -120,7 +122,59 @@ func saveConfigFile(cfg systemConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	return atomicWriteFile(path, data, 0o600)
+}
+
+// atomicWriteFile writes data to path crash-atomically: it writes a fresh temp
+// file in the same directory, fsyncs its contents, renames it into place, then
+// fsyncs the directory so the rename itself survives a crash. A reader therefore
+// only ever observes the complete old file or the complete new one — never a
+// truncated, half-written config (which #97 makes fatal at startup).
+//
+// It is also symlink-safe and permission-correcting for free. The target is
+// never opened for writing; we write a fresh temp file (O_CREATE|O_EXCL, random
+// name, so it cannot resolve through an attacker's pre-placed symlink) and rename
+// it over path. os.Rename replaces a symlink at path rather than following it, so
+// a planted link can never redirect the write to another file. Because the result
+// is always the freshly created temp inode, chmod'd to perm, a loosened mode on
+// any prior file at path is corrected rather than inherited.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	// On any failure, close and remove the temp file so no partial write is left
+	// behind; after a successful rename tmp no longer exists, so this is skipped.
+	defer func() {
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err = f.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// Best-effort fsync of the directory so the rename (the entry that now points
+	// at the new file) is durable across a crash; failing to open it is not fatal.
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // clearLoginConfig removes locally saved authentication while preserving the
