@@ -11,3 +11,9 @@
 # The "Toolchain pins agree" step in ci.yml is what stops that happening again.
 # If you bump go.mod, bump this too; CI will tell you if you forget.
 go = "1.25.0"
+
+# The supply-chain scanner CI runs against the binary: `govulncheck ./...` in
+# .github/actions/test. It reports only vulnerabilities on a path the code
+# actually calls, so a green run means no reachable CVE, not merely that go.sum
+# is current. Pinned like the toolchain so the check is reproducible.
+"go:golang.org/x/vuln/cmd/govulncheck" = "1.6.0"

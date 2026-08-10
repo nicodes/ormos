@@ -41,3 +41,13 @@ runs:
     - name: Go tests
       shell: bash
       run: go test -race -count=1 ./...
+
+    # Known vulnerabilities in the module graph the binary actually reaches.
+    # govulncheck reports only vulns on a path the code calls and exits non-zero
+    # when it finds one, so this fails the build on a reachable CVE rather than
+    # leaving it to a report nobody reads. Installed from the govulncheck pin in
+    # .mise.toml. Last, because it does its own analysis over the build the
+    # steps above already warmed.
+    - name: govulncheck
+      shell: bash
+      run: govulncheck ./...
