@@ -225,3 +225,90 @@ func waitQuiet(t testing.TB, c *recordCounter, want int) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// A megabyte of bulk output must not cost a sealed record, a yamux frame, a
+// WebSocket message, a fresh ChaCha instance and a term.write per tty chunk.
+func TestTerminalReadCoalescesBulkOutput(t *testing.T) {
+	const payload = 1 << 20
+	ptmx, tty := ptyPair(t)
+	r, err := newPTYReader(ptmx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go fill(t, tty, payload, 64<<10)
+
+	type result struct{ total, reads, chunks int }
+	done := make(chan result, 1)
+	go func() {
+		buf := make([]byte, terminalCoalesceMax)
+		var got result
+		for got.total < payload {
+			n, rd, err := r.read(buf)
+			got.total += n
+			got.reads += rd
+			if n > 0 {
+				got.chunks++
+			}
+			if err != nil {
+				break
+			}
+		}
+		done <- got
+	}()
+
+	// Bounded, so a producer that gave up fails here rather than parking until
+	// the package's ten-minute panic buries the reason under a goroutine dump.
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("the PTY read loop never finished; the producer stopped early")
+	}
+	if got.total < payload {
+		t.Fatalf("read %d of %d bytes", got.total, payload)
+	}
+
+	perChunk := got.total / max(got.chunks, 1)
+	t.Logf("1 MiB of PTY output: %d reads coalesced into %d chunks (%d bytes/chunk)",
+		got.reads, got.chunks, perChunk)
+	// Two bars, because they fail for different reasons. Bytes per chunk is
+	// what actually matters downstream, and it is stable now that the window
+	// opens on the size of the first read rather than on whether the writer
+	// happened to be scheduled. Reads per chunk is immune to how fast the
+	// producer runs at all: uncoalesced it is exactly 1.0 by construction.
+	if perChunk < 16<<10 {
+		t.Errorf("%d reads produced %d chunks of %d bytes; output is not being coalesced", got.reads, got.chunks, perChunk)
+	}
+	if got.reads < 2*got.chunks {
+		t.Errorf("%d reads produced %d chunks; fewer than two reads per chunk is not coalescing", got.reads, got.chunks)
+	}
+}
+
+// The other half of the trade: a lone keystroke echo has nothing behind it and
+// must leave immediately rather than wait out the coalescing window.
+func TestTerminalEchoSkipsTheCoalescingWindow(t *testing.T) {
+	ptmx, tty := ptyPair(t)
+	r, err := newPTYReader(ptmx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tty.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, terminalCoalesceMax)
+	start := time.Now()
+	n, reads, err := r.read(buf)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || string(buf[:n]) != "x" {
+		t.Fatalf("read %d bytes (%q), want the one echoed byte", n, buf[:n])
+	}
+	if reads != 1 {
+		t.Fatalf("a lone byte cost %d reads; it is waiting when it must not", reads)
+	}
+	if elapsed >= terminalCoalesceWindow {
+		t.Fatalf("a lone byte took %s to leave; the coalescing window is charging interactive latency", elapsed)
+	}
+}
