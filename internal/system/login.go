@@ -230,7 +230,7 @@ func postRelayJSON(ctx context.Context, url string, body, out any) error {
 		}
 		return fmt.Errorf("relay returned %s", resp.Status)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return decodeRelayJSON(resp.Body, out)
 }
 
 // headlessCodeDisplay prints the pairing code plainly to stdout — the mode
