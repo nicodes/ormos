@@ -165,10 +165,10 @@ func EncodeActivity(active bool) []byte {
 }
 
 func encodeFrame(tag termTag, payload []byte) []byte {
-	out := make([]byte, 5+len(payload))
+	out := make([]byte, frameHeaderSize+len(payload))
 	out[0] = byte(tag)
 	binary.BigEndian.PutUint32(out[1:], uint32(len(payload)))
-	copy(out[5:], payload)
+	copy(out[frameHeaderSize:], payload)
 	return out
 }
 
@@ -193,18 +193,18 @@ func writeAll(w io.Writer, p []byte) error {
 // by the peer: a frame claiming to be longer than it is must be an error, not a
 // slice past the end.
 func DecodeFrame(b []byte) (TermFrame, error) {
-	if len(b) < 5 {
+	if len(b) < frameHeaderSize {
 		return TermFrame{}, fmt.Errorf("terminal frame shorter than its header")
 	}
 	tag := termTag(b[0])
-	n := binary.BigEndian.Uint32(b[1:5])
+	n := binary.BigEndian.Uint32(b[1:frameHeaderSize])
 	if n > MaxFrameSize {
 		return TermFrame{}, fmt.Errorf("terminal frame length %d exceeds max %d", n, MaxFrameSize)
 	}
-	if int(n)+5 > len(b) {
-		return TermFrame{}, fmt.Errorf("terminal frame length %d overruns the %d bytes present", n, len(b)-5)
+	if int(n)+frameHeaderSize > len(b) {
+		return TermFrame{}, fmt.Errorf("terminal frame length %d overruns the %d bytes present", n, len(b)-frameHeaderSize)
 	}
-	payload := b[5 : 5+n]
+	payload := b[frameHeaderSize : frameHeaderSize+n]
 	switch tag {
 	case tagData:
 		return TermFrame{Data: payload}, nil

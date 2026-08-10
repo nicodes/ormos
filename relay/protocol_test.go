@@ -92,6 +92,30 @@ func TestDecodeFrameRejectsOverrunAndTruncation(t *testing.T) {
 	}
 }
 
+// MaxSealedRecord must budget for exactly a maximal terminal frame plus the
+// frame header plus the AEAD tag. This is the single relationship the relay's
+// read limit depends on: a maximal legitimate paste seals to MaxSealedRecord
+// bytes, which is larger than MaxFrameSize, so a read limit of MaxFrameSize
+// (the old api/terminal.go bug) would reject it.
+func TestMaxSealedRecordBudget(t *testing.T) {
+	if MaxSealedRecord != MaxFrameSize+frameHeaderSize+sealOverhead {
+		t.Fatalf("MaxSealedRecord = %d, want MaxFrameSize+frameHeaderSize+sealOverhead = %d",
+			MaxSealedRecord, MaxFrameSize+frameHeaderSize+sealOverhead)
+	}
+	// Construct the real thing: a frame at the payload ceiling, sealed.
+	sealer, err := NewSealer(bytes.Repeat([]byte{1}, SealKeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := sealer.Seal(EncodeData(bytes.Repeat([]byte{2}, MaxFrameSize)))
+	if len(rec) != MaxSealedRecord {
+		t.Fatalf("maximal sealed record = %d bytes, want MaxSealedRecord = %d", len(rec), MaxSealedRecord)
+	}
+	if len(rec) <= MaxFrameSize {
+		t.Fatalf("maximal sealed record %d should exceed MaxFrameSize %d", len(rec), MaxFrameSize)
+	}
+}
+
 // A header line with no newline must not buffer without bound.
 func TestReadHeaderRejectsOversized(t *testing.T) {
 	big := bytes.Repeat([]byte("a"), MaxHeaderSize+10) // no newline
