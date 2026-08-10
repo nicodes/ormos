@@ -7,10 +7,12 @@ import (
 	"crypto/hkdf"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base32"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -83,6 +85,18 @@ var ErrSealFailed = errors.New("sealed record failed authentication")
 // GenerateAgentKey returns a new X25519 private key for an agent.
 func GenerateAgentKey() (*ecdh.PrivateKey, error) {
 	return ecdh.X25519().GenerateKey(rand.Reader)
+}
+
+// Fingerprint renders a public key as a short string two people can compare
+// out of band: the agent prints it on startup, and the app shows it for the
+// key it has pinned, so a relay that substitutes the published key is visible
+// to anyone who looks. It is SHA-256 of the raw key, truncated to 10 bytes and
+// base32-encoded (RFC 4648, no padding, lowercase) — 16 characters. The app
+// implements the same recipe; the test below pins the exact string so the two
+// cannot drift.
+func Fingerprint(pub []byte) string {
+	sum := sha256.Sum256(pub)
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(sum[:10]))
 }
 
 // SessionKeys are the two directional keys derived from one agreement. Each

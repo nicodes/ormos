@@ -459,6 +459,10 @@ func (d *system) deletePort(ctx context.Context, portID string) error {
 // Run connects to the relay and serves the tunnel, reconnecting with backoff
 // until ctx is cancelled.
 func (d *system) Run(ctx context.Context) {
+	// The fingerprint of this machine's terminal key, on every start: it is the
+	// string the app pins and shows, so an operator can compare the two out of
+	// band and catch a relay serving a substituted key.
+	d.logf("terminal key fingerprint: %s", relay.Fingerprint(d.key.PublicKey().Bytes()))
 	// Reaching here with a cleartext remote relay means the operator opted in
 	// via ORMOS_INSECURE=1 (runSystem refuses it otherwise) — say so loudly,
 	// every reconnect.

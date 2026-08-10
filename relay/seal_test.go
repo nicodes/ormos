@@ -126,6 +126,20 @@ func TestDeriveRejectsMismatchedOwnKey(t *testing.T) {
 	}
 }
 
+// The fingerprint recipe is a cross-language contract: the app computes the
+// same string from the same key and shows it for out-of-band comparison. Pin
+// the exact value so the two implementations cannot drift.
+func TestFingerprintPinned(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	got := Fingerprint(agent.PublicKey().Bytes())
+	if got != "my3lxwl77sao4idr" {
+		t.Fatalf("Fingerprint = %q, want %q", got, "my3lxwl77sao4idr")
+	}
+	if len(got) != 16 {
+		t.Fatalf("fingerprint is %d characters, want 16", len(got))
+	}
+}
+
 func TestSealRoundTrip(t *testing.T) {
 	key := bytes.Repeat([]byte{7}, SealKeySize)
 	sender, err := NewSealer(key)
