@@ -459,8 +459,11 @@ func (d *system) deletePort(ctx context.Context, portID string) error {
 // Run connects to the relay and serves the tunnel, reconnecting with backoff
 // until ctx is cancelled.
 func (d *system) Run(ctx context.Context) {
+	// Reaching here with a cleartext remote relay means the operator opted in
+	// via ORMOS_INSECURE=1 (runSystem refuses it otherwise) — say so loudly,
+	// every reconnect.
 	if insecureRemoteRelay(d.cfg.RelayURL) {
-		d.logf("WARNING: %s is a remote cleartext relay; the pairing token is sent unencrypted — use wss://", d.cfg.RelayURL)
+		d.logf("WARNING: %s is a remote cleartext relay; the pairing token is sent unencrypted (allowed by ORMOS_INSECURE=1) — use wss://", d.cfg.RelayURL)
 	}
 	go d.pollPorts(ctx)
 	backoff := minBackoff
@@ -468,17 +471,26 @@ func (d *system) Run(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		began := time.Now()
 		connected, err := d.connectAndServe(ctx)
 		if ctx.Err() != nil {
 			return
 		}
-		if connected {
-			backoff = minBackoff // a healthy connection resets the backoff
+		lifetime := time.Since(began)
+		if tunnelHealthy(connected, lifetime) {
+			backoff = minBackoff // a long-lived tunnel resets the backoff
+			if err == nil {
+				continue // clean close of a healthy tunnel — reconnect promptly
+			}
 		}
-		if err == nil {
-			continue // clean close — reconnect promptly, no backoff
+		// Anything else backs off — including a CLEAN close of a young tunnel:
+		// a relay that accepts and immediately drops us would otherwise set
+		// the pace of a tight TLS handshake loop with zero delay.
+		if err != nil {
+			d.logf("tunnel error: %v (retry in %s)", err, backoff)
+		} else {
+			d.logf("tunnel closed after %s (retry in %s)", lifetime.Round(time.Millisecond), backoff)
 		}
-		d.logf("tunnel error: %v (retry in %s)", err, backoff)
 		select {
 		case <-ctx.Done():
 			return
@@ -491,6 +503,19 @@ func (d *system) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// tunnelHealthyFloor is how long a tunnel must live for its end to count as
+// an ordinary event (a deploy, a load balancer cycling the connection).
+// Shorter than that and the close is treated as churn: the reconnect backs
+// off like any failure, clean or not.
+const tunnelHealthyFloor = 30 * time.Second
+
+// tunnelHealthy reports whether a tunnel that just ended lived long enough to
+// reset the reconnect backoff (and, when it closed cleanly, to reconnect with
+// no delay at all).
+func tunnelHealthy(connected bool, lifetime time.Duration) bool {
+	return connected && lifetime >= tunnelHealthyFloor
 }
 
 // jitter returns a value in [0, d/2) to spread reconnects so a relay restart

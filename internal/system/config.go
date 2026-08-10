@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -80,7 +81,8 @@ func configPath() (string, error) {
 
 // loadConfigFile reads the saved config file. A missing file returns an error
 // for which os.IsNotExist(err) is true, so callers can distinguish "not logged
-// in" from a real read/parse failure.
+// in" from a real read/parse failure. A stored relay URL that is not a
+// ws:// or wss:// URL is a validation error, not a config to try anyway.
 func loadConfigFile() (systemConfig, error) {
 	var cfg systemConfig
 	path, err := configPath()
@@ -93,6 +95,12 @@ func loadConfigFile() (systemConfig, error) {
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
+	}
+	if cfg.RelayURL != "" {
+		u, err := url.Parse(cfg.RelayURL)
+		if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") {
+			return systemConfig{}, fmt.Errorf("saved relay URL %q is not a ws:// or wss:// URL; fix or delete %s", cfg.RelayURL, path)
+		}
 	}
 	return cfg, nil
 }
@@ -176,4 +184,15 @@ func insecureRemoteRelay(ws string) bool {
 		return false
 	}
 	return !isLoopbackHost(ws)
+}
+
+// checkRelayTransport refuses a relay URL that would carry the pairing token
+// in cleartext to a remote host. ORMOS_INSECURE=1 is the escape hatch for
+// pointing at a remote dev relay with no TLS; everything else about the URL
+// (loopback cleartext, any wss) needs no opt-in.
+func checkRelayTransport(ws string) error {
+	if !insecureRemoteRelay(ws) || os.Getenv("ORMOS_INSECURE") == "1" {
+		return nil
+	}
+	return fmt.Errorf("refusing a cleartext connection to remote relay %s: the pairing token would travel unencrypted — use a wss:// URL (set ORMOS_INSECURE=1 to accept the risk)", ws)
 }
