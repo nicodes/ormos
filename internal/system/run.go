@@ -58,8 +58,9 @@ in the web app and the system starts. The dashboard appears when stdout is a
 terminal; otherwise it runs headless.
 
 environment:
-  ORMOS_API_URL  ws base URL of the ormos API (default wss://api.ormos.dev)
-  SHELL          shell for spawned terminals (default /bin/bash)
+  ORMOS_API_URL    ws base URL of the ormos API (default wss://api.ormos.dev)
+  ORMOS_INSECURE=1 allow a cleartext (ws://) remote relay — otherwise fatal
+  SHELL            shell for spawned terminals (default /bin/bash)
 
 Pairing never asks for a password in this terminal: the relay issues a
 short-lived code and a human approves it in the web app, so there is no flag
@@ -90,6 +91,20 @@ func runSystem() {
 		if os.Getenv("ORMOS_API_URL") == "" && fileCfg.RelayURL != "" {
 			cfg.RelayURL = fileCfg.RelayURL
 		}
+	} else if !os.IsNotExist(err) {
+		// A config that exists but cannot be used must not silently fall
+		// through to re-pairing — least of all a relay URL that failed
+		// validation, which is exactly the case worth stopping for.
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// A cleartext remote relay is fatal before any token crosses the wire —
+	// in TUI mode a log line has no guaranteed receiver, so this cannot wait
+	// for the run loop to warn about it.
+	if err := checkRelayTransport(cfg.RelayURL); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
