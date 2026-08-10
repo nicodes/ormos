@@ -1,8 +1,10 @@
 package system
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -75,5 +77,60 @@ func TestRelayURLDefaultAndEnvironmentOverride(t *testing.T) {
 	t.Setenv("ORMOS_API_URL", "ws://127.0.0.1:9080")
 	if got := loadSystemConfig().RelayURL; got != "ws://127.0.0.1:9080" {
 		t.Fatalf("relay override = %q, want local relay", got)
+	}
+}
+
+// The stored relay URL is validated when the config is loaded: a scheme that
+// is not ws/wss (a hand-edit, a downgrade to http://) is an error, not a URL
+// to dial anyway.
+func TestLoadConfigFileValidatesRelayScheme(t *testing.T) {
+	write := func(t *testing.T, relayURL string) {
+		t.Helper()
+		path := useTempConfig(t)
+		cfg := fmt.Sprintf(`{"relayUrl": %q, "pairingToken": "tok"}`, relayURL)
+		if err := os.WriteFile(path, []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("rejects non-ws schemes", func(t *testing.T) {
+		write(t, "http://relay.example.com")
+		if _, err := loadConfigFile(); err == nil {
+			t.Fatal("an http:// relay URL must fail validation")
+		}
+	})
+	t.Run("rejects schemeless URLs", func(t *testing.T) {
+		write(t, "relay.example.com")
+		if _, err := loadConfigFile(); err == nil {
+			t.Fatal("a schemeless relay URL must fail validation")
+		}
+	})
+	for _, u := range []string{"wss://api.ormos.dev", "ws://127.0.0.1:9080"} {
+		t.Run("accepts "+u, func(t *testing.T) {
+			write(t, u)
+			cfg, err := loadConfigFile()
+			if err != nil || cfg.RelayURL != u {
+				t.Fatalf("loadConfigFile = %q, %v", cfg.RelayURL, err)
+			}
+		})
+	}
+}
+
+// Cleartext to a remote relay is refused at run time, with ORMOS_INSECURE=1
+// as the explicit escape hatch. Loopback cleartext (local dev) needs none.
+func TestCheckRelayTransport(t *testing.T) {
+	if err := checkRelayTransport("ws://relay.example.com"); err == nil {
+		t.Fatal("cleartext remote relay must be refused")
+	} else if !strings.Contains(err.Error(), "cleartext") {
+		t.Fatalf("error = %v, want a cleartext refusal", err)
+	}
+	for _, u := range []string{"wss://api.ormos.dev", "ws://127.0.0.1:9080", "ws://localhost:9080"} {
+		if err := checkRelayTransport(u); err != nil {
+			t.Fatalf("%s must not need the escape hatch: %v", u, err)
+		}
+	}
+	t.Setenv("ORMOS_INSECURE", "1")
+	if err := checkRelayTransport("ws://relay.example.com"); err != nil {
+		t.Fatalf("ORMOS_INSECURE=1 must allow a cleartext remote relay: %v", err)
 	}
 }
