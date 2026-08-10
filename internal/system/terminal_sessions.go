@@ -122,7 +122,17 @@ func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
 	d.terminalMu.Lock()
 	defer d.terminalMu.Unlock()
 	if s := d.terminals[h.SessionID]; s != nil {
-		d.audit.record(auditEntry{Event: "terminal-reattach", Detail: cwd, Allowed: true})
+		// The check above covered the REQUESTED directory; the session being
+		// reattached to may be rooted somewhere else entirely, and a relay that
+		// learns its id inherits whatever it was opened on. Re-decide against
+		// the session's own cwd, or the reattach path is a way around a policy
+		// that tightened since the shell was spawned.
+		if ok, reason := p.terminalAllowed(s.cwd); !ok {
+			d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: false})
+			d.logf("terminal reattach refused: %s", reason)
+			return nil, fmt.Errorf("%s", reason)
+		}
+		d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: true})
 		return s, nil
 	}
 	if len(d.terminals) >= maxTerminalSessions {
