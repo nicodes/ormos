@@ -1,0 +1,52 @@
+name: Actionlint
+
+# Lints the workflows themselves: a typo in a job key, an expression that never
+# resolves, a `run:` step shellcheck would reject. These files gate every merge
+# and every release, and nothing else checks them -- a broken workflow is only
+# discovered by the run that fails, if it runs at all.
+#
+# Separate from ci.yml because it depends on none of the toolchain that one
+# installs: it lints the tree, not the code. Its own runs are seconds.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only. This job only inspects the tree.
+permissions:
+  contents: read
+
+concurrency:
+  group: actionlint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    # Seconds of work. Ten minutes means something hung.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The binary is fetched at a pinned version and verified against its
+      # published SHA-256 before it runs -- the same guarantee a SHA-pinned
+      # action gives, without taking on another third-party action to lint the
+      # others. shellcheck is already on the runner; actionlint finds it and
+      # runs it over every `run:` block.
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          url="https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location "$url" -o actionlint.tar.gz
+          echo "${sha256}  actionlint.tar.gz" | sha256sum --check --strict -
+          tar -xzf actionlint.tar.gz actionlint
+          rm -f actionlint.tar.gz
+
+      - name: Lint the workflows
+        shell: bash
+        run: ./actionlint -color
