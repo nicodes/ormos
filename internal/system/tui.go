@@ -164,12 +164,13 @@ type model struct {
 	wiz   *wizard
 	conf  *confirmPrompt
 
-	status  Status
-	info    *relay.SystemInfo // system's own name/etc. from the relay
-	machine string            // "<distro> - <host> - <goos>/<goarch>"
-	notice  string            // last success line
-	err     string            // last error line
-	ticks   int
+	status      Status
+	info        *relay.SystemInfo // system's own name/etc. from the relay
+	machine     string            // "<distro> - <host> - <goos>/<goarch>"
+	fingerprint string            // sealing-key fingerprint for out-of-band verification
+	notice      string            // last success line
+	err         string            // last error line
+	ticks       int
 
 	width, height int
 }
@@ -178,7 +179,7 @@ func newModel(d *system) model {
 	ti := textinput.New()
 	ti.Prompt = "› "
 	ti.CharLimit = 512
-	return model{d: d, status: d.Snapshot(), input: ti, live: map[int]bool{}, machine: machineName()}
+	return model{d: d, status: d.Snapshot(), input: ti, live: map[int]bool{}, machine: machineName(), fingerprint: d.Fingerprint()}
 }
 
 func (m model) Init() tea.Cmd {
@@ -592,7 +593,10 @@ func (m model) View() string {
 		nameVal = selStyle.Render(name)
 	}
 	b.WriteString(nameCursor + labelStyle.Render("name     ") + nameVal + "\n")
-	b.WriteString("  " + labelStyle.Render("machine  ") + m.machine + "\n\n")
+	b.WriteString("  " + labelStyle.Render("machine  ") + m.machine + "\n")
+	// The sealing-key fingerprint, for out-of-band verification against the app:
+	// if the two do not match, a relay has swapped the key.
+	b.WriteString("  " + labelStyle.Render("sealing  ") + m.fingerprint + hintStyle.Render("  verify in app") + "\n\n")
 
 	b.WriteString(sectionStyle.Render("PROJECTS") + "\n")
 	if len(m.projects) == 0 {
