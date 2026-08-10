@@ -1,5 +1,5 @@
 [tools]
-# Must be >= the `go` directive in go.mod, which is currently 1.25.0.
+# Must be >= the `go` directive in go.mod, which is currently 1.25.12.
 #
 # CI used to read the version straight out of go.mod via setup-go, so there was
 # only ever one place for it to live. Moving to mise makes the toolchain
@@ -10,7 +10,7 @@
 #
 # The "Toolchain pins agree" step in ci.yml is what stops that happening again.
 # If you bump go.mod, bump this too; CI will tell you if you forget.
-go = "1.25.0"
+go = "1.25.12"
 
 # The supply-chain scanner CI runs against the binary: `govulncheck ./...` in
 # .github/actions/test. It reports only vulnerabilities on a path the code
