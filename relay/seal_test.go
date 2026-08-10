@@ -231,6 +231,23 @@ func TestDeriveRejectsBadPeerKey(t *testing.T) {
 	}
 }
 
+// MaxSealedRecord must fit exactly one maximal sealed record: a frame with a
+// MaxFrameSize payload, its header, and the authentication tag. The relay's
+// WebSocket read limit is derived from this constant, so if it drifted below
+// the real size a maximal legitimate paste would be killed mid-stream.
+func TestMaxSealedRecordComposition(t *testing.T) {
+	if want := MaxFrameSize + frameHeaderSize + sealOverhead; MaxSealedRecord != want {
+		t.Fatalf("MaxSealedRecord = %d, want MaxFrameSize + frameHeaderSize + sealOverhead = %d", MaxSealedRecord, want)
+	}
+	s, err := NewSealer(bytes.Repeat([]byte{7}, SealKeySize))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(s.Seal(EncodeData(make([]byte, MaxFrameSize)))); got != MaxSealedRecord {
+		t.Fatalf("a maximal sealed record is %d bytes, MaxSealedRecord = %d", got, MaxSealedRecord)
+	}
+}
+
 func TestRecordFraming(t *testing.T) {
 	var buf bytes.Buffer
 	payloads := [][]byte{[]byte("a"), {}, bytes.Repeat([]byte{9}, 4096)}

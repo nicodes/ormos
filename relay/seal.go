@@ -58,8 +58,9 @@ const (
 	// sealOverhead is the ChaCha20-Poly1305 authentication tag.
 	sealOverhead = chacha20poly1305.Overhead
 	// MaxSealedRecord bounds a single sealed record on the wire. A record holds
-	// one terminal frame plus the tag, so this tracks MaxFrameSize.
-	MaxSealedRecord = MaxFrameSize + 5 + sealOverhead
+	// one terminal frame (header plus payload) plus the tag, so this tracks
+	// MaxFrameSize.
+	MaxSealedRecord = MaxFrameSize + frameHeaderSize + sealOverhead
 	// sealInfo domain-separates this key schedule from any other use of the same
 	// agreement. Bump the version if the schedule changes.
 	//
