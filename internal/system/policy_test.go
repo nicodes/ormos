@@ -569,6 +569,28 @@ func TestRolledLogModeIsCorrected(t *testing.T) {
 	}
 }
 
+// A symlink standing at sessions.log.1 is left alone — hardenRolled corrects
+// the file this machine rolled, not whatever a planted link points at.
+func TestRolledLogSymlinkIsNotFollowed(t *testing.T) {
+	a := testAuditor(t)
+	elsewhere := filepath.Join(t.TempDir(), "target.log")
+	if err := os.WriteFile(elsewhere, []byte("elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, a.path+auditRollSuffix); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+	a.hardenRolled()
+
+	st, err := os.Stat(elsewhere)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o644 {
+		t.Errorf("the symlink's target was chmodded to %04o; hardenRolled must not follow links", perm)
+	}
+}
+
 // The relay chooses Detail, so it also chooses how much of it survives
 // truncation. Applying the worst-case escape factor to the whole remainder left
 // one rune of the directory the relay asked for, in an entry using a sixth of

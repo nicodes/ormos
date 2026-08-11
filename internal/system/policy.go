@@ -296,7 +296,10 @@ func (a *auditor) hardenRolled() {
 		return
 	}
 	path := a.path + auditRollSuffix
-	st, err := os.Stat(path)
+	// Lstat, not Stat: a symlink standing at this path is left alone rather
+	// than followed to its target, the same refusal openPrivateFile makes for
+	// the live files.
+	st, err := os.Lstat(path)
 	if err != nil || !st.Mode().IsRegular() {
 		return
 	}
@@ -315,8 +318,9 @@ type auditEntry struct {
 
 // truncateRunes shortens s to at most n bytes of ORIGINAL text, cutting on a
 // rune boundary, and appends an ellipsis to mark the cut — so the result is up
-// to n+3 bytes, not n. The caller's budget has to allow for that. A byte-slice mid-rune leaves U+FFFD sitting next to the
-// ellipsis, which reads as corruption in a file whose whole job is evidence.
+// to n+3 bytes, not n. The caller's budget has to allow for that. A byte-slice
+// mid-rune leaves U+FFFD sitting next to the ellipsis, which reads as
+// corruption in a file whose whole job is evidence.
 func truncateRunes(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -358,10 +362,6 @@ func (a *auditor) record(e auditEntry) {
 	if err != nil {
 		return
 	}
-	// The raw cap does not bound the encoded line, so if escaping blew it past
-	// the limit, cut Detail back to fit and encode once more. One retry, not a
-	// loop: the second Detail is short enough that even worst-case escaping
-	// leaves the line under the cap.
 	// The raw cap does not bound the ENCODED line, so if escaping blew it past
 	// the limit, cut Detail back and encode again. Halving rather than applying
 	// the worst-case escape factor to the whole remainder: the latter is safe

@@ -69,8 +69,12 @@ separate.
 `sessions.log` is append-only but not unbounded: at 4 MiB it is renamed to
 `sessions.log.1`, replacing any previous generation, and a fresh log starts. Two
 files of recent history, never more. The roll is taken under a file lock, so two
-agents sharing one state directory cannot roll each other's history away, and
-the mode of both files is corrected on the same read that finds it loosened.
+agents sharing one state directory cannot roll each other's history away; when
+the lock cannot be taken the roll waits for an uncontended write rather than
+renaming unlocked — on a filesystem with no flock support at all, that means
+the log grows past the bound. The live file's mode is corrected on every open;
+the rolled file's is corrected once at startup and inherited from the live file
+at each roll.
 
 Whenever the agent reads `config.json` or `identity.key` it re-checks what it
 finds there, so a copy restored from a backup or loosened by a stray `chmod`
