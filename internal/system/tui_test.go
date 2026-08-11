@@ -3,7 +3,23 @@ package system
 import (
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/nicodes/ormos/relay"
 )
+
+// sized builds a model and drives it through a resize and a tick, which is the
+// state every real render is in: a View at width 0 exercises none of the
+// clipping or the pinning.
+func sized(t *testing.T, d *system, w, h int) model {
+	t.Helper()
+	m, _ := newModel(d).Update(tea.WindowSizeMsg{Width: w, Height: h})
+	m, _ = m.(model).Update(tickMsg{})
+	return m.(model)
+}
 
 // In TUI mode the log ring is the only place the agent's own errors go: nothing
 // is echoed to stderr because the dashboard owns the screen. Before the
@@ -15,7 +31,7 @@ func TestDashboardRendersTheLogRing(t *testing.T) {
 	d := newSystem(systemConfig{})
 	d.logf("tunnel error: dial tcp: connection refused (retry in 1s)")
 
-	view := newModel(d).View()
+	view := sized(t, d, 80, 24).View()
 	if !strings.Contains(view, "ACTIVITY") {
 		t.Error("the dashboard has no activity pane")
 	}
@@ -33,7 +49,7 @@ func TestDashboardShowsOnlyTheTailOfTheRing(t *testing.T) {
 		d.logf("%s", line)
 	}
 
-	view := newModel(d).View()
+	view := sized(t, d, 80, 24).View()
 	if strings.Contains(view, "oldest") {
 		t.Error("the pane is showing more than the last few lines")
 	}
@@ -75,11 +91,150 @@ func TestClipMarksTheCut(t *testing.T) {
 		{"far too long to fit", 10, "far too l…"},
 		{"unclipped when width is unknown", 0, "unclipped when width is unknown"},
 		{"x", -5, "x"},
-		{"abc", 1, "a"},
+		// At a single column the marker is all that fits, which still says
+		// "there is more here" — better than an arbitrary first character.
+		{"abc", 1, "…"},
+		// Columns, not bytes. Ten arrows are 30 bytes: slicing by length
+		// truncated a line that fitted, and cut the last rune in half.
+		{"→→→→→→→→→→", 20, "→→→→→→→→→→"},
+		{"→abc", 4, "→abc"},
 	} {
 		if got := clip(tc.in, tc.w); got != tc.want {
 			t.Errorf("clip(%q, %d) = %q, want %q", tc.in, tc.w, got, tc.want)
 		}
+	}
+	// Whatever the width, the result must still be text a terminal can print.
+	for _, in := range []string{"→abc", "日本語のテキストです", "café ☕ résumé"} {
+		for w := 1; w < 24; w++ {
+			got := clip(in, w)
+			if !utf8.ValidString(got) {
+				t.Errorf("clip(%q, %d) = %q, which is not valid UTF-8", in, w, got)
+			}
+			if lipgloss.Width(got) > w {
+				t.Errorf("clip(%q, %d) = %q, which is %d columns wide", in, w, got, lipgloss.Width(got))
+			}
+		}
+	}
+}
+
+// pad lays out columns, so it has to count columns too — and it is applied to
+// project names and root directories, which are the user's own text.
+func TestPadCountsColumnsNotBytes(t *testing.T) {
+	for _, in := range []string{"app", "日本語", "→→→→→→→→→→", ""} {
+		for _, w := range []int{1, 4, 8, 18, 32} {
+			got := pad(in, w)
+			if !utf8.ValidString(got) {
+				t.Errorf("pad(%q, %d) = %q, which is not valid UTF-8", in, w, got)
+			}
+			if lipgloss.Width(got) != w {
+				t.Errorf("pad(%q, %d) is %d columns, want exactly %d", in, w, lipgloss.Width(got), w)
+			}
+		}
+	}
+}
+
+// Bubble Tea's renderer keeps the LAST height rows of an over-tall view, so a
+// pane that outgrows the screen deletes the header rather than scrolling the
+// log — and the header is where the connection state, the account and the
+// sealing fingerprint live, the last being the out-of-band check against a
+// relay that swapped the key.
+//
+// The property asserted is that the pane is BUDGETED: it may never make the
+// view taller than the screen, and when the body alone already overflows (a
+// long project list, which this change does not address and never did) the pane
+// must add nothing at all.
+func TestActivityPaneNeverPushesTheViewOffScreen(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{RelayURL: "wss://relay.example", Email: "you@example.test"})
+	for i := range 40 {
+		d.logf("line %d", i)
+	}
+
+	for _, projects := range []int{0, 1, 2, 4, 8, 20} {
+		for _, h := range []int{10, 16, 24, 40} {
+			m := sized(t, d, 80, h)
+			m.projects = make([]relay.ProjectInfo, projects)
+			for i := range m.projects {
+				m.projects[i] = relay.ProjectInfo{
+					Name: "project", RootDir: "/home/you/code/project",
+					Ports: []relay.PortEntry{{Port: 3000 + i}},
+				}
+			}
+			m.rebuildRows()
+
+			bare := m
+			bare.logs = nil
+			bareH := lipgloss.Height(bare.View())
+			withH := lipgloss.Height(m.View())
+
+			switch {
+			case bareH > h:
+				// The body alone does not fit. The pane must cost nothing.
+				if withH != bareH {
+					t.Errorf("%d projects at height %d: the pane added %d rows to a view that already overflowed",
+						projects, h, withH-bareH)
+				}
+			case withH > h:
+				t.Errorf("%d projects at height %d rendered %d rows; the header is dropped",
+					projects, h, withH)
+			}
+			// The footer is the one thing that must always survive.
+			if !strings.Contains(m.View(), "q quit") {
+				t.Errorf("%d projects at height %d lost the footer", projects, h)
+			}
+		}
+	}
+}
+
+// The ring is relay-influenced: an HTTP reason phrase comes back verbatim in
+// "relay returned %s". Painted raw into the alt screen, a relay could set the
+// window title, clear the display, or paint a line of its own — from the one
+// pane whose purpose is telling the operator the truth about their machine.
+func TestDashboardStripsTerminalEscapes(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	d.logf("ports poll failed: relay returned 403 \x1b]0;OWNED\a\x1b[2Jclick https://evil.example.test to fix")
+
+	view := sized(t, d, 80, 24).View()
+	// The agent's own styling emits ESC sequences, so this looks for the shapes
+	// only the relay's text could produce: an OSC introducer, a BEL, and an
+	// erase-display. What survives is the payload as inert characters, which is
+	// the point — the text is still readable, it just cannot act.
+	for _, seq := range []string{"\x1b]", "\a", "\x1b[2J"} {
+		if strings.Contains(view, seq) {
+			t.Errorf("a relay-supplied %q reached the screen", seq)
+		}
+	}
+	if !strings.Contains(view, "relay returned 403") {
+		t.Error("sanitising removed the message along with the escapes")
+	}
+
+	// Nothing unprintable may survive at all, and a newline least of all: it
+	// would add a full-width row and make the pane's height depend on what the
+	// relay sent.
+	for _, in := range []string{"a\x1b[31mb", "two\nrows", "bell\a", "null\x00byte", "del\x7f"} {
+		for _, r := range sanitize(in) {
+			if !unicode.IsPrint(r) {
+				t.Errorf("sanitize(%q) kept %q", in, r)
+			}
+		}
+	}
+}
+
+// The pane has to follow the ring, not the ring as it was when the model was
+// built: the tunnel error that matters arrives seconds into a session.
+func TestDashboardFollowsTheRingOnEveryTick(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	m := sized(t, d, 80, 24)
+
+	d.logf("tunnel error: connection refused")
+	if strings.Contains(m.View(), "connection refused") {
+		t.Fatal("the model saw a line logged after it was built, without a tick")
+	}
+	next, _ := m.Update(tickMsg{})
+	if !strings.Contains(next.(model).View(), "connection refused") {
+		t.Error("a tick did not bring the new line to the screen")
 	}
 }
 
@@ -93,7 +248,7 @@ func TestDashboardRendersEveryStatusField(t *testing.T) {
 	d.setConnected(true)
 	d.addSession(2)
 
-	view := newModel(d).View()
+	view := sized(t, d, 80, 24).View()
 	for _, want := range []string{"connected", "2 sessions", "wss://relay.example"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("the dashboard never shows %q:\n%s", want, view)

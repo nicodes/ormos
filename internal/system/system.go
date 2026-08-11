@@ -152,11 +152,14 @@ func (d *system) logf(format string, args ...any) {
 // Status is a snapshot of system state for the TUI.
 //
 // It carries only what a render actually reads. It used to also copy the whole
-// log ring and the configured-port slice on every call — 500ms, forever — for
-// two fields nothing outside a test ever looked at. The log ring now has a real
-// consumer and is fetched by the tail through RecentLogs; the port slice does
-// not, because the TUI lists projects and ports from the relay's own reply
+// log ring and d.ports on every call — 500ms, forever — into a Status.Logs and
+// a Status.Ports nothing outside a test ever looked at. The ring now has a real
+// consumer and is fetched by the tail through RecentLogs; Status.Ports is gone,
+// because the TUI lists projects and ports from the relay's own reply
 // (model.projects) and needs Live only to mark which of them are up.
+//
+// d.ports itself stays: cachedPortConfigured reads it on the proxy port-allow
+// path. It is only the per-render COPY of it that had no reader.
 type Status struct {
 	Connected bool
 	Sessions  int
@@ -197,6 +200,9 @@ func (d *system) RecentLogs(n int) []string {
 	defer d.mu.Unlock()
 	if n > len(d.logs) {
 		n = len(d.logs)
+	}
+	if n == 0 {
+		return nil
 	}
 	tail := make([]string, n)
 	copy(tail, d.logs[len(d.logs)-n:])

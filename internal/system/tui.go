@@ -9,10 +9,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/nicodes/ormos/relay"
 )
 
@@ -176,12 +178,12 @@ type model struct {
 	width, height int
 }
 
-// activityLines is how many log lines the ACTIVITY pane shows.
+// activityLines is the most log lines the ACTIVITY pane will show. It shows
+// fewer when the rest of the dashboard needs the rows — see activityBudget.
 //
-// Fixed rather than sized to the terminal so the dashboard does not reflow as
-// projects come and go, and small because these are the last few things that
-// happened, not a log viewer — the whole ring is the agent's, and `ormos` run
-// without a TTY prints every line to stderr.
+// Small on purpose: these are the last few things that happened, not a log
+// viewer. The whole ring belongs to the agent, and `ormos` run without a TTY
+// prints every line to stderr.
 const activityLines = 6
 
 func newModel(d *system) model {
@@ -601,9 +603,12 @@ func (m model) View() string {
 	// one of them is a shell or a connection to a local service, so "is anything
 	// happening on my machine right now" should be answerable from the header
 	// rather than by reading the activity pane.
+	// Always, including zero: "nothing is happening" and "this field is not
+	// rendered" must not look the same, and an unbalanced addSession showing a
+	// negative should be visible rather than hidden.
 	if s.Sessions == 1 {
 		state += labelStyle.Render("  1 session")
-	} else if s.Sessions > 1 {
+	} else {
 		state += labelStyle.Render(fmt.Sprintf("  %d sessions", s.Sessions))
 	}
 
@@ -689,20 +694,6 @@ func (m model) View() string {
 		}
 	}
 
-	// ACTIVITY: the tail of the agent's log ring. Headless mode echoes every
-	// line to stderr; the dashboard owns the whole screen, so without this pane
-	// a tunnel that will not connect shows as "offline" and nothing else — the
-	// reason is written to a ring the operator has no way to look at.
-	b.WriteString("\n" + sectionStyle.Render("ACTIVITY") + "\n")
-	if len(m.logs) == 0 {
-		b.WriteString(hintStyle.Render("  nothing yet") + "\n")
-	}
-	for _, line := range m.logs {
-		// Clipped, not wrapped: a long line (a relay URL, a dial error) would
-		// otherwise take several rows and push the pane's height around from
-		// one tick to the next.
-		b.WriteString("  " + hintStyle.Render(clip(line, m.width-2)) + "\n")
-	}
 	body := strings.TrimRight(b.String(), "\n")
 
 	// Footer: input wizard, confirm prompt, or key hints — fenced from the body
@@ -736,13 +727,40 @@ func (m model) View() string {
 		hints += " · L sign out · q quit"
 		f.WriteString(hintStyle.Render(hints))
 	}
-	// Status line: last error or success notice, under the hints.
+	// Status line: last error or success notice, under the hints. The error is
+	// sanitised: it can be relay text (see sanitize), and it is painted into
+	// the alt screen just like the activity pane.
 	if m.err != "" {
-		f.WriteString("\n" + errStyle.Render("✗ "+m.err))
+		f.WriteString("\n" + errStyle.Render("✗ "+sanitize(m.err)))
 	} else if m.notice != "" {
 		f.WriteString("\n" + noticeStyle.Render("✓ "+m.notice))
 	}
 	footer := divider(m.width) + "\n" + f.String()
+
+	// ACTIVITY: the tail of the agent's log ring, rendered last and given only
+	// the rows nothing above it needed. Headless mode echoes every line to
+	// stderr; the dashboard owns the whole screen, so without this pane a
+	// tunnel that will not connect shows as "offline" and nothing else — the
+	// reason goes to a ring the operator has no way to look at.
+	if n := m.activityBudget(body, footer); n > 0 {
+		var a strings.Builder
+		a.WriteString(body + "\n\n" + sectionStyle.Render("ACTIVITY") + "\n")
+		for _, line := range m.logs[len(m.logs)-n:] {
+			// Sanitised, then clipped, then styled. Sanitising first because
+			// part of the ring is relay-influenced and an escape sequence must
+			// never reach the terminal; clipping before styling so the width
+			// arithmetic never cuts through lipgloss's own ANSI.
+			// A width of 0 means "not known yet"; a genuinely 1- or 2-column
+			// terminal is not that, so it is floored at 1 rather than allowed
+			// to collide with the sentinel.
+			w := 0
+			if m.width > 0 {
+				w = max(m.width-2, 1)
+			}
+			a.WriteString("  " + hintStyle.Render(clip(sanitize(line), w)) + "\n")
+		}
+		body = strings.TrimRight(a.String(), "\n")
+	}
 
 	// Pin the footer to the bottom when the body fits; otherwise let it follow
 	// the content so nothing is clipped on a short terminal.
@@ -768,26 +786,75 @@ func portSummary(p relay.ProjectInfo, live map[int]bool) string {
 	return fmt.Sprintf("%d ports · %d live", len(p.Ports), liveN)
 }
 
-// clip shortens s to at most w columns, marking the cut with an ellipsis. A
-// width of zero or less means the terminal size is not known yet (no
-// WindowSizeMsg has arrived), in which case nothing is clipped.
-func clip(s string, w int) string {
-	if w <= 0 || len(s) <= w {
-		return s
+// activityBudget returns how many log lines the ACTIVITY pane may draw.
+//
+// The pane is the last thing on the screen and the first thing that should give
+// way. Everything above it is worth more than a sixth line of history — the
+// connection state, the account this machine is paired to, and the sealing
+// fingerprint the user reads against the app to catch a relay that swapped the
+// key. And an over-tall view does not scroll: Bubble Tea's renderer keeps the
+// LAST height rows, so it deletes the header rather than the oldest log line.
+// Unbudgeted, four projects were enough to push the whole SYSTEM block off an
+// 80x24 terminal.
+//
+// A height of zero means no WindowSizeMsg has arrived yet, so there is nothing
+// to budget against; the pane draws at full size and the first resize corrects
+// it.
+func (m model) activityBudget(body, footer string) int {
+	if m.height <= 0 {
+		// No WindowSizeMsg yet, so there is nothing to budget against: draw
+		// what there is and let the first resize correct it.
+		return min(activityLines, len(m.logs))
 	}
-	if w == 1 {
-		return s[:1]
-	}
-	return s[:w-1] + "…"
+	// The pane costs a blank separator and a heading before any log line, and
+	// it can never draw more lines than the ring has.
+	avail := m.height - lipgloss.Height(body) - lipgloss.Height(footer) - 2
+	return min(max(avail, 0), activityLines, len(m.logs))
 }
 
-// pad right-pads (or truncates with an ellipsis) s to width w for column layout.
-func pad(s string, w int) string {
-	if len(s) > w {
-		if w <= 1 {
-			return s[:w]
+// sanitize strips anything unprintable from text before it is painted into the
+// terminal.
+//
+// Part of what reaches the screen is chosen by the relay: an HTTP reason phrase
+// comes back verbatim inside "relay returned %s", and Go does not sanitise it.
+// Painted raw into the alt screen, a relay could set the window title, clear
+// the display, move the cursor, or paint a convincing line of its own — from a
+// pane whose whole purpose is to tell the operator the truth about their
+// machine. A newline is dropped for a second reason: it would add a full-width
+// row and make the pane's height depend on what the relay sent.
+func sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		if !unicode.IsPrint(r) {
+			return -1
 		}
-		return s[:w-1] + "…"
+		return r
+	}, s)
+}
+
+// clip shortens s to at most w display columns, marking the cut with an
+// ellipsis. A width of zero or less means the terminal size is not known yet
+// (no WindowSizeMsg has arrived), in which case nothing is clipped.
+//
+// Columns, not bytes: "→→→→→→→→→→" is ten columns and thirty bytes, so slicing
+// by length both truncated lines that fitted and cut runes in half, producing
+// invalid UTF-8 on screen.
+func clip(s string, w int) string {
+	if w <= 0 {
+		return s
 	}
-	return s + strings.Repeat(" ", w-len(s))
+	return ansi.Truncate(s, w, "…")
+}
+
+// pad right-pads s to w display columns, truncating with an ellipsis when it is
+// too long, for column layout. Width-aware for the same reason clip is: these
+// are project names and root directories, which are the user's own text.
+func pad(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	s = ansi.Truncate(s, w, "…")
+	if gap := w - ansi.StringWidth(s); gap > 0 {
+		return s + strings.Repeat(" ", gap)
+	}
+	return s
 }
