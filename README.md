@@ -10,9 +10,39 @@ instructions from the Ormos relay to start shells and connect to local services,
 so review the policy section below before leaving it running on an important
 machine.
 
+## Supported platforms
+
+Linux and macOS, on `amd64` and `arm64`. That is the whole list: CI tests and
+releases ship exactly those four targets, and nothing else is claimed as
+supported.
+
+There is no Windows build and none is planned. The agent's job is to act on the
+machine it runs on — allocate a PTY, poll it, read a terminal's foreground
+process group, signal a shell that will not exit — which it does through
+`golang.org/x/sys/unix`. The root package and every file in `internal/system`
+carry `//go:build (linux && !android) || (darwin && !ios)`, so `go build .` for
+Windows reports that the package does not exist there rather than failing on a
+list of missing syscalls.
+
+The tag names the platforms rather than saying `unix`, which would also claim
+the BSDs and Solaris. Nothing is tested there, so nothing is claimed there. The
+`!android` and `!ios` halves matter for the same reason: Go sets the `linux` tag
+on Android and the `darwin` tag on iOS, so a plain `linux || darwin` would build
+the whole agent for both. The shared [`relay`](./relay) package is untagged and stays portable —
+the hosted backend imports it.
+
+CI tests on Linux and macOS, cross-compiles every shipped target on Linux, and
+asserts that on every other platform Go supports the agent is not selected at
+all. A release is gated on the
+macOS tests too, since the Darwin archives are what people download.
+
+Live port status is a Linux-only feature for now: the agent finds listening
+ports by reading `/proc/net/tcp`, so on macOS the dashboard shows configured
+ports without marking which are up.
+
 ## Run or install
 
-Ormos requires Go 1.25 and currently supports Linux and macOS.
+Ormos requires Go 1.25.
 
 Run the latest release directly:
 
