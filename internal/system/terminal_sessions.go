@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/creack/pty"
@@ -19,6 +20,47 @@ const (
 	terminalDetachTTL   = time.Hour
 	terminalWriteTO     = 2 * time.Second
 	maxTerminalSessions = 32
+	// maxTerminalConns caps live connections to ONE session. maxTerminalSessions
+	// bounds sessions, but a session is looked up by the id on the header, so
+	// without this a peer can attach to one session as many times as it has
+	// stream slots. Each connection now carries a terminalSendBytes queue, so
+	// that is relay-controlled agent memory measured in hundreds of megabytes.
+	// A terminal is one view, occasionally two while a reattach overlaps the
+	// connection it replaces; four is slack, not a budget.
+	maxTerminalConns = 4
+	// terminalSendQueue and terminalSendBytes bound how far one connection may
+	// fall behind the PTY before its backlog is collapsed into a single
+	// catch-up frame.
+	//
+	// Both bounds exist because either can bind first: a client taking bulk
+	// output hits the byte budget after a few chunks, while one taking a stream
+	// of keystroke echoes would sit at a few bytes a frame forever.
+	//
+	// Overrunning them is deliberately NOT grounds for disconnection. A
+	// connection falls behind either because its socket is stuck or because its
+	// writer goroutine has not been scheduled, and from here those are
+	// indistinguishable — on a single-core host under load the second is
+	// ordinary. Dropping that kind costs a healthy session a fresh X25519
+	// handshake and a 256 KiB replay at exactly the moment the link is busiest,
+	// which is self-reinforcing. What ends a connection instead is its own
+	// terminalWriteTO deadline in writeLoop, which measures lateness rather
+	// than backlog.
+	terminalSendQueue = 256
+	terminalSendBytes = 1 << 20
+	// terminalResyncPrefix precedes a catch-up replay: RIS, a full terminal
+	// reset. A connection that missed frames has to redraw from a KNOWN state
+	// rather than append the replay to what it has already rendered, and the
+	// terminal's own reset is how to say that without inventing a frame type
+	// the browser would first have to learn.
+	//
+	// RIS rather than a clear-screen sequence, because clearing is not
+	// resetting. A session resynchronised while a full-screen program is
+	// running is in the alternate buffer with a scroll region, SGR attributes
+	// and a charset set by that program; erasing the display leaves every one
+	// of those in place and paints main-screen history into the alternate
+	// buffer. Erase-scrollback would also throw away the user's real scrollback
+	// on each resynchronisation, which a reattach has never done.
+	terminalResyncPrefix = "\x1bc"
 )
 
 // terminalKillGrace is how long close waits for the shell's process group to
@@ -53,9 +95,135 @@ type terminalSession struct {
 // terminal have independent keys and counters and share no crypto state. The
 // embedded net.Conn is kept for deadlines and close; everything that carries
 // terminal data goes through stream.
+//
+// Every connection owns a send queue and a writer goroutine, and nothing on the
+// PTY read path ever touches the socket. That separation is the whole point:
+// writing to a browser that has stopped draining — a backgrounded tab, a slow
+// relay leg, a full yamux window — used to block the session for the whole
+// terminalWriteTO, during which the PTY master went undrained, the kernel's tty
+// buffer filled, and the foreground process itself blocked in write().
+//
+// Sealing happens in the writer goroutine too. That keeps the direction's nonce
+// counter single-threaded without the session lock standing in for it, and
+// exactly one writer per connection is guaranteed by construction rather than
+// by convention: newSealedConn starts the only writeLoop there will ever be. A
+// second one would reuse a ChaCha20-Poly1305 nonce, which fails silently and
+// catastrophically, so it must not be reachable by calling something twice.
 type sealedConn struct {
 	net.Conn
 	stream *relay.SealedStream
+
+	// send carries encoded (not yet sealed) frames to the writer goroutine.
+	// Frames are immutable once encoded, so one buffer is safely shared by
+	// every connection a broadcast reaches.
+	send chan []byte
+	// queued approximates the byte weight sitting in send. It is approximate on
+	// purpose and in both directions: the writer decrements before writing, so
+	// a frame in flight is uncounted while still referenced, and enqueue adds
+	// after the channel send, so a reader can transiently see it negative. The
+	// atomics commute, producers are serialised by the session lock, and the
+	// real ceiling is terminalSendBytes plus one in-flight frame — which is all
+	// this needs to be for its purpose, which is deciding when to collapse a
+	// backlog.
+	queued atomic.Int64
+	// dead is closed once, by kill, and is what stops the writer goroutine and
+	// tells enqueue to stop accepting.
+	dead    chan struct{}
+	killOne sync.Once
+}
+
+func newSealedConn(conn net.Conn, stream *relay.SealedStream) *sealedConn {
+	c := &sealedConn{
+		Conn:   conn,
+		stream: stream,
+		send:   make(chan []byte, terminalSendQueue),
+		dead:   make(chan struct{}),
+	}
+	go c.writeLoop()
+	return c
+}
+
+// enqueue hands one encoded frame to the connection's writer, reporting false
+// if the connection is gone or has fallen too far behind to take it. It never
+// blocks — that is the property the PTY read loop depends on.
+func (c *sealedConn) enqueue(frame []byte) bool {
+	select {
+	case <-c.dead:
+		return false
+	default:
+	}
+	if c.queued.Load()+int64(len(frame)) > terminalSendBytes {
+		return false
+	}
+	select {
+	case c.send <- frame:
+		c.queued.Add(int64(len(frame)))
+		return true
+	default:
+		return false
+	}
+}
+
+// writeLoop seals and writes queued frames until the connection dies. The
+// per-write deadline is still terminalWriteTO, but it now bounds only this
+// goroutine: a socket that stalls costs its own connection and nothing else.
+func (c *sealedConn) writeLoop() {
+	for {
+		select {
+		case <-c.dead:
+			return
+		case frame := <-c.send:
+			c.queued.Add(-int64(len(frame)))
+			_ = c.SetWriteDeadline(time.Now().Add(terminalWriteTO))
+			err := c.stream.WriteFrame(frame)
+			_ = c.SetWriteDeadline(time.Time{})
+			if err != nil {
+				c.kill()
+				return
+			}
+		}
+	}
+}
+
+// resync replaces everything queued on the connection with one catch-up frame,
+// reporting false only if the connection is already dead.
+//
+// Discarding queued frames is safe for the seal: sealing happens in writeLoop
+// at write time, so a frame that never reaches it never consumed a nonce, and
+// both ends stay in lockstep. It is safe for the screen because the catch-up
+// frame carries a reset (terminalResyncPrefix) and the whole replay history, so
+// the browser redraws rather than resuming mid-stream.
+func (c *sealedConn) resync(frame []byte) bool {
+drain:
+	for {
+		select {
+		case stale := <-c.send:
+			c.queued.Add(-int64(len(stale)))
+		default:
+			break drain
+		}
+	}
+	return c.enqueue(frame)
+}
+
+// kill ends the connection and wakes whoever is blocked on it.
+//
+// The read deadline is not belt-and-braces: this net.Conn is a *yamux.Stream,
+// and Close on an established stream only moves it to streamLocalClose, which
+// yamux documents as prohibiting further local writes while reads carry on
+// normally. A parked Read is woken, finds an empty receive buffer and parks
+// again — so without the deadline a killed connection's attach goroutine, its
+// relay.MaxTunnelStreams slot and everything still queued on it survive until
+// the peer sends a FIN or StreamCloseTimeout (two minutes) fires. Against the
+// silent peer this path exists to defend against, that is the whole two
+// minutes. net.Pipe, which the tests use, does wake on Close, which is exactly
+// why a test cannot be what establishes this.
+func (c *sealedConn) kill() {
+	c.killOne.Do(func() {
+		close(c.dead)
+		_ = c.SetReadDeadline(time.Now())
+		_ = c.Close()
+	})
 }
 
 func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader) {
@@ -102,7 +270,7 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 		d.logf("terminal session: %v", err)
 		return
 	}
-	s.attach(&sealedConn{Conn: stream, stream: sealed})
+	s.attach(newSealedConn(stream, sealed))
 }
 
 func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
@@ -228,31 +396,45 @@ func (s *terminalSession) attach(conn *sealedConn) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		conn.kill()
 		return
 	}
 	if s.conns == nil {
 		s.conns = make(map[*sealedConn]struct{})
+	}
+	if len(s.conns) >= maxTerminalConns {
+		s.mu.Unlock()
+		s.owner.logf("terminal refused: session already has %d connections", maxTerminalConns)
+		conn.kill()
+		return
 	}
 	s.conns[conn] = struct{}{}
 	if s.expires != nil {
 		s.expires.Stop()
 		s.expires = nil
 	}
-	// Replaying the bounded terminal history lets a fresh xterm reconstruct the
-	// current display after mobile sleep or a WebView remount.
-	_ = conn.SetWriteDeadline(time.Now().Add(terminalWriteTO))
-	err := conn.stream.WriteFrame(relay.EncodeData(s.buffer))
-	if err == nil {
-		err = conn.stream.WriteFrame(relay.EncodeActivity(s.active))
-	}
-	_ = conn.SetWriteDeadline(time.Time{})
-	if err != nil {
+	// Replaying the bounded terminal history lets an xterm reconstruct the
+	// current display after mobile sleep or a WebView remount. It is queued like
+	// everything else, so it cannot block the lock, and a browser that never
+	// reads it costs this connection alone.
+	//
+	// Neither enqueue can fail here — the connection is new, so its queue is
+	// empty, and the catch-up frame is bounded by terminalReplayBytes, a quarter
+	// of the byte budget. It is still checked, because the failure mode if that
+	// ever stops being true is a browser painting live output onto a screen it
+	// never received, with nothing anywhere saying so.
+	if !conn.enqueue(relay.EncodeData(s.catchUp())) || !conn.enqueue(relay.EncodeActivity(s.active)) {
 		delete(s.conns, conn)
-	}
-	s.mu.Unlock()
-	if err != nil {
+		// Back to no connections, and attach stopped the timer above — without
+		// re-arming it the session would keep its shell until the process died.
+		if len(s.conns) == 0 && s.expires == nil {
+			s.expires = time.AfterFunc(terminalDetachTTL, s.close)
+		}
+		s.mu.Unlock()
+		conn.kill()
 		return
 	}
+	s.mu.Unlock()
 
 	for {
 		frame, err := conn.stream.ReadFrame()
@@ -279,13 +461,14 @@ func (s *terminalSession) attach(conn *sealedConn) {
 }
 
 func (s *terminalSession) detach(conn *sealedConn) {
+	conn.kill()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
 	delete(s.conns, conn)
-	if len(s.conns) == 0 {
+	if len(s.conns) == 0 && s.expires == nil {
 		s.expires = time.AfterFunc(terminalDetachTTL, s.close)
 	}
 }
@@ -306,8 +489,8 @@ func (s *terminalSession) readPTY() {
 
 func (s *terminalSession) output(data []byte) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return
 	}
 	s.buffer = append(s.buffer, data...)
@@ -315,17 +498,81 @@ func (s *terminalSession) output(data []byte) {
 		copy(s.buffer, s.buffer[len(s.buffer)-terminalReplayBytes:])
 		s.buffer = s.buffer[:terminalReplayBytes]
 	}
+	var dropped []*sealedConn
+	if len(s.conns) > 0 {
+		// Encoded here, under the lock, rather than before it. encodeFrame
+		// copies, and that copy is both what makes readPTY's reusable buffer
+		// safe to hand to another goroutine and what lets every connection
+		// share one frame — but it is the same memcpy of the same chunk that
+		// the replay append above already pays here, so it does not change the
+		// order of this critical section. Doing it inside is what lets a
+		// detached session — up to terminalDetachTTL, an hour, a build spamming
+		// logs into nothing — pay none of it.
+		dropped = s.broadcast(relay.EncodeData(data), false)
+	} else if s.expires == nil {
+		s.expires = time.AfterFunc(terminalDetachTTL, s.close)
+	}
+	s.mu.Unlock()
+	// Off this goroutine entirely: this is the PTY read loop, and killing a
+	// yamux stream writes a close frame, which parks for up to yamux's
+	// ConnectionWriteTimeout when the tunnel's writer is wedged — the very
+	// condition that causes the drop. Nothing on the PTY read path may wait on
+	// the network, including on the way out.
+	if len(dropped) > 0 {
+		go killAll(dropped)
+	}
+}
+
+// catchUp is the replay history behind a screen reset: what a connection needs
+// in order to redraw, whether it is new or has just missed frames.
+func (s *terminalSession) catchUp() []byte {
+	out := make([]byte, 0, len(terminalResyncPrefix)+len(s.buffer))
+	out = append(out, terminalResyncPrefix...)
+	return append(out, s.buffer...)
+}
+
+// broadcast queues one encoded frame on every attached connection, collapsing
+// the backlog of any that has fallen a whole budget behind, and returns those
+// that turned out to be dead. The caller holds s.mu.
+//
+// Falling behind is not itself fatal — see terminalSendBytes for why a starved
+// writer goroutine and a stuck socket cannot be told apart from here. A
+// connection only appears in the returned slice once its own write deadline has
+// already killed it. Deleting it here but killing outside the lock is
+// deliberate: closing a stream is network work, and this lock sits directly on
+// the PTY read path.
+//
+// It also arms the detach TTL when the last connection goes, which is how a
+// session whose every client died eventually reaps itself.
+func (s *terminalSession) broadcast(frame []byte, resendOnResync bool) []*sealedConn {
+	var dropped []*sealedConn
+	var catchUp []byte
 	for conn := range s.conns {
-		_ = conn.SetWriteDeadline(time.Now().Add(terminalWriteTO))
-		if err := conn.stream.WriteFrame(relay.EncodeData(data)); err != nil {
-			_ = conn.Close()
-			delete(s.conns, conn)
+		if conn.enqueue(frame) {
 			continue
 		}
-		_ = conn.SetWriteDeadline(time.Time{})
+		if catchUp == nil {
+			catchUp = relay.EncodeData(s.catchUp()) // at most once per broadcast
+		}
+		// The catch-up frame carries the terminal's screen, so a data frame it
+		// replaced is already in it. An activity frame is not — it is a state
+		// transition the replay says nothing about, and swallowing one leaves
+		// the browser's running/idle indicator wrong until the next transition,
+		// which may be an hour away. Those are re-sent behind the catch-up.
+		if !conn.resync(catchUp) || (resendOnResync && !conn.enqueue(frame)) {
+			dropped = append(dropped, conn)
+			delete(s.conns, conn)
+		}
 	}
 	if len(s.conns) == 0 && s.expires == nil {
 		s.expires = time.AfterFunc(terminalDetachTTL, s.close)
+	}
+	return dropped
+}
+
+func killAll(conns []*sealedConn) {
+	for _, conn := range conns {
+		conn.kill()
 	}
 }
 
@@ -348,22 +595,18 @@ func (s *terminalSession) pollActivity() {
 
 func (s *terminalSession) setActivity(active bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	// Before the encode, not after: pollActivity ticks every 700 ms for the
+	// life of the session and almost always finds nothing changed, and
+	// EncodeActivity marshals JSON.
 	if s.closed || active == s.active {
+		s.mu.Unlock()
 		return
 	}
 	s.active = active
-	for conn := range s.conns {
-		_ = conn.SetWriteDeadline(time.Now().Add(terminalWriteTO))
-		if err := conn.stream.WriteFrame(relay.EncodeActivity(active)); err != nil {
-			_ = conn.Close()
-			delete(s.conns, conn)
-			continue
-		}
-		_ = conn.SetWriteDeadline(time.Time{})
-	}
-	if len(s.conns) == 0 && s.expires == nil {
-		s.expires = time.AfterFunc(terminalDetachTTL, s.close)
+	dropped := s.broadcast(relay.EncodeActivity(active), true)
+	s.mu.Unlock()
+	if len(dropped) > 0 {
+		go killAll(dropped)
 	}
 }
 
@@ -419,9 +662,16 @@ func (s *terminalSession) close() {
 		s.closed = true
 		conns := s.conns
 		s.conns = nil
+		// Stopped, not left to fire: close is idempotent so a late tick is
+		// harmless, but an armed timer holds this session — and the PTY and
+		// buffers it closes over — reachable for up to terminalDetachTTL.
+		if s.expires != nil {
+			s.expires.Stop()
+			s.expires = nil
+		}
 		s.mu.Unlock()
 		for conn := range conns {
-			_ = conn.Close()
+			conn.kill()
 		}
 		s.killProcessGroup()
 		close(s.done)
