@@ -28,6 +28,27 @@ const policyFileName = "policy.json"
 // to do, next to the config so it is easy to find.
 const auditFileName = "sessions.log"
 
+const (
+	// maxAuditBytes is how large the audit log may grow before it is rolled.
+	//
+	// This is the one file the agent writes on every single action — every
+	// terminal attach and reattach, every proxy session, every port listing,
+	// every shutdown — and it lives in ~/.config, where nothing rotates
+	// anything. Without a bound it grows for the life of the install and the
+	// machine owner is the one who eventually notices.
+	//
+	// A few MiB is tens of thousands of entries: far more history than anyone
+	// reads, and small enough that two generations of it are never worth
+	// mentioning.
+	maxAuditBytes = 4 << 20
+	// auditRollSuffix names the single generation of history kept across a
+	// roll. One generation, not a numbered series: the log is evidence for the
+	// machine owner about what happened recently, and a rotation scheme that
+	// accumulates files is the unbounded growth this bound exists to stop,
+	// spread over more inodes.
+	auditRollSuffix = ".1"
+)
+
 // policy is what this machine will agree to, independent of what the relay
 // says. The zero value — no policy file — permits what the agent has always
 // permitted, so an existing install behaves identically until it opts in.
@@ -202,6 +223,10 @@ func (p policy) terminalAllowed(cwd string) (bool, string) {
 // deliberately simple and append-only: its job is to leave evidence on the
 // machine the relay is acting upon, so a session nobody asked for is visible
 // after the fact.
+//
+// Append-only, but not unbounded: past maxAuditBytes the file is rolled to a
+// single previous generation (see open). Recent history is what this evidence
+// is for, and nothing else on the machine would ever have truncated it.
 type auditor struct {
 	mu   sync.Mutex
 	path string
@@ -242,7 +267,7 @@ func (a *auditor) record(e auditEntry) {
 		a.off = true
 		return
 	}
-	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	f, err := a.open()
 	if err != nil {
 		a.off = true
 		return
@@ -251,4 +276,39 @@ func (a *auditor) record(e auditEntry) {
 	if _, err := f.Write(append(line, '\n')); err != nil {
 		a.off = true
 	}
+}
+
+// open returns the audit file ready to append to, rolling it first when it has
+// grown past maxAuditBytes.
+//
+// The roll is a rename, so the entry that triggered it is written to the fresh
+// file afterwards and nothing is lost at the seam. The previous generation is
+// replaced rather than kept alongside: os.Rename over an existing path is
+// atomic, so there is never a moment with no history at all, and it preserves
+// the file's 0600 mode.
+//
+// Everything here fails open, towards writing the entry. A log that is a little
+// over its bound is a much smaller problem than an action the relay took with
+// no local record of it, so a stat that fails or a rename that is refused
+// (a read-only directory, a permissions change) falls through to appending.
+func (a *auditor) open() (*os.File, error) {
+	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	// Stat through the descriptor we are about to write to, so the size that
+	// decides the roll is this file's and not that of something swapped in at
+	// the path since.
+	st, err := f.Stat()
+	if err != nil || st.Size() < maxAuditBytes {
+		return f, nil
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	// A rename that is refused leaves the un-rolled file exactly where it was,
+	// so reopening it appends as before and the next record tries the bound
+	// again. Ignored deliberately: there is nothing better to do with it here.
+	_ = os.Rename(a.path, a.path+auditRollSuffix)
+	return os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 }
