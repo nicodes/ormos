@@ -374,13 +374,13 @@ func clearLoginConfig() error {
 			return nil
 		}
 		// The config cannot be read — it is a symlink, a fifo, owned by
-		// somebody else, or too corrupt to parse. Signing out must still work: this is exactly the state
-		// the README tells the user to fix, and the file being refused is the
-		// one holding the token they are trying to revoke. Removing it revokes
-		// the token locally, which is what sign-out is for. The client id is
-		// lost with it, so the next login registers a new system rather than
-		// re-registering this one; that is a far smaller problem than being
-		// unable to sign out at all.
+		// somebody else, or too corrupt to parse. Signing out must still work:
+		// this is exactly the state the README tells the user to fix, and the
+		// file being refused is the one holding the token they are trying to
+		// revoke. Removing it revokes the token locally, which is what sign-out
+		// is for. The client id is lost with it, so the next login registers a
+		// new system rather than re-registering this one; that is a far smaller
+		// problem than being unable to sign out at all.
 		path, perr := configPath()
 		if perr != nil {
 			return err
