@@ -269,6 +269,13 @@ func (p policy) terminalAllowed(cwd string) (bool, string) {
 // does not exist cannot be a link, and if one is created as a link later, the
 // next request re-runs this check against the path as it is then — policy is
 // re-read and re-applied per decision (see livePolicy).
+//
+// EvalSymlinks can also fail for reasons other than a missing component, most
+// plausibly EACCES on a directory this process cannot traverse. The remainder
+// is then joined lexically and could name a link that was never followed —
+// which is not a way out of the root, because a process that cannot traverse
+// that directory cannot reach anything through it either. It would refuse a
+// terminal it might have allowed, which is the direction to fail in.
 func resolveExisting(path string) string {
 	remainder := ""
 	for current := path; ; {

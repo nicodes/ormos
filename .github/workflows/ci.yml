@@ -106,25 +106,26 @@ jobs:
           # This is the one thing here that is proven by compiling.
           GOOS=windows go build ./relay/...
 
-          # The agent must not build anywhere it is not tested. The BSDs are
-          # listed because `unix` would have included all of them: the tag was
-          # a broader claim than the decision until it was narrowed.
+          # Off the supported platforms, the only package left standing must be
+          # relay. Asserted per GOOS with `go list`, which reports what is
+          # SELECTED -- the BSDs are named because `unix` would have included
+          # all of them, and the tag was a broader claim than the decision until
+          # it was narrowed.
+          #
+          # `go build` cannot do this job. It fails on the excluded main package
+          # before internal/system is even considered, so it only ever exercises
+          # main.go's tag: widening every file in internal/system back to `unix`
+          # while main.go stayed correct passed a build-based check, and so did
+          # adding a new internal/system file tagged `unix`. Selection catches
+          # both.
           for goos in windows freebsd openbsd netbsd solaris dragonfly; do
-            if GOOS="$goos" go build . 2>/dev/null; then
-              echo "::error::the agent built for $goos, which nothing tests. internal/system is tagged 'linux || darwin'; something has widened it."
+            got="$(GOOS="$goos" go list ./... 2>/dev/null || true)"
+            if [ "$got" != "github.com/nicodes/ormos/relay" ]; then
+              echo "::error::GOOS=$goos selects more than relay -- something in the agent is buildable on a platform nothing tests:"
+              echo "$got"
               exit 1
             fi
           done
-
-          # And off the supported platforms, the only package left standing must
-          # be relay. This is what catches a NEW file added without a build tag:
-          # it would make internal/system selectable again, and this fails.
-          got="$(GOOS=windows go list ./...)"
-          if [ "$got" != "github.com/nicodes/ormos/relay" ]; then
-            echo "::error::GOOS=windows selected more than relay -- a file in the agent is missing its '//go:build linux || darwin' tag:"
-            echo "$got"
-            exit 1
-          fi
 
           # Both supported platforms still build, so this can never pass by
           # excluding everything.

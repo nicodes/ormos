@@ -493,7 +493,13 @@ func processDead(t *testing.T, pid int) bool {
 	// not do: the process these tests care about is a grandchild, not ours.
 	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
-		return true // ps cannot find it either
+		// NOT "gone". Kill(pid, 0) has already proved the process exists, so a
+		// ps that is missing, sandboxed, or spells its state keyword
+		// differently would otherwise turn processGone into a no-op on that
+		// platform -- the same vacuity the /proc read had. processGone polls,
+		// so being conservative costs one more 25ms iteration and the next
+		// Kill settles it.
+		return false
 	}
 	return strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
 }
@@ -556,7 +562,14 @@ func startGroupSession(t *testing.T, script string) (*terminalSession, int) {
 // Killing only the shell leaves its children running; enforcePolicy then
 // "ends" a terminal whose processes are still alive.
 func TestTerminalCloseKillsProcessGroup(t *testing.T) {
-	s, child := startGroupSession(t, "sleep 600 & echo $! > %s; wait")
+	// The child traps SIGHUP so the KERNEL cannot be what kills it. Closing the
+	// PTY master hangs up the session's foreground process group, so with a
+	// plain `sleep 600` this test passed no matter what killProcessGroup did --
+	// gutting it entirely, or replacing the group signal with a single
+	// Process.Kill, both stayed green. What is under test is the agent reaching
+	// the whole GROUP, so the only thing left that can kill this child is the
+	// explicit unix.Kill(-pgid, ...).
+	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; exec sleep 600' & echo $! > %s; wait")
 	s.close()
 	processGone(t, s.cmd.Process.Pid)
 	processGone(t, child)

@@ -17,8 +17,10 @@ import (
 // 127.0.0.1. Callers disclose this set to the relay (KindListPorts) for
 // live-status highlighting, so they must filter it through local policy first
 // (see handleListPorts): the listing alone tells the relay which services
-// this machine runs. Linux-only (parses /proc/net/tcp*); returns nil
-// elsewhere, so on macOS/other the TUI shows no live status.
+// this machine runs. Linux-only: it parses /proc/net/tcp*, so anywhere else it
+// finds nothing and returns an EMPTY list — not nil, so it still encodes as []
+// rather than null — and the TUI shows no live status. That gap is documented
+// in the README, because macOS is a supported platform.
 // TODO(macos): fall back to `lsof -iTCP -sTCP:LISTEN` / netstat.
 func listeningPorts() []int {
 	set := map[int]struct{}{}

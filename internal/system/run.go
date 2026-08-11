@@ -12,10 +12,10 @@
 //
 // The agent's job is to act on the machine it runs on: allocate a PTY, poll its
 // master descriptor, read a terminal's foreground process group, deliver SIGHUP
-// and then SIGKILL to a shell that will not exit. That is golang.org/x/sys/unix,
-// which has no Windows implementation of any of it, so `go build .` for Windows
-// reports that the package does not exist there rather than listing the ten
-// symbols it is missing.
+// and then SIGKILL to a shell that will not exit, and take a file lock over the
+// audit log. That is golang.org/x/sys/unix, which has no Windows implementation
+// of any of it, so `go build .` for Windows reports that the package does not
+// exist there rather than listing the symbols it is missing.
 //
 // The tag names the two platforms rather than saying `unix`, which would also
 // select the BSDs and Solaris. Nothing here is tested on those, and this is a
