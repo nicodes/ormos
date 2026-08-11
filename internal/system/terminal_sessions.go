@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -61,6 +62,20 @@ const (
 	// buffer. Erase-scrollback would also throw away the user's real scrollback
 	// on each resynchronisation, which a reattach has never done.
 	terminalResyncPrefix = "\x1bc"
+	// terminalCoalesceMax is the largest chunk readPTY builds out of
+	// consecutive PTY reads before sealing and sending it, and so also the size
+	// of its read buffer. Well under relay.MaxFrameSize, which bounds what the
+	// far end will accept.
+	terminalCoalesceMax = 64 << 10
+	// terminalCoalesceMinChunk is the read size above which output is treated
+	// as bulk and worth waiting on. A keystroke echo is a handful of bytes; a
+	// tty hands back kilobytes at a time. Anything smaller leaves immediately,
+	// so interactive latency is untouched.
+	terminalCoalesceMinChunk = 1 << 10
+	// terminalCoalesceWindow bounds how long a bulk chunk may wait for more
+	// output to batch with. It is the entire latency cost of coalescing, and it
+	// is paid only by output that already arrived in tty-chunk quantities.
+	terminalCoalesceWindow = 2 * time.Millisecond
 )
 
 // terminalKillGrace is how long close waits for the shell's process group to
@@ -474,9 +489,15 @@ func (s *terminalSession) detach(conn *sealedConn) {
 }
 
 func (s *terminalSession) readPTY() {
-	buf := make([]byte, 32*1024)
+	r, err := newPTYReader(s.ptmx)
+	if err != nil {
+		s.owner.logf("terminal: cannot read the pty: %v", err)
+		s.close()
+		return
+	}
+	buf := make([]byte, terminalCoalesceMax)
 	for {
-		n, err := s.ptmx.Read(buf)
+		n, _, err := r.read(buf)
 		if n > 0 {
 			s.output(buf[:n])
 		}
@@ -485,6 +506,117 @@ func (s *terminalSession) readPTY() {
 			return
 		}
 	}
+}
+
+// ptyReader reads coalesced chunks from a PTY master.
+//
+// A Linux PTY master hands back at most one tty chunk per read, and one read
+// used to become exactly one sealed record — with everything that costs
+// downstream, all the way to a fresh AEAD instance and a term.write in the
+// browser. The relay deliberately cannot parse a record, so it cannot merge
+// two; the batching has to happen here. ssh and mosh both coalesce for the same
+// reason.
+type ptyReader struct {
+	f  *os.File
+	rc syscall.RawConn
+	// fds is reused across probes rather than built per call: it escapes into
+	// the poll syscall, and read runs on exactly one goroutine per session.
+	fds [1]unix.PollFd
+	// blind latches a probe that failed for a reason the blocking read did not
+	// also surface. Retrying it per chunk would buy a syscall pair for ever and
+	// coalesce nothing.
+	blind bool
+}
+
+func newPTYReader(f *os.File) (*ptyReader, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	return &ptyReader{f: f, rc: rc}, nil
+}
+
+// read performs one blocking read and then absorbs whatever more the tty has,
+// up to len(buf). It reports how many underlying reads produced the chunk,
+// which is what the coalescing test measures.
+//
+// The window opens on the SIZE of the blocking read, not on a zero-wait probe.
+// A probe is a bet on the writer having been scheduled in the gap between the
+// read returning and poll(2) running: on an idle machine that bet wins, and
+// under load it loses, so coalescing switched itself off precisely when the
+// output storm made it worth having — measured degrading from 65 KiB a chunk to
+// 7 KiB under CPU contention. The size of the first read carries the same
+// information with no timing in it at all, because a keystroke echo is a
+// handful of bytes while a tty chunk is kilobytes. A lone echo therefore still
+// leaves without waiting a nanosecond, and bulk output gets the full window
+// whatever the host is doing.
+func (p *ptyReader) read(buf []byte) (n, reads int, err error) {
+	n, err = p.f.Read(buf)
+	reads = 1
+	if err != nil || n < terminalCoalesceMinChunk || p.blind {
+		return n, reads, err
+	}
+	deadline := time.Now().Add(terminalCoalesceWindow)
+	for n < len(buf) {
+		if !p.readable(deadline) {
+			return n, reads, nil
+		}
+		m, rerr := p.f.Read(buf[n:])
+		reads++
+		n += m
+		if rerr != nil {
+			return n, reads, rerr
+		}
+	}
+	return n, reads, nil
+}
+
+// readable reports whether the master has bytes ready, waiting no later than
+// deadline.
+//
+// It reports readiness only. A failed probe is deliberately indistinguishable
+// from "nothing more is waiting": the genuine error is surfaced by the next
+// blocking read, and there is nothing useful to do with a transient poll
+// failure in the middle of a chunk. One that would repeat, though, latches, so
+// a permanently failing probe stops costing a syscall pair per chunk.
+//
+// poll on the raw descriptor rather than a read with a deadline, because
+// creack/pty does not build the master the same way on every supported
+// platform — Linux opens it, macOS wraps an already-open blocking descriptor —
+// so whether the runtime poller has it, and therefore whether SetReadDeadline
+// does anything at all rather than returning ErrNoDeadline, is not something
+// this code can rely on. It also keeps a runtime timer off a path that runs per
+// chunk.
+//
+// The wait rounds UP to whole milliseconds, which is all poll(2) takes: a
+// sub-millisecond remainder truncated toward zero would quietly turn the tail
+// of the window into non-blocking probes and halve it.
+func (p *ptyReader) readable(deadline time.Time) bool {
+	var ready bool
+	err := p.rc.Control(func(fd uintptr) {
+		p.fds[0] = unix.PollFd{Fd: int32(fd), Events: unix.POLLIN}
+		for {
+			wait := time.Until(deadline)
+			if wait <= 0 {
+				return
+			}
+			ms := int((wait + time.Millisecond - 1) / time.Millisecond)
+			n, err := unix.Poll(p.fds[:], ms)
+			if err == unix.EINTR {
+				continue // with what is LEFT of the budget, not a fresh one
+			}
+			if err != nil {
+				p.blind = true
+				return
+			}
+			ready = n > 0
+			return
+		}
+	})
+	if err != nil {
+		p.blind = true
+	}
+	return ready
 }
 
 func (s *terminalSession) output(data []byte) {
