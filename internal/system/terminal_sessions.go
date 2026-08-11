@@ -82,6 +82,20 @@ const (
 // die from SIGHUP before escalating to SIGKILL. A var so tests can shrink it.
 var terminalKillGrace = 2 * time.Second
 
+// terminalHandshakeTO bounds the whole sealed handshake — client hello, server
+// hello, key agreement — the way headerReadTO bounds the stream header before
+// it. serveStream clears its deadline once a stream has announced itself, and
+// the very next read on a terminal stream is the client hello; without this the
+// threat model's compromised relay could open a terminal stream, send a
+// well-formed header, and never say another word, pinning a goroutine and one
+// of the relay.MaxTunnelStreams slots for as long as the agent runs.
+//
+// Deliberately separate from headerReadTO despite sharing its value: they bound
+// different phases against different peers' behaviour, and collapsing them into
+// one knob would mean neither can be tuned without moving the other. A var so
+// tests can shrink it.
+var terminalHandshakeTO = 10 * time.Second
+
 // replayRing is the bounded terminal history a reattaching or resynchronising
 // xterm redraws from.
 //
@@ -320,6 +334,13 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 		d.logf("terminal refused: missing session id")
 		return
 	}
+	// The handshake gets its own deadline, covering the read of the hello, the
+	// write of the reply and the agreement between them — a peer that never
+	// READS stalls the reply just as effectively as one that never writes. It
+	// is cleared only once there is a sealed stream to hand to attach, past
+	// which point there must be no read deadline at all: an idle terminal is
+	// not a broken one, and only the writer goroutine is paced.
+	_ = stream.SetDeadline(time.Now().Add(terminalHandshakeTO))
 	// The browser opens with its ephemeral public key. Everything after this is
 	// sealed, so a failure here has to end the stream rather than fall back to
 	// plaintext — a downgrade that a peer could ask for is not a protection.
@@ -353,6 +374,7 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 		d.logf("terminal refused: %v", err)
 		return
 	}
+	_ = stream.SetDeadline(time.Time{})
 
 	s, err := d.terminal(h)
 	if err != nil {
@@ -441,9 +463,9 @@ func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
 		_, _ = cmd.Process.Wait()
 		return nil, fmt.Errorf("read shell process group: %w", err)
 	}
-	if h.Cols > 0 && h.Rows > 0 {
-		_ = pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(h.Cols), Rows: uint16(h.Rows)})
-	}
+	// Unconditional: the header's dimensions were validated at the top of this
+	// function, so there is no reachable case where they are zero.
+	_ = pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(h.Cols), Rows: uint16(h.Rows)})
 	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[*sealedConn]struct{}), done: make(chan struct{})}
 	d.terminals[h.SessionID] = s
 	d.addSession(1)

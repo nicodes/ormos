@@ -121,3 +121,105 @@ func TestServeStreamClearsHeaderDeadline(t *testing.T) {
 		t.Fatalf("echo = %q, want %q", buf, msg)
 	}
 }
+
+// The threat model includes a compromised relay. Such a relay could open a
+// terminal stream, send the header — which satisfied headerReadTO — and then
+// never send the client hello, because serveStream cleared its deadline exactly
+// one read too early. Each such stream pinned a goroutine and one of the
+// relay.MaxTunnelStreams slots for ever, until the agent could serve nothing.
+func TestTerminalHandshakeDeadlineDropsASilentPeer(t *testing.T) {
+	prev := terminalHandshakeTO
+	terminalHandshakeTO = 150 * time.Millisecond
+	t.Cleanup(func() { terminalHandshakeTO = prev })
+
+	withTempConfigDir(t)
+	agent, client := net.Pipe()
+	defer client.Close()
+	d := &system{terminals: make(map[string]*terminalSession), audit: newAuditor()}
+	done := make(chan struct{})
+	go func() {
+		d.serveStream(agent)
+		close(done)
+	}()
+	header := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "silent", Cols: 80, Rows: 24}
+	if err := relay.WriteHeader(client, header); err != nil {
+		t.Fatal(err)
+	}
+	// ...and then nothing, ever.
+	start := time.Now()
+	select {
+	case <-done:
+		// Bounded both ways: returning EARLY would mean something other than
+		// the deadline ended the stream, and a future guard placed before
+		// ReadClientHello would keep this green with the deadline gone.
+		if elapsed := time.Since(start); elapsed < terminalHandshakeTO {
+			t.Fatalf("the stream ended after %s, before the handshake deadline; it was not the deadline that dropped it", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a terminal stream that never sent its client hello was not dropped")
+	}
+}
+
+// The other half, and the one that fails as a user-visible disconnect rather
+// than as a red test: the deadline must be CLEARED once the handshake is done.
+// Leaving it armed kills every terminal, busy or not, terminalHandshakeTO after
+// it opens.
+func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
+	prev := terminalHandshakeTO
+	terminalHandshakeTO = 300 * time.Millisecond
+	t.Cleanup(func() { terminalHandshakeTO = prev })
+
+	withTempConfigDir(t)
+	agentKey, err := relay.GenerateAgentKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := relay.GenerateAgentKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &system{key: agentKey, terminals: make(map[string]*terminalSession), audit: newAuditor()}
+	d.cfg.Shell = "/bin/sh"
+	agent, client := net.Pipe()
+	defer client.Close()
+	go d.serveStream(agent)
+
+	h := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "idle", Cols: 80, Rows: 24}
+	if err := relay.WriteHeader(client, h); err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.WriteClientHello(client, clientKey.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	salt, err := relay.ReadServerHello(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := relay.DeriveSessionKeys(clientKey, agentKey.PublicKey().Bytes(), salt, h.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := relay.NewSealedStream(client, client, keys.ClientToAgent, keys.AgentToClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drain whatever the shell says, so the agent's writer never blocks.
+	go func() {
+		for {
+			if _, err := sealed.ReadFrame(); err != nil {
+				return
+			}
+		}
+	}()
+
+	// An idle terminal is not a broken one.
+	time.Sleep(4 * terminalHandshakeTO)
+	if err := sealed.WriteFrame(relay.EncodeData([]byte("echo still-here\n"))); err != nil {
+		t.Fatalf("an idle terminal was dropped %s after its handshake: %v", 4*terminalHandshakeTO, err)
+	}
+	t.Cleanup(func() {
+		for _, s := range d.terminals {
+			s.close()
+		}
+	})
+}
