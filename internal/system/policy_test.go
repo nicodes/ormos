@@ -619,3 +619,45 @@ func TestAuditDetailKeepsItsAllowance(t *testing.T) {
 		}
 	}
 }
+
+// The two sides of the allowedRoots comparison must be resolved to the same
+// degree. EvalSymlinks resolves nothing when any component is missing, and the
+// relay may ask for a directory that does not exist yet -- so an existing root
+// reached through a symlink used to be compared against an unresolved target
+// and refuse everything under itself. macOS finds this immediately (/var is a
+// link to /private/var); on Linux it needs a symlinked home to show up.
+func TestAllowedRootsResolveBothSidesEqually(t *testing.T) {
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "via-link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+	p := policy{AllowedRoots: []string{link}}
+
+	// A directory that does not exist yet, named through the real path, under
+	// a root named through the link. Both spellings are the same directory.
+	if ok, reason := p.terminalAllowed(filepath.Join(real, "not-created-yet")); !ok {
+		t.Errorf("a not-yet-created directory under the allowed root was refused: %s", reason)
+	}
+	if ok, reason := p.terminalAllowed(filepath.Join(link, "not-created-yet")); !ok {
+		t.Errorf("the same directory named through the link was refused: %s", reason)
+	}
+}
+
+// The other direction: resolving the existing prefix means a link that leaves
+// the allowed root is caught even when the path continues past it into
+// something that does not exist. Unresolved, that was a plain string prefix of
+// the root and was allowed.
+func TestAllowedRootsFollowALinkOutOfTheRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	escape := filepath.Join(root, "escape")
+	if err := os.Symlink(outside, escape); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+	p := policy{AllowedRoots: []string{root}}
+
+	if ok, _ := p.terminalAllowed(filepath.Join(escape, "missing")); ok {
+		t.Fatal("a link out of the allowed root must not be followed, even into a path that does not exist")
+	}
+}

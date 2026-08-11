@@ -226,27 +226,62 @@ func (p policy) terminalAllowed(cwd string) (bool, string) {
 	if cwd == "" {
 		return false, "local policy restricts terminals to allowedRoots, but no directory was requested"
 	}
-	target, err := filepath.Abs(cwd)
+	abs, err := filepath.Abs(cwd)
 	if err != nil {
 		return false, "could not resolve the requested directory"
 	}
 	// Resolve symlinks so a link inside an allowed root cannot point out of it.
-	if resolved, err := filepath.EvalSymlinks(target); err == nil {
-		target = resolved
-	}
+	// Both sides go through the same resolution: comparing a resolved root
+	// against an unresolved target is comparing two spellings of one tree.
+	target := resolveExisting(abs)
 	for _, root := range p.AllowedRoots {
 		allowed, err := filepath.Abs(expandHome(root))
 		if err != nil {
 			continue
 		}
-		if resolved, err := filepath.EvalSymlinks(allowed); err == nil {
-			allowed = resolved
-		}
+		allowed = resolveExisting(allowed)
 		if target == allowed || strings.HasPrefix(target, allowed+string(filepath.Separator)) {
 			return true, ""
 		}
 	}
 	return false, fmt.Sprintf("local policy does not allow terminals under %s", cwd)
+}
+
+// resolveExisting resolves symlinks in path as far as the filesystem allows,
+// leaving any trailing components that do not exist unchanged.
+//
+// filepath.EvalSymlinks resolves nothing at all when any component of the path
+// is missing, and the relay may legitimately ask for a directory that does not
+// exist yet. That left the two sides of the comparison above resolved to
+// different degrees: the allowed root exists and was resolved, the requested
+// directory did not and was not, so a root reached through any symlink refused
+// every path under it. On macOS that is not a corner case — /var is a link to
+// /private/var, so everything under a temp directory has two spellings — and on
+// Linux it bites anyone whose home or code directory is a link.
+//
+// It also closes the asymmetry in the other direction. With the whole path
+// unresolvable, "<root>/link/missing" where link points at /etc used to compare
+// as a plain string prefix of the root and be allowed; resolving the prefix
+// turns it into /etc/missing, which is not under the root.
+//
+// The security property is unchanged and the reasoning is the same as before:
+// every symlink that actually exists on the path is followed. A component that
+// does not exist cannot be a link, and if one is created as a link later, the
+// next request re-runs this check against the path as it is then — policy is
+// re-read and re-applied per decision (see livePolicy).
+func resolveExisting(path string) string {
+	remainder := ""
+	for current := path; ; {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			return filepath.Join(resolved, remainder)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return path // nothing on the path exists; there is nothing to resolve
+		}
+		remainder = filepath.Join(filepath.Base(current), remainder)
+		current = parent
+	}
 }
 
 // auditor appends a line per relay-requested action to a local file. It is
