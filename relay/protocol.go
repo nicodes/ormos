@@ -38,6 +38,50 @@ const (
 // for it (seal.go).
 const frameHeaderSize = 1 + 4
 
+// Protocol invariants both binaries must agree on. They live here, in the one
+// package the agent and the relay both import, because that is the only place
+// they cannot drift: a bound spelled as a literal on each side is two bounds,
+// and nothing fails loudly when they stop matching.
+const (
+	// MinTerminalDim and MaxTerminalDim bound a terminal's columns and rows, on
+	// the opening StreamHeader and on every resize frame after it.
+	//
+	// The upper bound is not about what a display could plausibly be. It is
+	// what keeps the dimensions inside the uint16 that TIOCSWINSZ takes: the
+	// agent casts to uint16 when it calls pty.Setsize, so a bound above 65535
+	// would wrap silently and set a window nothing asked for.
+	MinTerminalDim = 1
+	MaxTerminalDim = 1000
+	// MinPort and MaxPort bound a TCP port number.
+	MinPort = 1
+	MaxPort = 65535
+	// PublicKeyHeader carries the agent's sealing public key on the tunnel
+	// handshake — every connect, rather than once at pairing, so an agent whose
+	// key was regenerated starts working again by reconnecting instead of being
+	// re-paired. It is the invariant with the quietest failure of the three:
+	// change it on one side and the relay simply never calls SetSystemPubKey,
+	// browsers keep sealing against a stale key, and terminals stop opening
+	// with no error anywhere.
+	PublicKeyHeader = "X-Ormos-Public-Key"
+)
+
+// ValidTerminalSize reports whether a terminal's dimensions are within bounds.
+func ValidTerminalSize(cols, rows int) bool {
+	return cols >= MinTerminalDim && cols <= MaxTerminalDim &&
+		rows >= MinTerminalDim && rows <= MaxTerminalDim
+}
+
+// ValidPort reports whether p is a usable TCP port number.
+//
+// It has no caller in this repository yet. The remaining agent-side literals
+// live in files a concurrent workstream is editing, and the relay's live in the
+// other repository, which re-pins to this one; both conversions are tracked
+// rather than taken here so that two workstreams never edit one file. Until
+// they land, the port bound is the one invariant here with two spellings and no
+// check tying them together — unlike PublicKeyHeader, which the agent names and
+// can therefore be pinned to.
+func ValidPort(p int) bool { return p >= MinPort && p <= MaxPort }
+
 // StreamKind identifies what a newly opened yamux stream is for.
 type StreamKind string
 

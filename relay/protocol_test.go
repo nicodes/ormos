@@ -123,3 +123,46 @@ func TestReadHeaderRejectsOversized(t *testing.T) {
 		t.Fatal("expected error for oversized header, got nil")
 	}
 }
+
+// The bounds live here rather than as a literal per call site, because a
+// literal per call site is a bound per call site. The cases are written as
+// literals on purpose: they pin the values themselves, which the browser and
+// the relay also encode, rather than restating the constants back at
+// themselves.
+func TestValidTerminalSize(t *testing.T) {
+	for _, tc := range []struct {
+		cols, rows int
+		want       bool
+	}{
+		{80, 24, true},
+		{1, 1, true},
+		{1000, 1000, true},
+		{0, 24, false},
+		{80, 0, false},
+		{1001, 24, false},
+		{80, 1001, false},
+		{-1, -1, false},
+	} {
+		if got := ValidTerminalSize(tc.cols, tc.rows); got != tc.want {
+			t.Errorf("ValidTerminalSize(%d, %d) = %v, want %v", tc.cols, tc.rows, got, tc.want)
+		}
+	}
+	// The reason for the upper bound, exercised rather than asserted about: the
+	// agent casts to the uint16 TIOCSWINSZ takes, so a bound past 65535 would
+	// wrap silently. Round-tripping the constant through that cast is a real
+	// check; `if MaxTerminalDim > 65535` would be a constant expression the
+	// compiler folds, with a t.Fatalf that can never run.
+	if got := int(uint16(MaxTerminalDim)); got != MaxTerminalDim {
+		t.Fatalf("MaxTerminalDim %d survives the uint16 cast pty.Setsize takes as %d", MaxTerminalDim, got)
+	}
+}
+
+func TestValidPort(t *testing.T) {
+	for port, want := range map[int]bool{
+		-1: false, 0: false, 1: true, 3000: true, 65535: true, 65536: false,
+	} {
+		if got := ValidPort(port); got != want {
+			t.Errorf("ValidPort(%d) = %v, want %v", port, got, want)
+		}
+	}
+}
