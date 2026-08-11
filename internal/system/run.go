@@ -1,7 +1,45 @@
+//go:build (linux && !android) || (darwin && !ios)
+
 // Package system is ormos on a personal machine: it opens a single outbound
 // WebSocket to the relay and serves terminal and port-proxy streams multiplexed
 // over it. With no arguments it runs the tunnel; with a TTY it also shows a
 // Bubble Tea status dashboard.
+//
+// # Supported platforms
+//
+// Linux and macOS. Every file in this package carries
+// //go:build (linux && !android) || (darwin && !ios), and that is the whole
+// statement.
+//
+// The agent's job is to act on the machine it runs on: allocate a PTY, poll its
+// master descriptor, read a terminal's foreground process group, deliver SIGHUP
+// and then SIGKILL to a shell that will not exit, and take a file lock over the
+// audit log. That is golang.org/x/sys/unix, which has no Windows implementation
+// of any of it, so `go build .` for Windows reports that the package does not
+// exist there rather than listing the symbols it is missing.
+//
+// The tag names the two platforms rather than saying `unix`, which would also
+// select the BSDs and Solaris. Nothing here is tested on those, and this is a
+// program that hands out shells on the machine it runs on — the PTY and
+// process-group paths are exactly the code that misbehaves quietly on a kernel
+// nobody exercised. A build tag is a claim about where this is known to work,
+// so it must not be wider than the set CI actually runs.
+//
+// The !android and !ios halves are not pedantry: Go sets the linux tag on
+// android and the darwin tag on ios, so a plain `linux || darwin` silently
+// included both, and the whole agent selected and built for them. Android is
+// Linux — /proc/net/tcp parsing, PTY allocation and process-group signalling
+// all compile there, on a security model nothing here has considered.
+//
+// CI holds up both halves: a macos-latest job runs the suite, and a step in
+// ci.yml asserts that on every other platform Go knows about — Windows, the
+// BSDs, Solaris, illumos, AIX, plan9, wasm, android and ios — nothing but relay
+// is even selected. Without that step the claim would
+// be unenforceable — `go build ./...` SKIPS packages with no buildable files,
+// so a file that lost its tag would go unnoticed by every build in the pipeline.
+//
+// The shared relay package is deliberately untagged: it is pure Go, the hosted
+// relay imports it, and it cross-compiles for Windows today.
 package system
 
 import (

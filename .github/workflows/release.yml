@@ -26,7 +26,48 @@ permissions: {}
 concurrency: release-${{ github.repository }}
 
 jobs:
+  # A release publishes ormos_Darwin_x86_64 and ormos_Darwin_arm64. Until this
+  # job existed, no macOS machine had run a line of this code before those
+  # archives went out — the cross-compile on the Linux job proves the symbols
+  # resolve and nothing more.
+  #
+  # This is the same argument release.yml already makes for re-running Test at
+  # all ("CI passing on this SHA earlier is a claim about that run, and a
+  # release is the artefact people actually execute"), applied to the platform
+  # CI has only just started testing.
+  #
+  # Test only, no Build: the build action archives with sha256sum and unpacks
+  # the Linux tarball to check the version it reports, neither of which is a
+  # macOS thing. Cross-compiling for darwin is the release job's business.
+  darwin:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+
+      - name: Go version
+        shell: bash
+        run: go version
+
+      - name: Cache Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum', '.mise.toml') }}
+          restore-keys: |
+            go-${{ runner.os }}-
+
+      - name: Test
+        uses: ./.github/actions/test
+
   release:
+    needs: darwin
     runs-on: ubuntu-latest
     # Bounded, so a step that hangs fails here rather than sitting until the
     # runner's own timeout hours later.

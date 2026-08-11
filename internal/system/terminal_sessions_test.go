@@ -1,3 +1,5 @@
+//go:build (linux && !android) || (darwin && !ios)
+
 package system
 
 import (
@@ -8,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -465,31 +468,53 @@ func TestTerminalReattachRechecksSessionCwd(t *testing.T) {
 	}
 }
 
-// processState reads a pid's state from /proc: "" if the process is gone,
-// "Z" if it is a zombie (dead, awaiting a reap that may never come under a
-// non-reaping init), anything else if it is alive.
-func processState(pid int) string {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return ""
+// processDead reports whether pid is dead for the purposes of these tests:
+// either reaped, or a zombie (dead, awaiting a reap that may never come under a
+// non-reaping init).
+//
+// This used to read /proc/<pid>/stat, which does not exist on macOS — so every
+// read errored, "" was taken to mean "the process is gone", and the
+// process-group kill and SIGKILL-escalation tests asserted nothing whatsoever
+// on darwin while reporting green. That is a check that survives the deletion
+// of the thing it guards, and it would have shipped underneath a CI job added
+// specifically to cover those paths.
+//
+// signal 0 is the portable liveness test: it runs the existence and permission
+// checks and delivers nothing. ESRCH means gone; EPERM means the pid exists but
+// belongs to somebody else now, which after a pid recycle also means our
+// process is gone.
+func processDead(t *testing.T, pid int) bool {
+	t.Helper()
+	if err := unix.Kill(pid, 0); err != nil {
+		return true
 	}
-	// comm is parenthesised and may contain spaces; the state follows the
-	// final ')'.
-	return string(data[strings.LastIndexByte(string(data), ')')+2])
+	// Alive — or a zombie, which signal 0 still finds. ps is the one state
+	// query that answers the same way on both supported platforms. Wait4 would
+	// not do: the process these tests care about is a grandchild, not ours.
+	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		// NOT "gone". Kill(pid, 0) has already proved the process exists, so a
+		// ps that is missing, sandboxed, or spells its state keyword
+		// differently would otherwise turn processGone into a no-op on that
+		// platform -- the same vacuity the /proc read had. processGone polls,
+		// so being conservative costs one more 25ms iteration and the next
+		// Kill settles it.
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
 }
 
 func processGone(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		switch state := processState(pid); state {
-		case "", "Z":
+		if processDead(t, pid) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("pid %d still alive (%s) after terminal close", pid, processState(pid))
+			t.Fatalf("pid %d still alive after terminal close", pid)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 
@@ -537,7 +562,31 @@ func startGroupSession(t *testing.T, script string) (*terminalSession, int) {
 // Killing only the shell leaves its children running; enforcePolicy then
 // "ends" a terminal whose processes are still alive.
 func TestTerminalCloseKillsProcessGroup(t *testing.T) {
-	s, child := startGroupSession(t, "sleep 600 & echo $! > %s; wait")
+	// The child traps SIGHUP so the KERNEL cannot be what kills it. Closing the
+	// PTY master hangs up the session's foreground process group, so with a
+	// plain `sleep 600` this test passed no matter what killProcessGroup did --
+	// gutting it entirely, or replacing the group signal with a single
+	// Process.Kill, both stayed green. What is under test is the agent reaching
+	// the whole GROUP, so the only thing left that can kill this child is the
+	// explicit unix.Kill(-pgid, ...).
+	//
+	// The CHILD writes the pidfile, after installing the trap. Writing it from
+	// the parent (`... & echo $! > %s`) publishes the pid at fork time, so the
+	// test could close the PTY while the inner shell had not yet reached the
+	// trap -- and then the kernel's hangup killed it at its default
+	// disposition, which is the vacuity this is supposed to have removed. It
+	// held only by winning a race; a 50ms sleep before the trap made the test
+	// pass again with the group kill gutted. $$ inside sh -c is that shell's
+	// own pid and survives the exec, and an ignored disposition survives exec
+	// by POSIX, so the pidfile existing now proves the trap is installed.
+	//
+	// Note what the pair of close tests can and cannot separate: a process in
+	// the tty's foreground group cannot tell the kernel's hangup from the
+	// agent's SIGHUP, so trapping HUP is the only lever available and what both
+	// tests actually pin is that the ESCALATION reaches the group. Replacing
+	// the SIGHUP with a single-process kill leaves both green; replacing the
+	// group SIGKILL does not.
+	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; echo $$ > %s; exec sleep 600' & wait")
 	s.close()
 	processGone(t, s.cmd.Process.Pid)
 	processGone(t, child)
@@ -550,7 +599,9 @@ func TestTerminalCloseEscalatesToSIGKILL(t *testing.T) {
 	terminalKillGrace = 200 * time.Millisecond
 	t.Cleanup(func() { terminalKillGrace = prev })
 
-	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; exec sleep 600' & echo $! > %s; wait")
+	// The child publishes its own pid after the trap; see the note in
+	// TestTerminalCloseKillsProcessGroup for why the parent must not.
+	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; echo $$ > %s; exec sleep 600' & wait")
 	start := time.Now()
 	s.close()
 	if elapsed := time.Since(start); elapsed > 5*time.Second {

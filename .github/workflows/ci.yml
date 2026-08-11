@@ -1,17 +1,21 @@
 name: CI
 
-# Every push and pull request: build, then test, on one runner.
+# Every push and pull request: build, then test.
 #
 # Nothing is published, so a green CI means one thing — this commit is good.
 #
-# One job, because a job is a machine: two would each pay their own checkout and
-# their own toolchain to split one green tick in two. The phases are separate
-# STEPS, so the log still shows which is which and a failure still says so.
+# TWO jobs, and only two, because a job is a machine and ormos is a two-platform
+# product. Splitting phases across machines would be waste — each would pay its
+# own checkout and toolchain to split one green tick in two — so build and test
+# are separate STEPS of the Linux job. Splitting PLATFORMS is not waste: macOS is
+# a different kernel, and the claim "this runs on macOS" is otherwise checked by
+# nobody. The Darwin job exists to make that claim falsifiable.
 #
 # The steps are .github/actions/*, the same ones Release runs. There is one
 # definition of each, and it is the one guarding a release; two would drift in a
 # single direction, with the release-side copy trimmed for speed until it no
-# longer matched what people trust on a pull request.
+# longer matched what people trust on a pull request. The Darwin job reuses the
+# same test action for the same reason — one definition of "tested".
 
 on:
   pull_request:
@@ -72,9 +76,111 @@ jobs:
             go-${{ runner.os }}-
 
       # Built first: a compile error should fail before a test suite spends
-      # minutes reaching the same conclusion more slowly.
+      # minutes reaching the same conclusion more slowly. Same order as
+      # release.yml, which is the point — one ordering, no exceptions to
+      # remember. (The steps used to run the other way round while both this
+      # comment and the header above said "build, then test".)
+      - name: Build
+        uses: ./.github/actions/build
+
       - name: Test
         uses: ./.github/actions/test
 
-      - name: Build
-        uses: ./.github/actions/build
+      # The agent is Linux and macOS. That is a decision, and a decision with
+      # nothing checking it is a comment.
+      #
+      # It cannot be checked by building: `go build ./...` SKIPS packages with
+      # no buildable files, so once internal/system is tagged out, a Windows
+      # build of ./... exits 0 having compiled only relay. Which means that
+      # without this step, a file that lost its build tag would sail through
+      # both jobs, and the first person to find out would be whoever ran it on
+      # an untested kernel.
+      #
+      # So the assertions are about what is SELECTED, not what compiles.
+      - name: The agent builds for Linux and macOS, and nothing else
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # relay is imported by the hosted backend and must stay portable.
+          # This is the one thing here that is proven by compiling.
+          GOOS=windows go build ./relay/...
+
+          # Each target names its arch explicitly: several of these have no
+          # valid default, and `GOOS=x ${var} go list` does not work — bash
+          # recognises assignment prefixes before expansion, so the expanded
+          # word is run as a command. env takes them as arguments instead.
+          #
+          # android and ios are on this list because they are the two a plain
+          # `linux || darwin` tag SILENTLY INCLUDES: Go sets the linux tag on
+          # android and the darwin tag on ios, so the agent selected and built
+          # there — on kernels with a different security model, different PTY
+          # behaviour, and no CI at all. The tags say `(linux && !android) ||
+          # (darwin && !ios)` for that reason, and this is what holds them to it.
+          for target in \
+            windows/amd64 freebsd/amd64 openbsd/amd64 netbsd/amd64 \
+            solaris/amd64 dragonfly/amd64 illumos/amd64 aix/ppc64 \
+            plan9/amd64 js/wasm wasip1/wasm android/arm64 ios/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            got="$(env GOOS="$goos" GOARCH="$goarch" go list ./... 2>/dev/null || true)"
+            if [ "$got" != "github.com/nicodes/ormos/relay" ]; then
+              echo "::error::$target selects more than relay -- something in the agent is buildable on a platform nothing tests:"
+              echo "$got"
+              exit 1
+            fi
+          done
+
+          # Both supported platforms still build, so this can never pass by
+          # excluding everything.
+          GOOS=linux go build ./...
+          GOOS=darwin go build ./...
+          echo "linux and darwin build; every other platform selects relay alone"
+
+  # macOS is half of what ormos claims to support, and until this job existed
+  # nothing verified it. The Build step above cross-compiles for darwin, but
+  # that proves only that the symbols resolve — it does not run a line of the
+  # code on the platform.
+  #
+  # It matters most for the terminal. The agent polls a raw PTY master
+  # descriptor through RawConn.Control, which on darwin goes via the libc
+  # trampoline rather than a kernel ppoll, and creack/pty builds the master
+  # differently on the two platforms (Linux os.OpenFile, macOS os.NewFile on an
+  # already-open blocking descriptor). That is exactly the difference the
+  # output-coalescing path reasons about, so it is exactly the code a
+  # cross-compile cannot vouch for.
+  #
+  # Test only, no Build: the build action archives with sha256sum and unpacks
+  # the Linux archive to check the version it reports, neither of which is a
+  # macOS thing. What a darwin binary needs proving about it is proven by
+  # compiling in the job above; what it needs proving about it HERE is that the
+  # tests pass on a Mac.
+  darwin:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+
+      # Which Go this job actually got. The pin-agreement check runs on the
+      # Linux job — it is a property of the tree, not of the machine — but when
+      # a failure happens only here, the first question is whether the toolchain
+      # differs, and the log should answer it without a rerun.
+      - name: Go version
+        shell: bash
+        run: go version
+
+      # runner.os is in the key, so this never collides with the Linux cache.
+      - name: Cache Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum', '.mise.toml') }}
+          restore-keys: |
+            go-${{ runner.os }}-
+
+      - name: Test
+        uses: ./.github/actions/test
