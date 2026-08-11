@@ -57,13 +57,19 @@ State lives under `~/.config/ormos/`:
 | File | Purpose |
 | --- | --- |
 | `config.json` | Pairing token and system identity; mode `0600` |
-| `key` | Long-lived terminal sealing key; mode `0600` |
+| `identity.key` | Long-lived terminal sealing key; mode `0600` |
 | `policy.json` | Optional restrictions enforced by this machine |
 | `sessions.log` | Local JSON-lines audit trail of relay requests |
 
 `--config /some/path/config.json` moves all four files into that config file's
 directory, which is useful for keeping development and production pairings
 separate.
+
+`config.json` and `identity.key` are re-tightened to `0600` whenever the agent
+reads them, so a copy restored from a backup or loosened by a stray `chmod` does
+not stay readable by other local users. That matters most for `identity.key`:
+the terminal seal has no forward secrecy, so whoever reads it can decrypt
+captured traffic from past sessions, not only future ones.
 
 An optional policy can limit what the relay may ask this machine to do:
 

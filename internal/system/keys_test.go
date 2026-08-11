@@ -60,6 +60,65 @@ func TestTerminalKeyIsWrittenPrivate(t *testing.T) {
 	}
 }
 
+// The mode is only set at creation, so a key loosened after the fact — restored
+// from a backup, copied by hand, caught by a stray chmod — would otherwise stay
+// readable by every local user forever. It decrypts captured past sessions, not
+// just future ones, so the correction happens on the read that finds it.
+func TestLoosenedTerminalKeyModeIsCorrectedOnRead(t *testing.T) {
+	dir := withTempConfigDir(t)
+	newSystem(systemConfig{}) // creates the key at 0600
+	path := filepath.Join(dir, keyFileName)
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, loose := range []os.FileMode{0o644, 0o604, 0o660, 0o666} {
+		if err := os.Chmod(path, loose); err != nil {
+			t.Fatal(err)
+		}
+		key, err := loadOrCreateKey()
+		if err != nil {
+			t.Fatalf("loadOrCreateKey after chmod %04o: %v", loose, err)
+		}
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := st.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("key file left at %04o after a read (was %04o); other local users can still read it", perm, loose)
+		}
+		// Tightening the file must not disturb its contents: the browser has
+		// already learned the public half, so a regenerated key is a silently
+		// broken pairing.
+		if string(key.Bytes()) != string(want) {
+			t.Error("the key changed while its mode was being corrected")
+		}
+	}
+}
+
+// A key the owner deliberately made read-only must stay read-only: forcing the
+// mode to exactly 0600 would grant write access, which is a loosening dressed
+// up as a fix.
+func TestTightTerminalKeyModeIsLeftAlone(t *testing.T) {
+	dir := withTempConfigDir(t)
+	newSystem(systemConfig{})
+	path := filepath.Join(dir, keyFileName)
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadOrCreateKey(); err != nil {
+		t.Fatalf("loadOrCreateKey on a 0400 key: %v", err)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o400 {
+		t.Errorf("key file is %04o, want 0400 left untouched", perm)
+	}
+}
+
 func TestCorruptTerminalKeyIsReportedNotIgnored(t *testing.T) {
 	dir := withTempConfigDir(t)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
