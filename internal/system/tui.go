@@ -269,7 +269,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case projectsMsg:
 		if msg.err != nil {
-			m.err = "load: " + msg.err.Error()
+			m.err = sanitize("load: " + msg.err.Error())
 			return m, nil
 		}
 		// Clear it: every pane starts at once under `make dev`, so the first
@@ -277,14 +277,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// "connection refused" used to stay on screen for the rest of the
 		// session even though the very next poll succeeded.
 		m.err = ""
-		m.projects = msg.projects
+		m.projects = sanitizeProjects(msg.projects)
 		sort.SliceStable(m.projects, func(i, j int) bool { return m.projects[i].Name < m.projects[j].Name })
 		m.rebuildRows()
 		return m, nil
 
 	case systemInfoMsg:
 		if msg.err == nil && msg.info != nil {
-			m.info = msg.info
+			info := *msg.info
+			info.Name = sanitize(info.Name)
+			m.info = &info
 		}
 		return m, nil
 
@@ -294,10 +296,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case mutatedMsg:
 		if msg.err != nil {
-			m.err = msg.err.Error()
+			m.err = sanitize(msg.err.Error())
 		} else {
 			m.err = ""
-			m.notice = msg.ok
+			// Sanitised like m.err even though every ok string is an agent
+			// literal today: the two sit one line apart, and an asymmetry with
+			// no reason written down is one a future relay-derived notice
+			// inherits silently.
+			m.notice = sanitize(msg.ok)
 		}
 		// Refresh both the project list and system info (a rename changes the header).
 		return m, tea.Batch(m.refreshCmd(), m.infoCmd())
@@ -694,7 +700,8 @@ func (m model) View() string {
 		}
 	}
 
-	body := strings.TrimRight(b.String(), "\n")
+	// Clipped as a block, so the line count below is also the ROW count.
+	body := clipLines(strings.TrimRight(b.String(), "\n"), m.width)
 
 	// Footer: input wizard, confirm prompt, or key hints — fenced from the body
 	// by a full-width divider and pinned to the bottom of the terminal.
@@ -735,7 +742,7 @@ func (m model) View() string {
 	} else if m.notice != "" {
 		f.WriteString("\n" + noticeStyle.Render("✓ "+m.notice))
 	}
-	footer := divider(m.width) + "\n" + f.String()
+	footer := clipLines(divider(m.width)+"\n"+f.String(), m.width)
 
 	// ACTIVITY: the tail of the agent's log ring, rendered last and given only
 	// the rows nothing above it needed. Headless mode echoes every line to
@@ -746,20 +753,12 @@ func (m model) View() string {
 		var a strings.Builder
 		a.WriteString(body + "\n\n" + sectionStyle.Render("ACTIVITY") + "\n")
 		for _, line := range m.logs[len(m.logs)-n:] {
-			// Sanitised, then clipped, then styled. Sanitising first because
-			// part of the ring is relay-influenced and an escape sequence must
-			// never reach the terminal; clipping before styling so the width
-			// arithmetic never cuts through lipgloss's own ANSI.
-			// A width of 0 means "not known yet"; a genuinely 1- or 2-column
-			// terminal is not that, so it is floored at 1 rather than allowed
-			// to collide with the sentinel.
-			w := 0
-			if m.width > 0 {
-				w = max(m.width-2, 1)
-			}
-			a.WriteString("  " + hintStyle.Render(clip(sanitize(line), w)) + "\n")
+			// Sanitised because part of the ring is relay-influenced and an
+			// escape sequence must never reach the terminal. The width is
+			// handled by clipLines below, with every other row.
+			a.WriteString("  " + hintStyle.Render(sanitize(line)) + "\n")
 		}
-		body = strings.TrimRight(a.String(), "\n")
+		body = clipLines(strings.TrimRight(a.String(), "\n"), m.width)
 	}
 
 	// Pin the footer to the bottom when the body fits; otherwise let it follow
@@ -812,11 +811,34 @@ func (m model) activityBudget(body, footer string) int {
 	return min(max(avail, 0), activityLines, len(m.logs))
 }
 
+// sanitizeProjects copies the relay's project list with every string it chose
+// stripped of control characters.
+//
+// At the boundary, not at each render site: the names and directories here are
+// painted in five places, and a sanitiser applied per site is one someone
+// forgets at the sixth. Everything downstream of this inherits it.
+func sanitizeProjects(in []relay.ProjectInfo) []relay.ProjectInfo {
+	out := make([]relay.ProjectInfo, len(in))
+	for i, p := range in {
+		p.Name = sanitize(p.Name)
+		p.RootDir = sanitize(p.RootDir)
+		ports := make([]relay.PortEntry, len(p.Ports))
+		for j, pt := range p.Ports {
+			pt.Label = sanitize(pt.Label)
+			ports[j] = pt
+		}
+		p.Ports = ports
+		out[i] = p
+	}
+	return out
+}
+
 // sanitize strips anything unprintable from text before it is painted into the
 // terminal.
 //
-// Part of what reaches the screen is chosen by the relay: an HTTP reason phrase
-// comes back verbatim inside "relay returned %s", and Go does not sanitise it.
+// Most of what reaches this screen is chosen by the relay: the system name, the
+// project names and root directories, the port labels, and — inside "relay
+// returned %s" — an HTTP reason phrase, which Go does not sanitise either.
 // Painted raw into the alt screen, a relay could set the window title, clear
 // the display, move the cursor, or paint a convincing line of its own — from a
 // pane whose whole purpose is to tell the operator the truth about their
@@ -829,6 +851,27 @@ func sanitize(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// clipLines caps every line in s at w columns, so a block's line count is also
+// its ROW count.
+//
+// lipgloss.Height counts newlines, not the rows a terminal will use, and
+// lipgloss.Place pads every line out to the width of the widest one — so one
+// over-wide row inflates the whole block, and the budget above is then computed
+// against a number that no longer describes the screen. A single long project
+// name was enough to turn a 24-line view into 41 rows; since Bubble Tea keeps
+// the LAST height rows, what falls off the top is the header and the sealing
+// fingerprint. Clipping every row is what makes lipgloss.Height honest.
+func clipLines(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = clip(line, w)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // clip shortens s to at most w display columns, marking the cut with an

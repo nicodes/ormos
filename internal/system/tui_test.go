@@ -151,8 +151,9 @@ func TestActivityPaneNeverPushesTheViewOffScreen(t *testing.T) {
 	}
 
 	for _, projects := range []int{0, 1, 2, 4, 8, 20} {
-		for _, h := range []int{10, 16, 24, 40} {
-			m := sized(t, d, 80, h)
+		for _, wh := range [][2]int{{80, 10}, {80, 16}, {80, 24}, {80, 40}, {20, 24}, {40, 16}, {2, 24}} {
+			w, h := wh[0], wh[1]
+			m := sized(t, d, w, h)
 			m.projects = make([]relay.ProjectInfo, projects)
 			for i := range m.projects {
 				m.projects[i] = relay.ProjectInfo{
@@ -165,22 +166,37 @@ func TestActivityPaneNeverPushesTheViewOffScreen(t *testing.T) {
 			bare := m
 			bare.logs = nil
 			bareH := lipgloss.Height(bare.View())
-			withH := lipgloss.Height(m.View())
+			view := m.View()
+			withH := lipgloss.Height(view)
+
+			// Every row must fit the width, or lipgloss.Place pads the whole
+			// block out to the widest one and the height above stops describing
+			// the screen.
+			for _, line := range strings.Split(view, "\n") {
+				if lipgloss.Width(line) > w {
+					t.Fatalf("%d projects at %dx%d: a row is %d columns wide: %q",
+						projects, w, h, lipgloss.Width(line), line)
+				}
+			}
 
 			switch {
 			case bareH > h:
 				// The body alone does not fit. The pane must cost nothing.
 				if withH != bareH {
-					t.Errorf("%d projects at height %d: the pane added %d rows to a view that already overflowed",
-						projects, h, withH-bareH)
+					t.Errorf("%d projects at %dx%d: the pane added %d rows to a view that already overflowed",
+						projects, w, h, withH-bareH)
 				}
 			case withH > h:
-				t.Errorf("%d projects at height %d rendered %d rows; the header is dropped",
-					projects, h, withH)
+				t.Errorf("%d projects at %dx%d rendered %d rows; the header is dropped",
+					projects, w, h, withH)
 			}
-			// The footer is the one thing that must always survive.
-			if !strings.Contains(m.View(), "q quit") {
-				t.Errorf("%d projects at height %d lost the footer", projects, h)
+			// The footer must survive the renderer's truncation, not merely be
+			// present in the string: Bubble Tea keeps the LAST height rows, so
+			// what matters is that the footer is inside that window. Asserted
+			// on the divider rather than the hint text, because at 20 or 2
+			// columns the hints are legitimately clipped away.
+			if !strings.Contains(lastRows(view, h), "─") {
+				t.Errorf("%d projects at %dx%d: the footer is outside the last %d rows", projects, w, h, h)
 			}
 		}
 	}
@@ -253,5 +269,84 @@ func TestDashboardRendersEveryStatusField(t *testing.T) {
 		if !strings.Contains(view, want) {
 			t.Errorf("the dashboard never shows %q:\n%s", want, view)
 		}
+	}
+}
+
+// lastRows returns the final n rows of a view — what Bubble Tea's renderer
+// actually keeps when the view is taller than the terminal.
+func lastRows(view string, n int) string {
+	lines := strings.Split(view, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Almost everything on this screen is text the relay chose: the system name,
+// project names, root directories and port labels all come off its JSON. The
+// activity pane was sanitised in round 1 and these were not — so the same
+// capability was still reachable, through a field that is on screen the whole
+// time rather than only when something is logged.
+//
+// The column-aware clip made it worse before it made it better: byte-slicing
+// used to cap a hostile name at 18 bytes, while ansi.Truncate deliberately
+// re-emits escape sequences and charges them nothing against the width.
+func TestDashboardStripsEscapesFromRelayText(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	m := sized(t, d, 80, 24)
+
+	// Arriving the way the relay delivers it, so the boundary is what is tested
+	// rather than the render sites.
+	info := &relay.SystemInfo{Name: "sys\x1b]0;OWNED\a"}
+	next, _ := m.Update(systemInfoMsg{info: info})
+	next, _ = next.(model).Update(projectsMsg{projects: []relay.ProjectInfo{{
+		Name:    "proj\x1b]0;PWN\a",
+		RootDir: "/r\x1b[2Joot",
+		Ports:   []relay.PortEntry{{Port: 3000, Label: "lbl\x1b]0;NOPE\a"}},
+	}}})
+	view := next.(model).View()
+
+	for _, seq := range []string{"\x1b]", "\a", "\x1b[2J"} {
+		if strings.Contains(view, seq) {
+			t.Errorf("a relay-supplied %q reached the screen", seq)
+		}
+	}
+	// The readable text still has to survive.
+	for _, want := range []string{"sys", "proj", "oot", "lbl"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("sanitising removed %q along with the escapes", want)
+		}
+	}
+}
+
+// A relay-chosen string is also a length, and a long one used to inflate the
+// whole block: lipgloss.Place pads every row out to the widest, so one 219-
+// column label turned a 24-line view into 41 rows and pushed the sealing
+// fingerprint off the top.
+func TestLongRelayTextCannotPushTheHeaderOffScreen(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	m := sized(t, d, 80, 24)
+
+	next, _ := m.Update(projectsMsg{projects: []relay.ProjectInfo{{
+		Name:    strings.Repeat("N", 200),
+		RootDir: strings.Repeat("R", 200),
+		Ports:   []relay.PortEntry{{Port: 3000, Label: strings.Repeat("L", 200)}},
+	}}})
+	view := next.(model).View()
+
+	if h := lipgloss.Height(view); h > 24 {
+		t.Errorf("a long relay string produced %d rows on a 24-row screen", h)
+	}
+	for _, line := range strings.Split(view, "\n") {
+		if lipgloss.Width(line) > 80 {
+			t.Errorf("a row is %d columns on an 80-column screen: %q", lipgloss.Width(line), line)
+		}
+	}
+	// The fingerprint is the out-of-band check against a swapped key; it is the
+	// thing that must not be what falls off.
+	if !strings.Contains(lastRows(view, 24), "sealing") {
+		t.Error("the sealing fingerprint was pushed off the screen")
 	}
 }
