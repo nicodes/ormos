@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -472,5 +473,125 @@ func TestAuditRecordDoesNotBlockOnAHeldLock(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"event":"proxy"`) {
 		t.Error("the entry was dropped rather than written unlocked")
+	}
+}
+
+// The roll must never happen without the lock. Renaming unlocked is the round-1
+// data loss exactly: check-then-rename is not atomic, so a second agent can
+// rename this process's FRESH log over sessions.log.1 and unlink the real
+// history. When the lock cannot be taken the entry is still written — to a file
+// briefly over its bound — and the roll waits for an uncontended call.
+func TestOverBoundLogIsNotRolledWithoutTheLock(t *testing.T) {
+	a := testAuditor(t)
+	fillAuditLog(t, a, int(a.bound()), "history")
+
+	// Hold the lock the way another agent process would.
+	holder, err := os.OpenFile(a.path, os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(holder.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	a.record(auditEntry{Event: "proxy", Port: 3000, Allowed: true})
+
+	if _, err := os.Stat(a.path + auditRollSuffix); !os.IsNotExist(err) {
+		t.Error("the log was rolled while another owner held the lock; history can be unlinked this way")
+	}
+	data, err := os.ReadFile(a.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(data), "history") {
+		t.Error("the history was replaced")
+	}
+	if !strings.Contains(string(data), `"event":"proxy"`) {
+		t.Error("the entry was dropped rather than appended over the bound")
+	}
+
+	// Once the contention clears, the roll happens on the next record.
+	holder.Close()
+	a.record(auditEntry{Event: "proxy", Port: 3001, Allowed: true})
+	rolled, err := os.ReadFile(a.path + auditRollSuffix)
+	if err != nil {
+		t.Fatalf("the deferred roll never happened: %v", err)
+	}
+	if !strings.HasPrefix(string(rolled), "history") {
+		t.Error("the deferred roll kept the wrong generation")
+	}
+}
+
+// A FIFO at sessions.log would block the open until a reader appears — while
+// holding a.mu, on the path that sets up every stream. The test fails by not
+// finishing.
+func TestAuditLogFifoDoesNotHang(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, auditFileName)
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("cannot create a fifo here: %v", err)
+	}
+	a := &auditor{path: path, max: 512}
+
+	done := make(chan struct{})
+	go func() {
+		a.record(auditEntry{Event: "proxy", Port: 3000, Allowed: true})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("record blocked on a fifo; every stream in the agent queues behind this")
+	}
+}
+
+// A rolled generation left loose by an older build is only ever replaced, never
+// re-opened — so its mode is corrected at the roll, where the path is known.
+func TestRolledLogModeIsCorrected(t *testing.T) {
+	a := testAuditor(t)
+	// A previous generation left world-readable by an older build. Nothing ever
+	// opens this path again, so if startup does not correct it, nothing will
+	// until a roll happens to replace it -- which on a quiet machine is never.
+	if err := os.WriteFile(a.path+auditRollSuffix, []byte("older\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(a.path+auditRollSuffix, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a.hardenRolled()
+
+	st, err := os.Stat(a.path + auditRollSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("the rolled log is %04o; it carries this machine's session history", perm)
+	}
+}
+
+// The relay chooses Detail, so it also chooses how much of it survives
+// truncation. Applying the worst-case escape factor to the whole remainder left
+// one rune of the directory the relay asked for, in an entry using a sixth of
+// its allowance — a compromised relay could erase the evidence about itself
+// while staying inside the bound.
+func TestAuditDetailKeepsItsAllowance(t *testing.T) {
+	for name, detail := range map[string]string{
+		"controls": strings.Repeat("\x01", 64<<10),
+		"quotes":   strings.Repeat(`"`, 64<<10),
+	} {
+		a := testAuditor(t)
+		a.record(auditEntry{Event: "terminal", Detail: detail, Allowed: false})
+		data, err := os.ReadFile(a.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var e auditEntry
+		if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &e); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len([]rune(e.Detail)) < 16 {
+			t.Errorf("%s: only %d runes of detail survived in a %d-byte entry; the evidence is gone",
+				name, len([]rune(e.Detail)), len(data))
+		}
 	}
 }

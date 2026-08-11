@@ -70,6 +70,11 @@ const (
 	// false for anything the relay picked on purpose. Bounding the line makes
 	// the count hold for every input.
 	maxAuditEntry = 512
+	// auditLockWait bounds the whole open, lock and roll. record holds a.mu
+	// across it and sits on the synchronous path that sets up every stream, so
+	// this is a stall every terminal attach and proxy dial in the process pays
+	// under contention. Short on purpose: missing the lock only defers a roll.
+	auditLockWait = 100 * time.Millisecond
 )
 
 // policy is what this machine will agree to, independent of what the relay
@@ -273,7 +278,31 @@ func newAuditor() *auditor {
 	if err != nil {
 		return &auditor{off: true}
 	}
-	return &auditor{path: filepath.Join(dir, auditFileName)}
+	a := &auditor{path: filepath.Join(dir, auditFileName)}
+	a.hardenRolled()
+	return a
+}
+
+// hardenRolled corrects the mode of the previous generation, once, at startup.
+//
+// The live log is re-checked on every open and the rename carries that mode
+// across, so a rolled file this build produced is already right. What this is
+// for is a sessions.log.1 left loose by an older build or a restore: nothing
+// ever opens that path again, so without this it stays world-readable until the
+// next roll happens to replace it — which may be never on a quiet machine. It
+// holds the same session history as the live log and deserves the same mode.
+func (a *auditor) hardenRolled() {
+	if a.path == "" {
+		return
+	}
+	path := a.path + auditRollSuffix
+	st, err := os.Stat(path)
+	if err != nil || !st.Mode().IsRegular() {
+		return
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		_ = os.Chmod(path, perm&^0o077)
+	}
 }
 
 type auditEntry struct {
@@ -284,8 +313,9 @@ type auditEntry struct {
 	Allowed bool   `json:"allowed"`
 }
 
-// truncateRunes shortens s to at most n bytes, cutting on a rune boundary and
-// marking the cut. A byte-slice mid-rune leaves U+FFFD sitting next to the
+// truncateRunes shortens s to at most n bytes of ORIGINAL text, cutting on a
+// rune boundary, and appends an ellipsis to mark the cut — so the result is up
+// to n+3 bytes, not n. The caller's budget has to allow for that. A byte-slice mid-rune leaves U+FFFD sitting next to the
 // ellipsis, which reads as corruption in a file whose whole job is evidence.
 func truncateRunes(s string, n int) string {
 	if len(s) <= n {
@@ -332,9 +362,16 @@ func (a *auditor) record(e auditEntry) {
 	// the limit, cut Detail back to fit and encode once more. One retry, not a
 	// loop: the second Detail is short enough that even worst-case escaping
 	// leaves the line under the cap.
-	if len(line) > maxAuditEntry {
-		over := len(line) - maxAuditEntry
-		e.Detail = truncateRunes(e.Detail, max(len(e.Detail)-over, 0)/6)
+	// The raw cap does not bound the ENCODED line, so if escaping blew it past
+	// the limit, cut Detail back and encode again. Halving rather than applying
+	// the worst-case escape factor to the whole remainder: the latter is safe
+	// but wildly over-cuts, and it over-cuts worst on exactly the input a
+	// hostile relay would choose — 256 control bytes left one rune of the
+	// directory it asked for, in an entry using 16% of its allowance. This
+	// converges in a handful of passes and keeps Detail near the real limit.
+	for n := len(e.Detail); len(line) > maxAuditEntry && n > 0; {
+		n /= 2
+		e.Detail = truncateRunes(e.Detail, n)
 		if line, err = json.Marshal(e); err != nil {
 			return
 		}
@@ -381,10 +418,15 @@ func (a *auditor) record(e auditEntry) {
 // that is refused (a read-only directory, a permissions change) all fall
 // through to appending.
 func (a *auditor) open() (*os.File, error) {
+	// ONE deadline for the whole call, not a fresh budget per attempt. record
+	// holds a.mu across this and sits on the synchronous path that sets up
+	// every stream, so per-attempt budgets multiplied into a stall of over a
+	// second under contention — bounded, but still a hang the operator feels.
+	deadline := time.Now().Add(auditLockWait)
 	// Bounded, because every iteration either returns or has just rolled the
 	// file, and a path that keeps changing under us is not worth spinning on.
 	for range 3 {
-		f, err := a.openLocked()
+		f, locked, err := a.openLocked(deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -392,12 +434,34 @@ func (a *auditor) open() (*os.File, error) {
 		if err != nil || st.Size() < a.bound() {
 			return f, nil
 		}
-		// Roll, still holding the lock. Closing releases it, and the next
-		// iteration reopens the now-fresh path and writes the entry there.
-		_ = os.Rename(a.path, a.path+auditRollSuffix)
+		// THE ROLL ONLY HAPPENS UNDER THE LOCK. Renaming without it is the
+		// round-1 data loss exactly: check-then-rename is not atomic, so a
+		// second agent can rename this process's FRESH log over
+		// sessions.log.1 and unlink the real history — leaving no history at
+		// all and a one-line "previous generation". Appending to a file that
+		// is a little over its bound costs nothing that matters; losing the
+		// evidence does.
+		//
+		// So when the lock was not taken — contention that outlasted the
+		// deadline, or a filesystem with no working flock — write the entry
+		// and leave the roll to a later, uncontended call.
+		if !locked {
+			return f, nil
+		}
+		// Still holding the lock. Closing releases it, and the next iteration
+		// reopens the now-fresh path and writes the entry there.
+		if err := os.Rename(a.path, a.path+auditRollSuffix); err != nil {
+			// A rename that cannot succeed will not start succeeding on the
+			// next iteration either, and retrying costs three more opens and
+			// three more lock waits on every record from here on.
+			f.Close()
+			f, _, err := a.openLocked(deadline)
+			return f, err
+		}
 		f.Close()
 	}
-	return a.openLocked()
+	f, _, err := a.openLocked(deadline)
+	return f, err
 }
 
 // openLocked opens the audit file for appending, takes an exclusive lock on it,
@@ -411,18 +475,20 @@ func (a *auditor) open() (*os.File, error) {
 // history. The mode is tightened on the same open, because this file is a
 // record of what a possibly-compromised relay asked this machine to do and no
 // other local user has any business reading it.
-func (a *auditor) openLocked() (*os.File, error) {
+func (a *auditor) openLocked(deadline time.Time) (*os.File, bool, error) {
 	for range 4 {
-		f, err := a.openLockedOnce()
+		f, locked, err := a.openLockedOnce(deadline)
 		if f != nil || err != nil {
-			return f, err
+			return f, locked, err
 		}
 	}
 	// Four opens in a row and the path changed under every one of them. Rather
-	// than drop the entry in silence — which would contradict the fail-towards-
-	// writing policy above — append unlocked. A line in the wrong generation is
-	// recoverable; an action the relay took with no record of it is not.
-	return os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	// than drop the entry in silence — which would contradict the
+	// fail-towards-writing policy above — append unlocked. A line in the wrong
+	// generation is recoverable; an action the relay took with no record of it
+	// is not.
+	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+	return f, false, err
 }
 
 // lockFile takes the exclusive lock, without ever blocking indefinitely.
@@ -434,58 +500,67 @@ func (a *auditor) openLocked() (*os.File, error) {
 // while holding the lock, would take THIS agent's terminal and proxy handling
 // down with it. That is a far worse failure than the one the lock prevents.
 //
-// Giving up and appending unlocked is the deliberate trade, and it is the one
-// the surrounding comments already promise: an unsynchronised roll can lose a
-// generation of history, and an agent that stops serving cannot lose anything
-// because it is not doing anything.
+// Giving up costs a deferred roll and nothing else. The caller rolls ONLY when
+// this returned true, so a lock that could not be taken means the entry is
+// appended to a file that is briefly over its bound and the roll waits for an
+// uncontended call. Nothing is lost either way, which is what makes the short
+// deadline safe.
 //
 // EINTR is retried rather than swallowed: a signal arriving mid-call would
 // otherwise silently downgrade this to the unlocked behaviour.
-func lockFile(f *os.File) {
-	for range 50 {
+func lockFile(f *os.File, deadline time.Time) bool {
+	for {
 		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
-		if err == nil || errors.Is(err, unix.EINTR) {
-			if err == nil {
-				return
-			}
-			continue
+		switch {
+		case err == nil:
+			return true
+		case errors.Is(err, unix.EINTR):
+			// Does not consume the budget. Go's async preemption delivers
+			// SIGURG freely and unix.Flock does not retry internally, so
+			// counting attempts would let a signal burst spend the whole
+			// allowance in microseconds and silently drop us to unlocked.
+			// A wall-clock deadline cannot be spent that way.
+		case !errors.Is(err, unix.EWOULDBLOCK):
+			return false // a filesystem with no working flock
+		default:
+			time.Sleep(2 * time.Millisecond)
 		}
-		if !errors.Is(err, unix.EWOULDBLOCK) {
-			return // a filesystem that cannot lock; append anyway
+		if !time.Now().Before(deadline) {
+			return false
 		}
-		time.Sleep(2 * time.Millisecond)
 	}
 }
 
-// openLockedOnce returns (nil, nil) when the file was rolled out from under it
-// and the caller should try again.
-func (a *auditor) openLockedOnce() (*os.File, error) {
+// openLockedOnce returns (nil, false, nil) when the file was rolled out from
+// under it and the caller should try again. The bool reports whether the lock
+// is actually held, which decides whether the caller may roll.
+func (a *auditor) openLockedOnce(deadline time.Time) (*os.File, bool, error) {
 	// O_NONBLOCK because O_NOFOLLOW does not stop a FIFO, and opening one for
 	// writing blocks until a reader appears — while holding a.mu, on the stream
 	// path. The regular-file check below cannot run until the open returns, so
 	// without this a fifo here hangs the agent rather than one log write.
 	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, err
+		return nil, false, err
 	}
 	if !st.Mode().IsRegular() {
 		f.Close()
-		return nil, fmt.Errorf("%s is not a regular file", a.path)
+		return nil, false, fmt.Errorf("%s is not a regular file", a.path)
 	}
 	if perm := st.Mode().Perm(); perm&0o077 != 0 {
 		_ = f.Chmod(perm &^ 0o077)
 	}
-	lockFile(f)
+	locked := lockFile(f, deadline)
 	// Did somebody roll the file while we were waiting for the lock? Then this
 	// descriptor is the rolled-away inode and the entry belongs elsewhere.
 	if onDisk, err := os.Stat(a.path); err != nil || !os.SameFile(onDisk, st) {
 		f.Close()
-		return nil, nil
+		return nil, false, nil
 	}
-	return f, nil
+	return f, locked, nil
 }
