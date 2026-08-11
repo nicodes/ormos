@@ -104,6 +104,23 @@ func scrubbedEnv() []string {
 	return out
 }
 
+// writeProxyError answers a proxy stream with a complete plain-text HTTP
+// response and nothing else — the caller closes the stream immediately after.
+//
+// Hand-assembled because there is no http.Request to answer: the relay opened a
+// raw byte pipe, and by the time this is called the agent has decided not to
+// forward what came down it. What reaches the user is an iframe, so a bare EOF
+// would render as a blank frame; a status and a sentence render as an
+// explanation.
+//
+// One spelling of the response, called from every refusal, so a change to its
+// shape — a security header, a charset, a Connection semantics fix — lands on
+// all of them rather than on three of four.
+func writeProxyError(w io.Writer, status, body string) {
+	fmt.Fprintf(w, "HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\n"+
+		"Content-Length: %d\r\nConnection: close\r\n\r\n%s", status, len(body), body)
+}
+
 // handleProxy dials a local TCP port and pipes raw bytes both ways.
 func (d *system) handleProxy(stream io.ReadWriteCloser, br io.Reader, port int) {
 	d.addSession(1)
@@ -116,25 +133,22 @@ func (d *system) handleProxy(stream io.ReadWriteCloser, br io.Reader, port int) 
 	pol, policyOK := d.livePolicy()
 	if !policyOK {
 		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: "policy unreadable", Allowed: false})
-		body := "Local policy on this system could not be read; nothing is being served.\n"
-		fmt.Fprintf(stream, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\n"+
-			"Content-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+		writeProxyError(stream, "403 Forbidden",
+			"Local policy on this system could not be read; nothing is being served.\n")
 		return
 	}
 	if ok, reason := pol.proxyAllowed(port); !ok {
 		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: reason, Allowed: false})
 		d.logf("proxy refused by local policy: %s", reason)
-		body := fmt.Sprintf("Local policy on this system refuses port %d.\n", port)
-		fmt.Fprintf(stream, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\n"+
-			"Content-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+		writeProxyError(stream, "403 Forbidden",
+			fmt.Sprintf("Local policy on this system refuses port %d.\n", port))
 		return
 	}
 	if !d.proxyPortAllowed(port) {
 		d.audit.record(auditEntry{Event: "proxy", Port: port, Allowed: false})
 		d.logf("proxy refused: port %d is not exposed", port)
-		body := fmt.Sprintf("Port %d is not exposed on this system.\n", port)
-		fmt.Fprintf(stream, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain; charset=utf-8\r\n"+
-			"Content-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+		writeProxyError(stream, "403 Forbidden",
+			fmt.Sprintf("Port %d is not exposed on this system.\n", port))
 		return
 	}
 
@@ -146,11 +160,8 @@ func (d *system) handleProxy(stream io.ReadWriteCloser, br io.Reader, port int) 
 	}
 	if err != nil {
 		d.logf("proxy dial :%d: %v", port, err)
-		// Send a clear 502 so the iframe shows a message instead of a bare EOF.
-		body := fmt.Sprintf(
-			"Nothing is listening on port %d on this system.\nStart your app on that port and reload.\n", port)
-		fmt.Fprintf(stream, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\n"+
-			"Content-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+		writeProxyError(stream, "502 Bad Gateway",
+			fmt.Sprintf("Nothing is listening on port %d on this system.\nStart your app on that port and reload.\n", port))
 		return
 	}
 	defer local.Close()

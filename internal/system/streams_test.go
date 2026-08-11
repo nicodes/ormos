@@ -3,8 +3,10 @@
 package system
 
 import (
+	"bufio"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -234,5 +236,75 @@ func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
 func TestPublicKeyHeaderMatchesTheProtocol(t *testing.T) {
 	if publicKeyHeader != relay.PublicKeyHeader {
 		t.Fatalf("the agent sends %q but the protocol says %q", publicKeyHeader, relay.PublicKeyHeader)
+	}
+}
+
+// proxyResponse runs one refused proxy stream and parses what the agent wrote
+// back as an HTTP response. Parsing rather than string-matching is the point:
+// a Content-Length that disagrees with the body, or a malformed status line,
+// fails here instead of rendering as a blank iframe for the user.
+func proxyResponse(t *testing.T, d *system, port int) (*http.Response, string) {
+	t.Helper()
+	agent, client := net.Pipe()
+	defer client.Close()
+	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		d.handleProxy(agent, agent, port)
+		agent.Close()
+	}()
+	resp, err := http.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatalf("the agent's refusal is not a readable HTTP response: %v", err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading the refusal body: %v", err)
+	}
+	if resp.ContentLength != int64(len(body)) {
+		t.Errorf("Content-Length is %d but the body is %d bytes", resp.ContentLength, len(body))
+	}
+	return resp, string(body)
+}
+
+// Every refusal goes out through writeProxyError, so these pin the shape of
+// the response the browser actually receives. Four hand-assembled copies of
+// that format string is four places a future edit lands on three.
+func TestProxyRefusalsAreWellFormedHTTP(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+
+	// Refused by the built-in guard: a privileged port, no local opt-in.
+	resp, body := proxyResponse(t, d, 22)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("policy refusal answered %s, want 403", resp.Status)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "text/plain; charset=utf-8" {
+		t.Errorf("Content-Type is %q", ct)
+	}
+	if !strings.Contains(body, "Local policy") {
+		t.Errorf("the refusal does not say why: %q", body)
+	}
+
+	// Allowed, exposed, but nothing is listening: a 502 with an explanation,
+	// because what the user sees is an iframe and a bare EOF renders blank.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dead := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: dead}}
+	d.mu.Unlock()
+
+	resp, body = proxyResponse(t, d, dead)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("a dead port answered %s, want 502", resp.Status)
+	}
+	if !strings.Contains(body, "Nothing is listening") {
+		t.Errorf("the 502 does not say why: %q", body)
 	}
 }
