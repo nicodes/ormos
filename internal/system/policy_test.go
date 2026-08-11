@@ -1,11 +1,15 @@
 package system
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestNoPolicyAllowsAnything(t *testing.T) {
@@ -383,5 +387,90 @@ func TestAuditLogRecoversFromATransientOpenFailure(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"port":3001`) {
 		t.Errorf("the entry after recovery was dropped: %q", data)
+	}
+}
+
+// Capping the raw Detail does not cap the LINE, and the relay chooses the
+// content: JSON escaping turns 256 quotes into ~2x and 256 control bytes into
+// ~6x, so a raw-only cap made the entry-count claim true for ASCII and false
+// for anything picked on purpose. The bound has to hold for the worst input.
+func TestAuditEntryIsBoundedForEveryInput(t *testing.T) {
+	for name, detail := range map[string]string{
+		"plain":     strings.Repeat("A", 64<<10),
+		"quotes":    strings.Repeat(`"`, 64<<10),
+		"controls":  strings.Repeat("\x01", 64<<10),
+		"backslash": strings.Repeat(`\`, 64<<10),
+		"multibyte": strings.Repeat("日", 64<<10),
+	} {
+		a := testAuditor(t)
+		a.record(auditEntry{Event: "terminal", Detail: detail, Allowed: false})
+		data, err := os.ReadFile(a.path)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(data) > maxAuditEntry+1 { // +1 for the newline
+			t.Errorf("%s: one entry cost %d bytes, over the %d cap", name, len(data), maxAuditEntry)
+		}
+		// And it must still be one valid JSON object.
+		var e auditEntry
+		if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &e); err != nil {
+			t.Errorf("%s: the truncated entry is not valid JSON: %v (%q)", name, err, data)
+		}
+	}
+}
+
+// A truncated non-ASCII cwd must not end mid-rune: json.Marshal substitutes
+// U+FFFD, which reads as corruption in a file whose whole job is evidence.
+func TestAuditDetailTruncatesOnRuneBoundaries(t *testing.T) {
+	a := testAuditor(t)
+	a.record(auditEntry{Event: "terminal", Detail: strings.Repeat("日", 400), Allowed: false})
+	data, err := os.ReadFile(a.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e auditEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(data))), &e); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(e.Detail, '�') {
+		t.Errorf("the detail was cut mid-rune: %q", e.Detail)
+	}
+}
+
+// A blocking flock would wait forever while holding a.mu, on the synchronous
+// path that sets up every stream — so a second agent stopped under a debugger
+// while holding the lock would take this agent's terminals down with it. The
+// entry is written unlocked instead.
+func TestAuditRecordDoesNotBlockOnAHeldLock(t *testing.T) {
+	a := testAuditor(t)
+	fillAuditLog(t, a, 16, "old")
+
+	// Hold the lock from another descriptor, the way another process would.
+	holder, err := os.OpenFile(a.path, os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	if err := unix.Flock(int(holder.Fd()), unix.LOCK_EX); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		a.record(auditEntry{Event: "proxy", Port: 3000, Allowed: true})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("record blocked on a held lock; every stream in the agent queues behind this")
+	}
+
+	data, err := os.ReadFile(a.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"event":"proxy"`) {
+		t.Error("the entry was dropped rather than written unlocked")
 	}
 }

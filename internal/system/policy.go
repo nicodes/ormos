@@ -2,6 +2,7 @@ package system
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,6 +62,14 @@ const (
 	// away everything that came before. It is what keeps "a few MiB is tens of
 	// thousands of entries" true when the relay is the one writing them.
 	maxAuditDetail = 256
+	// maxAuditEntry bounds the whole marshalled line, which is what actually
+	// consumes the file. Capping only the raw Detail is not enough: JSON
+	// escaping expands, and the relay chooses the content — 256 bytes of quotes
+	// marshals to about twice that, and 256 control bytes to about six times,
+	// so a raw-only cap made "tens of thousands of entries" true for ASCII and
+	// false for anything the relay picked on purpose. Bounding the line makes
+	// the count hold for every input.
+	maxAuditEntry = 512
 )
 
 // policy is what this machine will agree to, independent of what the relay
@@ -275,6 +284,23 @@ type auditEntry struct {
 	Allowed bool   `json:"allowed"`
 }
 
+// truncateRunes shortens s to at most n bytes, cutting on a rune boundary and
+// marking the cut. A byte-slice mid-rune leaves U+FFFD sitting next to the
+// ellipsis, which reads as corruption in a file whose whole job is evidence.
+func truncateRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := 0
+	for i := range s {
+		if i > n {
+			break
+		}
+		cut = i
+	}
+	return s[:cut] + "…"
+}
+
 // record appends one entry. A write that fails disables the auditor rather than
 // interrupting the session — a machine that cannot write its log should still
 // work — but the caller's own log line still reports the action.
@@ -297,12 +323,21 @@ func (a *auditor) record(e auditEntry) {
 	// twice with a hundred or so junk requests and erase every trace of what it
 	// did before that. Bounding the log is what makes it lossy, so the cap on
 	// what one entry may cost belongs here with it.
-	if len(e.Detail) > maxAuditDetail {
-		e.Detail = e.Detail[:maxAuditDetail] + "…"
-	}
+	e.Detail = truncateRunes(e.Detail, maxAuditDetail)
 	line, err := json.Marshal(e)
 	if err != nil {
 		return
+	}
+	// The raw cap does not bound the encoded line, so if escaping blew it past
+	// the limit, cut Detail back to fit and encode once more. One retry, not a
+	// loop: the second Detail is short enough that even worst-case escaping
+	// leaves the line under the cap.
+	if len(line) > maxAuditEntry {
+		over := len(line) - maxAuditEntry
+		e.Detail = truncateRunes(e.Detail, max(len(e.Detail)-over, 0)/6)
+		if line, err = json.Marshal(e); err != nil {
+			return
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(a.path), 0o700); err != nil {
 		return
@@ -383,16 +418,53 @@ func (a *auditor) openLocked() (*os.File, error) {
 			return f, err
 		}
 	}
-	// Four opens in a row and the path changed under every one of them. That is
-	// not a state to keep retrying in, and an error here drops one entry rather
-	// than returning a nil file the caller would dereference.
-	return nil, fmt.Errorf("%s is being replaced faster than it can be opened", a.path)
+	// Four opens in a row and the path changed under every one of them. Rather
+	// than drop the entry in silence — which would contradict the fail-towards-
+	// writing policy above — append unlocked. A line in the wrong generation is
+	// recoverable; an action the relay took with no record of it is not.
+	return os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+}
+
+// lockFile takes the exclusive lock, without ever blocking indefinitely.
+//
+// LOCK_NB and a short bounded retry rather than a plain LOCK_EX. A blocking
+// flock waits forever, and it would wait while holding a.mu, on the synchronous
+// path that sets up every stream — so a second agent sharing this state
+// directory that is stopped under a debugger, or stalled on a hung filesystem
+// while holding the lock, would take THIS agent's terminal and proxy handling
+// down with it. That is a far worse failure than the one the lock prevents.
+//
+// Giving up and appending unlocked is the deliberate trade, and it is the one
+// the surrounding comments already promise: an unsynchronised roll can lose a
+// generation of history, and an agent that stops serving cannot lose anything
+// because it is not doing anything.
+//
+// EINTR is retried rather than swallowed: a signal arriving mid-call would
+// otherwise silently downgrade this to the unlocked behaviour.
+func lockFile(f *os.File) {
+	for range 50 {
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil || errors.Is(err, unix.EINTR) {
+			if err == nil {
+				return
+			}
+			continue
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) {
+			return // a filesystem that cannot lock; append anyway
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // openLockedOnce returns (nil, nil) when the file was rolled out from under it
 // and the caller should try again.
 func (a *auditor) openLockedOnce() (*os.File, error) {
-	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
+	// O_NONBLOCK because O_NOFOLLOW does not stop a FIFO, and opening one for
+	// writing blocks until a reader appears — while holding a.mu, on the stream
+	// path. The regular-file check below cannot run until the open returns, so
+	// without this a fifo here hangs the agent rather than one log write.
+	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -408,9 +480,7 @@ func (a *auditor) openLockedOnce() (*os.File, error) {
 	if perm := st.Mode().Perm(); perm&0o077 != 0 {
 		_ = f.Chmod(perm &^ 0o077)
 	}
-	// Advisory, and best-effort: a filesystem that cannot lock still gets its
-	// entry written, it just loses the cross-process guarantee.
-	_ = unix.Flock(int(f.Fd()), unix.LOCK_EX)
+	lockFile(f)
 	// Did somebody roll the file while we were waiting for the lock? Then this
 	// descriptor is the rolled-away inode and the entry belongs elsewhere.
 	if onDisk, err := os.Stat(a.path); err != nil || !os.SameFile(onDisk, st) {
