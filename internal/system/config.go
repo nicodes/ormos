@@ -109,14 +109,18 @@ func loadConfigFileChecked() (systemConfig, string, error) {
 	// on the read, not only the next time something happens to save it. It holds
 	// the pairing token, and saves are rare: a login, a logout, and nothing else
 	// for the life of the install.
-	f, warning, err := openPrivateFile(path)
+	f, dirWarning, fileWarning, err := openPrivateFile(path)
+	warning := dirWarning
+	if fileWarning != "" {
+		// The remedy belongs only to the file: tightening the mode does not
+		// un-leak a bearer token.
+		fileWarning += " — the pairing token in it may already have been copied; sign out and pair again to mint a new one"
+		warning = strings.TrimPrefix(warning+"; "+fileWarning, "; ")
+	}
 	if err != nil {
 		return cfg, warning, err
 	}
 	defer f.Close()
-	if warning != "" {
-		warning += " — the pairing token in it may already have been copied; sign out and pair again to mint a new one"
-	}
 	data, err := io.ReadAll(io.LimitReader(f, maxConfigFileSize))
 	if err != nil {
 		return cfg, warning, err
@@ -190,62 +194,54 @@ const maxConfigFileSize = 1 << 20
 // access to a file the owner had deliberately made read-only, which is a
 // loosening dressed up as a fix.
 //
-// A correction is returned as a warning string rather than printed, because the
-// right place to put it depends on the caller — stderr is wiped by the TUI's
-// alt screen a moment later, so the agent puts it in the log ring as well.
-func openPrivateFile(path string) (*os.File, string, error) {
+// Corrections are returned as warnings rather than printed, because the right
+// place to put them depends on the caller — stderr is wiped by the TUI's alt
+// screen a moment later, so the agent puts them in the log ring as well. The
+// directory's and the file's are returned separately: only the file's earns a
+// remedy like "delete it and re-pair", and welding that onto a directory
+// correction told the operator to delete a key that had never existed.
+func openPrivateFile(path string) (f *os.File, dirWarning, fileWarning string, err error) {
 	// The directory first, so both read paths get it rather than only the key's.
 	// A group- or world-WRITABLE state directory defeats every check below it:
 	// an attacker who cannot read a 0600 file can still unlink it and leave
 	// their own in its place, which is the planted-file case with the right
 	// owner already on it.
-	warning := hardenOrmosDir()
+	dirWarning = hardenOrmosDir()
 
 	// O_NONBLOCK because O_NOFOLLOW does not save us from a FIFO: opening a
 	// named pipe for reading BLOCKS until a writer appears, and the regular-file
 	// check below cannot run until the open returns. Without this, a fifo at
 	// this path wedges the agent at startup with nothing printed. It is a no-op
 	// on a regular file.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err = os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
-			return nil, warning, fmt.Errorf("%s is a symbolic link; refusing to follow it (move the real file into place, or point --config at it)", path)
+			return nil, dirWarning, "", fmt.Errorf("%s is a symbolic link; refusing to follow it (move the real file into place, or point --config at it)", path)
 		}
-		return nil, warning, err
+		return nil, dirWarning, "", err
 	}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, warning, err
+		return nil, dirWarning, "", err
 	}
 	if !st.Mode().IsRegular() {
 		f.Close()
-		return nil, warning, fmt.Errorf("%s is not a regular file", path)
+		return nil, dirWarning, "", fmt.Errorf("%s is not a regular file", path)
 	}
 	if owner, ok := fileOwner(st); ok && owner != os.Getuid() {
 		f.Close()
-		return nil, warning, fmt.Errorf("%s is owned by uid %d, not by this user (uid %d); refusing to use it", path, owner, os.Getuid())
+		return nil, dirWarning, "", fmt.Errorf("%s is owned by uid %d, not by this user (uid %d); refusing to use it", path, owner, os.Getuid())
 	}
 	perm := st.Mode().Perm()
 	if perm&0o077 == 0 {
-		return f, warning, nil
+		return f, dirWarning, "", nil
 	}
 	want := perm &^ 0o077
 	if err := f.Chmod(want); err != nil {
-		return f, join(warning, fmt.Sprintf("%s is mode %04o, readable by other local users, and its mode could not be corrected: %v", path, perm, err)), nil
+		return f, dirWarning, fmt.Sprintf("%s is mode %04o, readable by other local users, and its mode could not be corrected: %v", path, perm, err), nil
 	}
-	return f, join(warning, fmt.Sprintf("%s was mode %04o, readable by other local users; corrected to %04o", path, perm, want)), nil
-}
-
-// join concatenates two warnings, either of which may be empty.
-func join(a, b string) string {
-	switch {
-	case a == "":
-		return b
-	case b == "":
-		return a
-	}
-	return a + "; " + b
+	return f, dirWarning, fmt.Sprintf("%s was mode %04o, readable by other local users; corrected to %04o", path, perm, want), nil
 }
 
 // fileOwner returns the uid owning fi, and whether it could be determined.
@@ -272,9 +268,21 @@ var fileOwner = func(fi os.FileInfo) (int, bool) {
 // there, which is the planted-key case openPrivateFile refuses, handed to them
 // with the right owner on it.
 //
+// Only ever applied to the default ~/.config/ormos, which is a directory this
+// agent creates and owns the meaning of. Under --config the state directory is
+// filepath.Dir of whatever path was given, which can be $HOME or any other
+// directory the agent has no business rewriting the mode of: `ormos --config
+// ~/config.json` would silently turn $HOME into 0700 on every start, breaking
+// ~/public_html and anything else that depends on being reachable. Refusing to
+// READ private files out of a loose directory stays unconditional; it is only
+// the silent write to someone else's directory that is gated.
+//
 // Best-effort and silent about the ordinary case: it returns a warning only
 // when it had to change something.
 func hardenOrmosDir() string {
+	if configFileOverride != "" {
+		return ""
+	}
 	dir, err := ormosDir()
 	if err != nil {
 		return ""
@@ -365,7 +373,22 @@ func clearLoginConfig() error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		// The config cannot be read — it is a symlink, a fifo, or owned by
+		// somebody else. Signing out must still work: this is exactly the state
+		// the README tells the user to fix, and the file being refused is the
+		// one holding the token they are trying to revoke. Removing it revokes
+		// the token locally, which is what sign-out is for. The client id is
+		// lost with it, so the next login registers a new system rather than
+		// re-registering this one; that is a far smaller problem than being
+		// unable to sign out at all.
+		path, perr := configPath()
+		if perr != nil {
+			return err
+		}
+		if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
+			return err
+		}
+		return nil
 	}
 	cfg.PairingToken = ""
 	cfg.SystemID = ""

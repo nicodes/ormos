@@ -233,11 +233,29 @@ func TestWriteNewKeyNeverOverwrites(t *testing.T) {
 	}
 }
 
+// withTempHome points HOME at a temp dir and leaves configFileOverride EMPTY,
+// so ormosDir resolves the default ~/.config/ormos. That is the only
+// configuration in which the agent owns the state directory, and therefore the
+// only one in which it will rewrite that directory's mode.
+func withTempHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	prev := configFileOverride
+	configFileOverride = ""
+	t.Cleanup(func() { configFileOverride = prev })
+	dir := filepath.Join(home, ".config", "ormos")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 // A group- or world-writable state directory defeats every check on the files
 // inside it: an attacker who cannot read a 0600 key can still unlink it and
 // leave their own in its place.
 func TestStateDirectoryModeIsCorrectedOnRead(t *testing.T) {
-	dir := withTempConfigDir(t)
+	dir := withTempHome(t)
 	newSystem(systemConfig{})
 	if err := os.Chmod(dir, 0o777); err != nil {
 		t.Fatal(err)
@@ -256,6 +274,30 @@ func TestStateDirectoryModeIsCorrectedOnRead(t *testing.T) {
 	}
 	if len(warnings) == 0 {
 		t.Error("correcting the state directory was not reported")
+	}
+}
+
+// Under --config the state directory is filepath.Dir of whatever was given,
+// which can be $HOME or any other directory the agent has no business
+// rewriting. `ormos --config ~/config.json` must not silently turn $HOME into
+// 0700 on every start. Refusing to READ private files out of a loose directory
+// stays unconditional; only the silent write is gated.
+func TestConfigOverrideDirectoryIsNotChmodded(t *testing.T) {
+	dir := withTempConfigDir(t)
+	newSystem(systemConfig{})
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := loadOrCreateKey(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o755 {
+		t.Errorf("a --config directory was chmodded to %04o; the agent does not own that directory", perm)
 	}
 }
 

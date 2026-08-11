@@ -55,13 +55,19 @@ func loadOrCreateKey() (*ecdh.PrivateKey, []string, error) {
 	// warning is collected on every path out of here -- including the error
 	// ones. "the key was world-readable" must not be lost because the read then
 	// failed for some other reason.
-	f, w, err := openPrivateFile(path)
+	f, dirWarning, fileWarning, err := openPrivateFile(path)
 	var warnings []string
-	if w != "" {
-		// The seal has no forward secrecy, so tightening the mode does not undo
-		// the exposure: anything captured while the file was readable stays
-		// decryptable by whoever read it. Say what actually helps.
-		warnings = append(warnings, w+" — it may already have been copied; delete it to generate a new one and re-pair this machine")
+	if dirWarning != "" {
+		warnings = append(warnings, dirWarning)
+	}
+	if fileWarning != "" {
+		// The remedy belongs to the FILE, not to the directory around it: the
+		// seal has no forward secrecy, so tightening the key's mode does not
+		// undo the exposure — anything captured while it was readable stays
+		// decryptable by whoever read it. Attaching this to a directory
+		// correction would tell the operator to delete a key that may never
+		// have existed.
+		warnings = append(warnings, fileWarning+" — it may already have been copied; delete it to generate a new one and re-pair this machine")
 	}
 	if err == nil {
 		defer f.Close()

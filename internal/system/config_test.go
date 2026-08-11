@@ -387,3 +387,54 @@ func TestFifoAtAPrivatePathDoesNotHang(t *testing.T) {
 		t.Fatal("loadConfigFile blocked on a fifo; startup would hang with nothing printed")
 	}
 }
+
+// The remedy belongs to the file, not to the directory around it. Welding them
+// together told the operator, on a first run with no key on disk at all, to
+// "delete it to generate a new one and re-pair this machine" — about a key that
+// had never existed and a machine that had never been paired.
+func TestDirectoryWarningCarriesNoFileRemedy(t *testing.T) {
+	dir := withTempHome(t)
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	// No key on disk: the only correction possible is the directory's.
+	_, warnings, err := loadOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("want exactly the directory warning, got %q", warnings)
+	}
+	if !contains(warnings[0], "reachable by other local users") {
+		t.Errorf("the directory warning is missing: %q", warnings[0])
+	}
+	for _, forbidden := range []string{"delete it", "re-pair", "already have been copied"} {
+		if contains(warnings[0], forbidden) {
+			t.Errorf("the directory warning carries a file remedy (%q): %q", forbidden, warnings[0])
+		}
+	}
+}
+
+// Signing out must work in exactly the state the README tells the user to fix.
+// The file being refused is the one holding the token they are trying to
+// revoke, so refusing to read it must not mean refusing to revoke it.
+func TestSignOutWorksWithAnUnreadableConfig(t *testing.T) {
+	dir := withTempConfigDir(t)
+	path := filepath.Join(dir, "config.json")
+	elsewhere := filepath.Join(t.TempDir(), "real.json")
+	if err := os.WriteFile(elsewhere, []byte(`{"pairingToken":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+
+	if err := clearLoginConfig(); err != nil {
+		t.Fatalf("sign-out refused with an unreadable config: %v", err)
+	}
+	// The local pairing must be gone.
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Error("the config was left in place, so the machine is still paired locally")
+	}
+}
