@@ -81,7 +81,16 @@ That does not delete the system from the account; use the app to forget it.
 func runSystem() {
 	// Precedence: env > saved config > defaults.
 	cfg := loadSystemConfig() // relay default/env, $SHELL
-	if fileCfg, err := loadConfigFile(); err == nil {
+	fileCfg, cfgWarning, cfgErr := loadConfigFileChecked()
+	// Before anything else, and on the error path too: "config.json was
+	// world-readable" is the most important thing that can have happened here,
+	// and it must not be swallowed because the read then failed for some other
+	// reason. This is the one read that happens before the log ring exists, so
+	// stderr is the only destination.
+	if cfgWarning != "" {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", cfgWarning)
+	}
+	if err := cfgErr; err == nil {
 		cfg.ClientID = fileCfg.ClientID
 		cfg.SystemID = fileCfg.SystemID
 		cfg.Email = fileCfg.Email

@@ -5,7 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // useTempConfig points the whole local state at a temp dir for one test. It
@@ -252,5 +254,136 @@ func TestCheckRelayTransport(t *testing.T) {
 	t.Setenv("ORMOS_INSECURE", "1")
 	if err := checkRelayTransport("ws://relay.example.com"); err != nil {
 		t.Fatalf("ORMOS_INSECURE=1 must allow a cleartext remote relay: %v", err)
+	}
+}
+
+// config.json holds the pairing token — a bearer credential for the relay — so
+// it gets the same treatment identity.key does. Nothing covered this: the whole
+// self-heal could be reverted to a plain os.ReadFile and the suite stayed green.
+func TestLoosenedConfigModeIsCorrectedOnRead(t *testing.T) {
+	dir := withTempConfigDir(t)
+	if err := saveConfigFile(systemConfig{RelayURL: "wss://relay.example", PairingToken: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, warning, err := loadConfigFileChecked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PairingToken != "t" {
+		t.Errorf("the config did not survive the correction: %+v", cfg)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("config.json left at %04o; the pairing token is still readable by other local users", perm)
+	}
+	// Tightening the mode does not un-leak a bearer token, so the operator has
+	// to be told the remedy rather than have it fixed silently.
+	if !contains(warning, "sign out and pair again") {
+		t.Errorf("the correction was not reported with its remedy: %q", warning)
+	}
+}
+
+// A symlink at config.json must not be followed: it would redirect the read and
+// the mode correction onto a file of someone else's choosing.
+func TestConfigSymlinkIsRefused(t *testing.T) {
+	dir := withTempConfigDir(t)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := filepath.Join(t.TempDir(), "planted.json")
+	if err := os.WriteFile(elsewhere, []byte(`{"relayUrl":"wss://evil.example.test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(dir, "config.json")); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+
+	if _, err := loadConfigFile(); err == nil {
+		t.Fatal("a symlink at config.json was followed")
+	}
+}
+
+// A directory (or any non-regular file) at config.json is refused rather than
+// chmod'd and reported as a loosened config.
+func TestConfigPathMustBeARegularFile(t *testing.T) {
+	dir := withTempConfigDir(t)
+	if err := os.MkdirAll(filepath.Join(dir, "config.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadConfigFile()
+	if err == nil {
+		t.Fatal("a directory at config.json was accepted")
+	}
+	if !contains(err.Error(), "regular file") {
+		t.Errorf("the error should say what is wrong, got: %v", err)
+	}
+}
+
+// The one check here that fails CLOSED. A file owned by someone else is a
+// planted file: for identity.key, adopting one publishes the planter's public
+// half and seals every terminal to a key they hold. Creating a file owned by
+// another uid needs a second uid, which CI does not have — so fileOwner is a
+// var, and this forces the mismatch.
+func TestForeignOwnedPrivateFileIsRefused(t *testing.T) {
+	dir := withTempConfigDir(t)
+	newSystem(systemConfig{}) // creates identity.key owned by us
+
+	real := fileOwner
+	t.Cleanup(func() { fileOwner = real })
+	fileOwner = func(os.FileInfo) (int, bool) { return os.Getuid() + 1, true }
+
+	_, _, err := loadOrCreateKey()
+	if err == nil {
+		t.Fatal("a key file owned by another user was adopted")
+	}
+	for _, want := range []string{"owned by uid", "refusing to use it"} {
+		if !contains(err.Error(), want) {
+			t.Errorf("the error should say why, got: %v", err)
+		}
+	}
+	// And it must not have been rewritten or removed on the way out.
+	if _, err := os.Stat(filepath.Join(dir, keyFileName)); err != nil {
+		t.Errorf("the refused key file was disturbed: %v", err)
+	}
+}
+
+// O_NOFOLLOW does not save us from a FIFO: opening a named pipe for reading
+// BLOCKS until a writer appears, and the regular-file refusal cannot run until
+// the open returns. Without O_NONBLOCK the agent wedges at startup with nothing
+// printed — a hang, not an error, which is the worst shape a failure can take.
+// The timeout is what makes this a real test: it fails by not finishing.
+func TestFifoAtAPrivatePathDoesNotHang(t *testing.T) {
+	dir := withTempConfigDir(t)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("cannot create a fifo here: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := loadConfigFile()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a fifo at config.json was accepted")
+		}
+		if !contains(err.Error(), "regular file") {
+			t.Errorf("the error should say what is wrong, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loadConfigFile blocked on a fifo; startup would hang with nothing printed")
 	}
 }

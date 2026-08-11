@@ -51,20 +51,20 @@ func loadOrCreateKey() (*ecdh.PrivateKey, []string, error) {
 	}
 	path := filepath.Join(dir, keyFileName)
 
-	var warnings []string
-	if w := hardenOrmosDir(); w != "" {
-		warnings = append(warnings, w)
-	}
-
+	// openPrivateFile hardens the state directory as well as the file, so its
+	// warning is collected on every path out of here -- including the error
+	// ones. "the key was world-readable" must not be lost because the read then
+	// failed for some other reason.
 	f, w, err := openPrivateFile(path)
+	var warnings []string
+	if w != "" {
+		// The seal has no forward secrecy, so tightening the mode does not undo
+		// the exposure: anything captured while the file was readable stays
+		// decryptable by whoever read it. Say what actually helps.
+		warnings = append(warnings, w+" — it may already have been copied; delete it to generate a new one and re-pair this machine")
+	}
 	if err == nil {
 		defer f.Close()
-		if w != "" {
-			// The seal has no forward secrecy, so tightening the mode does not
-			// undo the exposure: anything captured while the file was readable
-			// stays decryptable by whoever read it. Say what actually helps.
-			warnings = append(warnings, w+" — it may already have been copied; delete it to generate a new one and re-pair this machine")
-		}
 		raw, err := io.ReadAll(io.LimitReader(f, maxKeyFileSize))
 		if err != nil {
 			return nil, warnings, fmt.Errorf("reading %s: %w", path, err)
@@ -90,22 +90,7 @@ func loadOrCreateKey() (*ecdh.PrivateKey, []string, error) {
 	}
 	// 0600 from the moment it exists: writing world-readable and chmod-ing
 	// after leaves a window in which another local user can read it.
-	//
-	// O_EXCL|O_NOFOLLOW rather than os.WriteFile, which follows symlinks. A
-	// DANGLING link planted at this path is the dangerous case — the read above
-	// refuses to follow it, so control arrives here, and a plain create would
-	// then write a freshly generated private key straight through the link into
-	// a file of the attacker's choosing. O_EXCL refuses any path that already
-	// exists, including a link, and O_NOFOLLOW says so a second time.
-	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
-	if err != nil {
-		return nil, warnings, fmt.Errorf("writing %s: %w", path, err)
-	}
-	if _, err := out.Write(key.Bytes()); err != nil {
-		out.Close()
-		return nil, warnings, fmt.Errorf("writing %s: %w", path, err)
-	}
-	if err := out.Close(); err != nil {
+	if err := writeNewKey(path, key.Bytes()); err != nil {
 		return nil, warnings, fmt.Errorf("writing %s: %w", path, err)
 	}
 	return key, warnings, nil
@@ -131,4 +116,29 @@ func encodePublicKey(key *ecdh.PrivateKey) string {
 // catch a relay that swapped the key. See relay.Fingerprint.
 func (d *system) Fingerprint() string {
 	return relay.Fingerprint(d.key.PublicKey().Bytes())
+}
+
+// writeNewKey creates the key file, and only ever creates it.
+//
+// O_EXCL is the guard here, and what it guards is the create/create race, not
+// the symlink: two agents starting at once both see ENOENT from the read above
+// and both arrive here, and without O_EXCL the second silently overwrites the
+// key the first has already generated and published — leaving one of them
+// sealing against a key the relay does not hold. O_EXCL makes the loser fail
+// loudly instead of quietly winning.
+//
+// It also refuses any path that appeared since the read, symlink or not, which
+// is the belt to O_NOFOLLOW's braces. A symlink is already refused earlier: an
+// O_NOFOLLOW open returns ELOOP for a DANGLING link as much as a live one — not
+// ENOENT — so control never reaches this function for either.
+func writeNewKey(path string, raw []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

@@ -87,34 +87,50 @@ func configPath() (string, error) {
 // in" from a real read/parse failure. A stored relay URL that is not a
 // ws:// or wss:// URL is a validation error, not a config to try anyway.
 func loadConfigFile() (systemConfig, error) {
+	cfg, _, err := loadConfigFileChecked()
+	return cfg, err
+}
+
+// loadConfigFileChecked is loadConfigFile plus any warning about the state it
+// found on disk, for the one caller that has somewhere to put it.
+//
+// The warning matters as much here as it does for the key: config.json holds
+// the pairing token, which is a bearer credential for the relay. Tightening the
+// mode does not un-leak it, so whoever was able to read it can still use it
+// until the machine is re-paired — and the operator has to be told that, not
+// have it fixed silently.
+func loadConfigFileChecked() (systemConfig, string, error) {
 	var cfg systemConfig
 	path, err := configPath()
 	if err != nil {
-		return cfg, err
+		return cfg, "", err
 	}
 	// Through openPrivateFile so a config.json loosened out of band is tightened
 	// on the read, not only the next time something happens to save it. It holds
 	// the pairing token, and saves are rare: a login, a logout, and nothing else
 	// for the life of the install.
-	f, _, err := openPrivateFile(path)
+	f, warning, err := openPrivateFile(path)
 	if err != nil {
-		return cfg, err
+		return cfg, warning, err
 	}
 	defer f.Close()
+	if warning != "" {
+		warning += " — the pairing token in it may already have been copied; sign out and pair again to mint a new one"
+	}
 	data, err := io.ReadAll(io.LimitReader(f, maxConfigFileSize))
 	if err != nil {
-		return cfg, err
+		return cfg, warning, err
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return cfg, err
+		return cfg, warning, err
 	}
 	if cfg.RelayURL != "" {
 		u, err := url.Parse(cfg.RelayURL)
 		if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") {
-			return systemConfig{}, fmt.Errorf("saved relay URL %q is not a ws:// or wss:// URL; fix or delete %s", cfg.RelayURL, path)
+			return systemConfig{}, warning, fmt.Errorf("saved relay URL %q is not a ws:// or wss:// URL; fix or delete %s", cfg.RelayURL, path)
 		}
 	}
-	return cfg, nil
+	return cfg, warning, nil
 }
 
 // saveConfigFile writes the config file, creating the directory. The file holds
@@ -178,39 +194,67 @@ const maxConfigFileSize = 1 << 20
 // right place to put it depends on the caller — stderr is wiped by the TUI's
 // alt screen a moment later, so the agent puts it in the log ring as well.
 func openPrivateFile(path string) (*os.File, string, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	// The directory first, so both read paths get it rather than only the key's.
+	// A group- or world-WRITABLE state directory defeats every check below it:
+	// an attacker who cannot read a 0600 file can still unlink it and leave
+	// their own in its place, which is the planted-file case with the right
+	// owner already on it.
+	warning := hardenOrmosDir()
+
+	// O_NONBLOCK because O_NOFOLLOW does not save us from a FIFO: opening a
+	// named pipe for reading BLOCKS until a writer appears, and the regular-file
+	// check below cannot run until the open returns. Without this, a fifo at
+	// this path wedges the agent at startup with nothing printed. It is a no-op
+	// on a regular file.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
-			return nil, "", fmt.Errorf("%s is a symbolic link; refusing to follow it (move the real file into place)", path)
+			return nil, warning, fmt.Errorf("%s is a symbolic link; refusing to follow it (move the real file into place, or point --config at it)", path)
 		}
-		return nil, "", err
+		return nil, warning, err
 	}
 	st, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return nil, "", err
+		return nil, warning, err
 	}
 	if !st.Mode().IsRegular() {
 		f.Close()
-		return nil, "", fmt.Errorf("%s is not a regular file", path)
+		return nil, warning, fmt.Errorf("%s is not a regular file", path)
 	}
 	if owner, ok := fileOwner(st); ok && owner != os.Getuid() {
 		f.Close()
-		return nil, "", fmt.Errorf("%s is owned by uid %d, not by this user (uid %d); refusing to use it", path, owner, os.Getuid())
+		return nil, warning, fmt.Errorf("%s is owned by uid %d, not by this user (uid %d); refusing to use it", path, owner, os.Getuid())
 	}
 	perm := st.Mode().Perm()
 	if perm&0o077 == 0 {
-		return f, "", nil
+		return f, warning, nil
 	}
 	want := perm &^ 0o077
 	if err := f.Chmod(want); err != nil {
-		return f, fmt.Sprintf("%s is mode %04o, readable by other local users, and its mode could not be corrected: %v", path, perm, err), nil
+		return f, join(warning, fmt.Sprintf("%s is mode %04o, readable by other local users, and its mode could not be corrected: %v", path, perm, err)), nil
 	}
-	return f, fmt.Sprintf("%s was mode %04o, readable by other local users; corrected to %04o", path, perm, want), nil
+	return f, join(warning, fmt.Sprintf("%s was mode %04o, readable by other local users; corrected to %04o", path, perm, want)), nil
+}
+
+// join concatenates two warnings, either of which may be empty.
+func join(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	}
+	return a + "; " + b
 }
 
 // fileOwner returns the uid owning fi, and whether it could be determined.
-func fileOwner(fi os.FileInfo) (int, bool) {
+//
+// A var, not a func, so a test can force a mismatch. Creating a file owned by
+// somebody else needs a second uid, which CI does not have — and without this
+// seam the one check here that FAILS CLOSED would be the only one with no test
+// behind it.
+var fileOwner = func(fi os.FileInfo) (int, bool) {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
 		return 0, false
@@ -235,7 +279,17 @@ func hardenOrmosDir() string {
 	if err != nil {
 		return ""
 	}
-	st, err := os.Stat(dir)
+	// Through a descriptor, for the same reason openPrivateFile does it to the
+	// files: a path-based stat followed by a path-based chmod is two operations
+	// on a name, and the name can be swapped between them. O_DIRECTORY refuses
+	// anything that is not a directory, O_NOFOLLOW refuses a symlink standing
+	// where the state directory should be.
+	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
 	if err != nil || !st.IsDir() {
 		return ""
 	}
@@ -244,7 +298,7 @@ func hardenOrmosDir() string {
 		return ""
 	}
 	want := perm &^ 0o077
-	if err := os.Chmod(dir, want); err != nil {
+	if err := f.Chmod(want); err != nil {
 		return fmt.Sprintf("%s is mode %04o, reachable by other local users, and its mode could not be corrected: %v", dir, perm, err)
 	}
 	return fmt.Sprintf("%s was mode %04o, reachable by other local users; corrected to %04o", dir, perm, want)

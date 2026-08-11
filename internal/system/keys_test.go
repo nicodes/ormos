@@ -170,10 +170,11 @@ func TestTerminalKeySymlinkIsRefused(t *testing.T) {
 	}
 }
 
-// The dangerous half of the same trap: a DANGLING link means the read fails
-// with "not found", control reaches the create branch, and a plain create would
-// write a freshly generated private key through the link.
-func TestTerminalKeyIsNotCreatedThroughADanglingSymlink(t *testing.T) {
+// A DANGLING link is refused at the READ, not at the create: an O_NOFOLLOW open
+// returns ELOOP for a dangling link as much as a live one -- not ENOENT -- so
+// control never reaches the create branch for either. This pins that, and that
+// nothing is written to the attacker's path.
+func TestDanglingKeySymlinkIsRefusedAtTheRead(t *testing.T) {
 	dir := withTempConfigDir(t)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -183,11 +184,52 @@ func TestTerminalKeyIsNotCreatedThroughADanglingSymlink(t *testing.T) {
 		t.Skipf("cannot create a symlink here: %v", err)
 	}
 
-	if _, _, err := loadOrCreateKey(); err == nil {
-		t.Fatal("a dangling symlink at the key path was written through; it must be refused")
+	_, _, err := loadOrCreateKey()
+	if err == nil {
+		t.Fatal("a dangling symlink at the key path was accepted; it must be refused")
+	}
+	if !contains(err.Error(), "symbolic link") {
+		t.Errorf("the error should name the cause, got: %v", err)
 	}
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Fatal("a private key was written through the symlink to the attacker's path")
+	}
+}
+
+// The create branch's own guard. O_EXCL is not about symlinks -- those are
+// already gone by here -- it is about two agents starting at once, both seeing
+// ENOENT, and the second overwriting the key the first has already published.
+// The loser must fail loudly rather than quietly win.
+func TestWriteNewKeyNeverOverwrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, keyFileName)
+	existing := []byte("a key that is already here")
+	if err := os.WriteFile(path, existing, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := writeNewKey(path, make([]byte, 32)); err == nil {
+		t.Fatal("writeNewKey overwrote an existing key file")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(existing) {
+		t.Error("the existing key was modified")
+	}
+
+	// And it does create when there is genuinely nothing there, at 0600.
+	fresh := filepath.Join(dir, "fresh.key")
+	if err := writeNewKey(fresh, make([]byte, 32)); err != nil {
+		t.Fatalf("writeNewKey on a free path: %v", err)
+	}
+	st, err := os.Stat(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm != 0o600 {
+		t.Errorf("new key created %04o, want 0600", perm)
 	}
 }
 
