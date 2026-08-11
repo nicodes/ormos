@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build (linux && !android) || (darwin && !ios)
 
 // Command ormos runs the system on a personal machine.
 package main

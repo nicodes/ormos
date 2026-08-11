@@ -106,22 +106,26 @@ jobs:
           # This is the one thing here that is proven by compiling.
           GOOS=windows go build ./relay/...
 
-          # Off the supported platforms, the only package left standing must be
-          # relay. Asserted per GOOS with `go list`, which reports what is
-          # SELECTED -- the BSDs are named because `unix` would have included
-          # all of them, and the tag was a broader claim than the decision until
-          # it was narrowed.
+          # Each target names its arch explicitly: several of these have no
+          # valid default, and `GOOS=x ${var} go list` does not work — bash
+          # recognises assignment prefixes before expansion, so the expanded
+          # word is run as a command. env takes them as arguments instead.
           #
-          # `go build` cannot do this job. It fails on the excluded main package
-          # before internal/system is even considered, so it only ever exercises
-          # main.go's tag: widening every file in internal/system back to `unix`
-          # while main.go stayed correct passed a build-based check, and so did
-          # adding a new internal/system file tagged `unix`. Selection catches
-          # both.
-          for goos in windows freebsd openbsd netbsd solaris dragonfly; do
-            got="$(GOOS="$goos" go list ./... 2>/dev/null || true)"
+          # android and ios are on this list because they are the two a plain
+          # `linux || darwin` tag SILENTLY INCLUDES: Go sets the linux tag on
+          # android and the darwin tag on ios, so the agent selected and built
+          # there — on kernels with a different security model, different PTY
+          # behaviour, and no CI at all. The tags say `(linux && !android) ||
+          # (darwin && !ios)` for that reason, and this is what holds them to it.
+          for target in \
+            windows/amd64 freebsd/amd64 openbsd/amd64 netbsd/amd64 \
+            solaris/amd64 dragonfly/amd64 illumos/amd64 aix/ppc64 \
+            plan9/amd64 js/wasm wasip1/wasm android/arm64 ios/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            got="$(env GOOS="$goos" GOARCH="$goarch" go list ./... 2>/dev/null || true)"
             if [ "$got" != "github.com/nicodes/ormos/relay" ]; then
-              echo "::error::GOOS=$goos selects more than relay -- something in the agent is buildable on a platform nothing tests:"
+              echo "::error::$target selects more than relay -- something in the agent is buildable on a platform nothing tests:"
               echo "$got"
               exit 1
             fi
@@ -131,7 +135,7 @@ jobs:
           # excluding everything.
           GOOS=linux go build ./...
           GOOS=darwin go build ./...
-          echo "linux and darwin build; windows and the BSDs are excluded; relay stays portable"
+          echo "linux and darwin build; every other platform selects relay alone"
 
   # macOS is half of what ormos claims to support, and until this job existed
   # nothing verified it. The Build step above cross-compiles for darwin, but

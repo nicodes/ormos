@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build (linux && !android) || (darwin && !ios)
 
 // Package system is ormos on a personal machine: it opens a single outbound
 // WebSocket to the relay and serves terminal and port-proxy streams multiplexed
@@ -7,8 +7,9 @@
 //
 // # Supported platforms
 //
-// Linux and macOS. Every file in this package carries //go:build linux ||
-// darwin, and that is the whole statement.
+// Linux and macOS. Every file in this package carries
+// //go:build (linux && !android) || (darwin && !ios), and that is the whole
+// statement.
 //
 // The agent's job is to act on the machine it runs on: allocate a PTY, poll its
 // master descriptor, read a terminal's foreground process group, deliver SIGHUP
@@ -24,9 +25,16 @@
 // nobody exercised. A build tag is a claim about where this is known to work,
 // so it must not be wider than the set CI actually runs.
 //
+// The !android and !ios halves are not pedantry: Go sets the linux tag on
+// android and the darwin tag on ios, so a plain `linux || darwin` silently
+// included both, and the whole agent selected and built for them. Android is
+// Linux — /proc/net/tcp parsing, PTY allocation and process-group signalling
+// all compile there, on a security model nothing here has considered.
+//
 // CI holds up both halves: a macos-latest job runs the suite, and a step in
-// ci.yml asserts that the agent does not build for Windows or the BSDs and that
-// nothing but relay is even selected there. Without that step the claim would
+// ci.yml asserts that on every other platform Go knows about — Windows, the
+// BSDs, Solaris, illumos, AIX, plan9, wasm, android and ios — nothing but relay
+// is even selected. Without that step the claim would
 // be unenforceable — `go build ./...` SKIPS packages with no buildable files,
 // so a file that lost its tag would go unnoticed by every build in the pipeline.
 //

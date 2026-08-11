@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build (linux && !android) || (darwin && !ios)
 
 package system
 
@@ -569,7 +569,24 @@ func TestTerminalCloseKillsProcessGroup(t *testing.T) {
 	// Process.Kill, both stayed green. What is under test is the agent reaching
 	// the whole GROUP, so the only thing left that can kill this child is the
 	// explicit unix.Kill(-pgid, ...).
-	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; exec sleep 600' & echo $! > %s; wait")
+	//
+	// The CHILD writes the pidfile, after installing the trap. Writing it from
+	// the parent (`... & echo $! > %s`) publishes the pid at fork time, so the
+	// test could close the PTY while the inner shell had not yet reached the
+	// trap -- and then the kernel's hangup killed it at its default
+	// disposition, which is the vacuity this is supposed to have removed. It
+	// held only by winning a race; a 50ms sleep before the trap made the test
+	// pass again with the group kill gutted. $$ inside sh -c is that shell's
+	// own pid and survives the exec, and an ignored disposition survives exec
+	// by POSIX, so the pidfile existing now proves the trap is installed.
+	//
+	// Note what the pair of close tests can and cannot separate: a process in
+	// the tty's foreground group cannot tell the kernel's hangup from the
+	// agent's SIGHUP, so trapping HUP is the only lever available and what both
+	// tests actually pin is that the ESCALATION reaches the group. Replacing
+	// the SIGHUP with a single-process kill leaves both green; replacing the
+	// group SIGKILL does not.
+	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; echo $$ > %s; exec sleep 600' & wait")
 	s.close()
 	processGone(t, s.cmd.Process.Pid)
 	processGone(t, child)
@@ -582,7 +599,9 @@ func TestTerminalCloseEscalatesToSIGKILL(t *testing.T) {
 	terminalKillGrace = 200 * time.Millisecond
 	t.Cleanup(func() { terminalKillGrace = prev })
 
-	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; exec sleep 600' & echo $! > %s; wait")
+	// The child publishes its own pid after the trap; see the note in
+	// TestTerminalCloseKillsProcessGroup for why the parent must not.
+	s, child := startGroupSession(t, "sh -c 'trap \"\" HUP; echo $$ > %s; exec sleep 600' & wait")
 	start := time.Now()
 	s.close()
 	if elapsed := time.Since(start); elapsed > 5*time.Second {

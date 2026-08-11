@@ -1,4 +1,4 @@
-//go:build linux || darwin
+//go:build (linux && !android) || (darwin && !ios)
 
 package system
 
@@ -284,7 +284,10 @@ func resolveExisting(path string) string {
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
-			return path // nothing on the path exists; there is nothing to resolve
+			// Loop guard rather than a reachable state: callers pass an absolute
+			// path, filepath.Dir bottoms out at "/", and EvalSymlinks("/") cannot
+			// fail — so the climb always terminates on a successful resolve above.
+			return path
 		}
 		remainder = filepath.Join(filepath.Base(current), remainder)
 		current = parent
