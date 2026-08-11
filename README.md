@@ -66,9 +66,11 @@ State lives under `~/.config/ormos/`:
 directory, which is useful for keeping development and production pairings
 separate.
 
-`sessions.log` is append-only but not unbounded: past 4 MiB it is renamed to
+`sessions.log` is append-only but not unbounded: at 4 MiB it is renamed to
 `sessions.log.1`, replacing any previous generation, and a fresh log starts. Two
-files of recent history, never more.
+files of recent history, never more. The roll is taken under a file lock, so two
+agents sharing one state directory cannot roll each other's history away, and
+the mode of both files is corrected on the same read that finds it loosened.
 
 Whenever the agent reads `config.json` or `identity.key` it re-checks what it
 finds there, so a copy restored from a backup or loosened by a stray `chmod`

@@ -7,7 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // The agent does whatever the relay asks: open a stream marked "terminal" and it
@@ -29,7 +32,10 @@ const policyFileName = "policy.json"
 const auditFileName = "sessions.log"
 
 const (
-	// maxAuditBytes is how large the audit log may grow before it is rolled.
+	// maxAuditBytes is the size at which the audit log is rolled: it is checked
+	// when the file is opened, and the entry that finds the file over it is
+	// written to the FRESH log, so the live file's real ceiling is this plus
+	// one entry and the pair's is twice that.
 	//
 	// This is the one file the agent writes on every single action — every
 	// terminal attach and reattach, every proxy session, every port listing,
@@ -39,7 +45,8 @@ const (
 	//
 	// A few MiB is tens of thousands of entries: far more history than anyone
 	// reads, and small enough that two generations of it are never worth
-	// mentioning.
+	// mentioning. maxAuditDetail is what keeps that true when the relay is the
+	// one choosing how long an entry is.
 	maxAuditBytes = 4 << 20
 	// auditRollSuffix names the single generation of history kept across a
 	// roll. One generation, not a numbered series: the log is evidence for the
@@ -47,6 +54,13 @@ const (
 	// accumulates files is the unbounded growth this bound exists to stop,
 	// spread over more inodes.
 	auditRollSuffix = ".1"
+	// maxAuditDetail caps the relay-supplied text in one entry. Detail carries
+	// the directory the relay asked for when a request was refused, and a
+	// StreamHeader may be up to relay.MaxHeaderSize — so without this a single
+	// junk request costs tens of kilobytes of log, and a hundred of them roll
+	// away everything that came before. It is what keeps "a few MiB is tens of
+	// thousands of entries" true when the relay is the one writing them.
+	maxAuditDetail = 256
 )
 
 // policy is what this machine will agree to, independent of what the relay
@@ -231,6 +245,18 @@ type auditor struct {
 	mu   sync.Mutex
 	path string
 	off  bool // disabled after a write failure, so we don't log on every stream
+	// max is the roll threshold, a field only so tests can set a small one:
+	// exercising the roll at the real 4 MiB means writing 4 MiB per case.
+	// Zero means maxAuditBytes.
+	max int64
+}
+
+// bound returns the roll threshold in effect.
+func (a *auditor) bound() int64 {
+	if a.max > 0 {
+		return a.max
+	}
+	return maxAuditBytes
 }
 
 func newAuditor() *auditor {
@@ -249,9 +275,15 @@ type auditEntry struct {
 	Allowed bool   `json:"allowed"`
 }
 
-// record appends one entry. Failures disable the auditor rather than interrupt
-// the session — a machine that cannot write its log should still work — but the
-// caller's own log line still reports the action.
+// record appends one entry. A write that fails disables the auditor rather than
+// interrupting the session — a machine that cannot write its log should still
+// work — but the caller's own log line still reports the action.
+//
+// An OPEN that fails does not latch anything off. Latching was meant for a file
+// that cannot be written at all, and applying it to the open turned a transient
+// EMFILE or a momentarily full disk into auditing silently disabled for the
+// life of the process. Nothing is printed on the failure path, so retrying next
+// time costs one cheap failed syscall per action.
 func (a *auditor) record(e auditEntry) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -259,17 +291,24 @@ func (a *auditor) record(e auditEntry) {
 		return
 	}
 	e.Time = time.Now().UTC().Format(time.RFC3339)
+	// The relay chooses part of what lands here — Detail carries the cwd it
+	// asked for when that request was refused, and a StreamHeader may be up to
+	// relay.MaxHeaderSize. Untruncated, a compromised relay could roll the log
+	// twice with a hundred or so junk requests and erase every trace of what it
+	// did before that. Bounding the log is what makes it lossy, so the cap on
+	// what one entry may cost belongs here with it.
+	if len(e.Detail) > maxAuditDetail {
+		e.Detail = e.Detail[:maxAuditDetail] + "…"
+	}
 	line, err := json.Marshal(e)
 	if err != nil {
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(a.path), 0o700); err != nil {
-		a.off = true
 		return
 	}
 	f, err := a.open()
 	if err != nil {
-		a.off = true
 		return
 	}
 	defer f.Close()
@@ -279,36 +318,104 @@ func (a *auditor) record(e auditEntry) {
 }
 
 // open returns the audit file ready to append to, rolling it first when it has
-// grown past maxAuditBytes.
+// grown past the bound.
 //
 // The roll is a rename, so the entry that triggered it is written to the fresh
 // file afterwards and nothing is lost at the seam. The previous generation is
 // replaced rather than kept alongside: os.Rename over an existing path is
-// atomic, so there is never a moment with no history at all, and it preserves
-// the file's 0600 mode.
+// atomic, so there is never a moment with no history at all.
 //
-// Everything here fails open, towards writing the entry. A log that is a little
-// over its bound is a much smaller problem than an action the relay took with
-// no local record of it, so a stat that fails or a rename that is refused
-// (a read-only directory, a permissions change) falls through to appending.
+// The whole check-and-roll is done holding an exclusive flock on the descriptor,
+// and this is the part that has to be right. a.mu serializes nothing between
+// PROCESSES, and two agents sharing one state directory is reachable — --config
+// makes it explicit, and nothing stops a second agent on the default path
+// either. Without the lock: A stats a full log, renames it to sessions.log.1
+// and starts a fresh one; B, which statted the same inode before A's rename,
+// then renames A's FRESH log over sessions.log.1, unlinking the real history.
+// The result is no history at all and a one-line "previous generation". flock
+// is advisory, but both parties here are this same code.
+//
+// After taking the lock the descriptor is checked against the path: another
+// process may have rolled the file while we waited, in which case this
+// descriptor points at the rolled-away inode and the entry would be appended to
+// the history file rather than the live one. Reopen and try again.
+//
+// Everything else fails towards writing the entry. A log a little over its
+// bound is a much smaller problem than an action the relay took with no local
+// record of it, so a stat that fails, a lock that cannot be taken, or a rename
+// that is refused (a read-only directory, a permissions change) all fall
+// through to appending.
 func (a *auditor) open() (*os.File, error) {
-	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	// Bounded, because every iteration either returns or has just rolled the
+	// file, and a path that keeps changing under us is not worth spinning on.
+	for range 3 {
+		f, err := a.openLocked()
+		if err != nil {
+			return nil, err
+		}
+		st, err := f.Stat()
+		if err != nil || st.Size() < a.bound() {
+			return f, nil
+		}
+		// Roll, still holding the lock. Closing releases it, and the next
+		// iteration reopens the now-fresh path and writes the entry there.
+		_ = os.Rename(a.path, a.path+auditRollSuffix)
+		f.Close()
+	}
+	return a.openLocked()
+}
+
+// openLocked opens the audit file for appending, takes an exclusive lock on it,
+// and confirms the descriptor is still the file at the path.
+//
+// O_NOFOLLOW and the regular-file check for the same reason the key file has
+// them: a symlink planted at sessions.log would otherwise have its TARGET's
+// size decide the roll — point it at anything large and the first entry rolls
+// the log — and the rename would then move the planted link into
+// sessions.log.1, laundering it into what the README calls a kept generation of
+// history. The mode is tightened on the same open, because this file is a
+// record of what a possibly-compromised relay asked this machine to do and no
+// other local user has any business reading it.
+func (a *auditor) openLocked() (*os.File, error) {
+	for range 4 {
+		f, err := a.openLockedOnce()
+		if f != nil || err != nil {
+			return f, err
+		}
+	}
+	// Four opens in a row and the path changed under every one of them. That is
+	// not a state to keep retrying in, and an error here drops one entry rather
+	// than returning a nil file the caller would dereference.
+	return nil, fmt.Errorf("%s is being replaced faster than it can be opened", a.path)
+}
+
+// openLockedOnce returns (nil, nil) when the file was rolled out from under it
+// and the caller should try again.
+func (a *auditor) openLockedOnce() (*os.File, error) {
+	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	// Stat through the descriptor we are about to write to, so the size that
-	// decides the roll is this file's and not that of something swapped in at
-	// the path since.
 	st, err := f.Stat()
-	if err != nil || st.Size() < maxAuditBytes {
-		return f, nil
-	}
-	if err := f.Close(); err != nil {
+	if err != nil {
+		f.Close()
 		return nil, err
 	}
-	// A rename that is refused leaves the un-rolled file exactly where it was,
-	// so reopening it appends as before and the next record tries the bound
-	// again. Ignored deliberately: there is nothing better to do with it here.
-	_ = os.Rename(a.path, a.path+auditRollSuffix)
-	return os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if !st.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%s is not a regular file", a.path)
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		_ = f.Chmod(perm &^ 0o077)
+	}
+	// Advisory, and best-effort: a filesystem that cannot lock still gets its
+	// entry written, it just loses the cross-process guarantee.
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_EX)
+	// Did somebody roll the file while we were waiting for the lock? Then this
+	// descriptor is the rolled-away inode and the entry belongs elsewhere.
+	if onDisk, err := os.Stat(a.path); err != nil || !os.SameFile(onDisk, st) {
+		f.Close()
+		return nil, nil
+	}
+	return f, nil
 }
