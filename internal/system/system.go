@@ -127,7 +127,8 @@ func (d *system) notifyEvent() {
 func (d *system) Events() <-chan struct{} { return d.events }
 
 // EchoToStderr controls whether log lines are also printed to stderr (headless
-// mode). The TUI renders the ring buffer instead.
+// mode). The TUI renders the tail of the ring buffer instead, in its ACTIVITY
+// pane — see RecentLogs and the TUI's View.
 func (d *system) EchoToStderr(v bool) {
 	d.mu.Lock()
 	d.echoStderr = v
@@ -149,12 +150,17 @@ func (d *system) logf(format string, args ...any) {
 }
 
 // Status is a snapshot of system state for the TUI.
+//
+// It carries only what a render actually reads. It used to also copy the whole
+// log ring and the configured-port slice on every call — 500ms, forever — for
+// two fields nothing outside a test ever looked at. The log ring now has a real
+// consumer and is fetched by the tail through RecentLogs; the port slice does
+// not, because the TUI lists projects and ports from the relay's own reply
+// (model.projects) and needs Live only to mark which of them are up.
 type Status struct {
 	Connected bool
 	Sessions  int
 	RelayURL  string
-	Logs      []string
-	Ports     []PortStatus
 	Live      map[int]bool // host's currently-listening ports (for live highlighting)
 }
 
@@ -163,10 +169,6 @@ type Status struct {
 func (d *system) Snapshot() Status {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	logs := make([]string, len(d.logs))
-	copy(logs, d.logs)
-	ports := make([]PortStatus, len(d.ports))
-	copy(ports, d.ports)
 	live := make(map[int]bool, len(d.listening))
 	for _, p := range d.listening {
 		live[p] = true
@@ -175,10 +177,30 @@ func (d *system) Snapshot() Status {
 		Connected: d.connected,
 		Sessions:  d.sessions,
 		RelayURL:  d.cfg.RelayURL,
-		Logs:      logs,
-		Ports:     ports,
 		Live:      live,
 	}
+}
+
+// RecentLogs returns the last n log lines, oldest first.
+//
+// The tail rather than the whole ring: the TUI shows a fixed handful of lines
+// and copying the other ~190 twice a second bought nothing. In headless mode
+// the same lines go to stderr; in TUI mode this is the only way they are ever
+// seen, which is the point — before the ACTIVITY pane existed, "tunnel error:
+// ..." was written to a buffer nothing displayed and the dashboard just sat
+// there saying offline with no reason given.
+func (d *system) RecentLogs(n int) []string {
+	if n <= 0 {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if n > len(d.logs) {
+		n = len(d.logs)
+	}
+	tail := make([]string, n)
+	copy(tail, d.logs[len(d.logs)-n:])
+	return tail
 }
 
 func (d *system) setConnected(v bool) {

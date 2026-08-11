@@ -165,6 +165,7 @@ type model struct {
 	conf  *confirmPrompt
 
 	status      Status
+	logs        []string          // tail of the agent's log ring, for the ACTIVITY pane
 	info        *relay.SystemInfo // system's own name/etc. from the relay
 	machine     string            // "<distro> - <host> - <goos>/<goarch>"
 	fingerprint string            // sealing-key fingerprint for out-of-band verification
@@ -175,11 +176,27 @@ type model struct {
 	width, height int
 }
 
+// activityLines is how many log lines the ACTIVITY pane shows.
+//
+// Fixed rather than sized to the terminal so the dashboard does not reflow as
+// projects come and go, and small because these are the last few things that
+// happened, not a log viewer — the whole ring is the agent's, and `ormos` run
+// without a TTY prints every line to stderr.
+const activityLines = 6
+
 func newModel(d *system) model {
 	ti := textinput.New()
 	ti.Prompt = "› "
 	ti.CharLimit = 512
-	return model{d: d, status: d.Snapshot(), input: ti, live: map[int]bool{}, machine: machineName(), fingerprint: d.Fingerprint()}
+	return model{
+		d:           d,
+		status:      d.Snapshot(),
+		logs:        d.RecentLogs(activityLines),
+		input:       ti,
+		live:        map[int]bool{},
+		machine:     machineName(),
+		fingerprint: d.Fingerprint(),
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -238,6 +255,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.status = m.d.Snapshot()
+		m.logs = m.d.RecentLogs(activityLines)
 		m.live = m.status.Live
 		m.ticks++
 		// Fallback refresh (~10s) in case a pushed nudge was missed; the relay's
@@ -579,6 +597,15 @@ func (m model) View() string {
 	if s.Connected {
 		state = onStyle.Render("● connected")
 	}
+	// How many streams the relay currently has open against this machine. Every
+	// one of them is a shell or a connection to a local service, so "is anything
+	// happening on my machine right now" should be answerable from the header
+	// rather than by reading the activity pane.
+	if s.Sessions == 1 {
+		state += labelStyle.Render("  1 session")
+	} else if s.Sessions > 1 {
+		state += labelStyle.Render(fmt.Sprintf("  %d sessions", s.Sessions))
+	}
 
 	name := "ormos system"
 	if m.info != nil && m.info.Name != "" {
@@ -603,6 +630,10 @@ func (m model) View() string {
 	}
 	b.WriteString(nameCursor + labelStyle.Render("name     ") + nameVal + "\n")
 	b.WriteString("  " + labelStyle.Render("machine  ") + m.machine + "\n")
+	// Which relay this agent is talking to. ORMOS_API_URL and the saved config
+	// can each set it, so "connected to what" is worth stating outright rather
+	// than leaving to be inferred from a connect line in the activity pane.
+	b.WriteString("  " + labelStyle.Render("relay    ") + s.RelayURL + "\n")
 	// The sealing-key fingerprint, for out-of-band verification against the app:
 	// if the two do not match, a relay has swapped the key.
 	b.WriteString("  " + labelStyle.Render("sealing  ") + m.fingerprint + hintStyle.Render("  verify in app") + "\n\n")
@@ -656,6 +687,21 @@ func (m model) View() string {
 			}
 			b.WriteString(cursor + label + "\n")
 		}
+	}
+
+	// ACTIVITY: the tail of the agent's log ring. Headless mode echoes every
+	// line to stderr; the dashboard owns the whole screen, so without this pane
+	// a tunnel that will not connect shows as "offline" and nothing else — the
+	// reason is written to a ring the operator has no way to look at.
+	b.WriteString("\n" + sectionStyle.Render("ACTIVITY") + "\n")
+	if len(m.logs) == 0 {
+		b.WriteString(hintStyle.Render("  nothing yet") + "\n")
+	}
+	for _, line := range m.logs {
+		// Clipped, not wrapped: a long line (a relay URL, a dial error) would
+		// otherwise take several rows and push the pane's height around from
+		// one tick to the next.
+		b.WriteString("  " + hintStyle.Render(clip(line, m.width-2)) + "\n")
 	}
 	body := strings.TrimRight(b.String(), "\n")
 
@@ -720,6 +766,19 @@ func portSummary(p relay.ProjectInfo, live map[int]bool) string {
 		}
 	}
 	return fmt.Sprintf("%d ports · %d live", len(p.Ports), liveN)
+}
+
+// clip shortens s to at most w columns, marking the cut with an ellipsis. A
+// width of zero or less means the terminal size is not known yet (no
+// WindowSizeMsg has arrived), in which case nothing is clipped.
+func clip(s string, w int) string {
+	if w <= 0 || len(s) <= w {
+		return s
+	}
+	if w == 1 {
+		return s[:1]
+	}
+	return s[:w-1] + "…"
 }
 
 // pad right-pads (or truncates with an ellipsis) s to width w for column layout.
