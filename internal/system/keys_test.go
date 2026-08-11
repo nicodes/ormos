@@ -280,8 +280,8 @@ func TestStateDirectoryModeIsCorrectedOnRead(t *testing.T) {
 // Under --config the state directory is filepath.Dir of whatever was given,
 // which can be $HOME or any other directory the agent has no business
 // rewriting. `ormos --config ~/config.json` must not silently turn $HOME into
-// 0700 on every start. Refusing to READ private files out of a loose directory
-// stays unconditional; only the silent write is gated.
+// 0700 on every start. The read is never refused on the directory's mode;
+// only the correction is gated, so a loose --config directory stays as it is.
 func TestConfigOverrideDirectoryIsNotChmodded(t *testing.T) {
 	dir := withTempConfigDir(t)
 	newSystem(systemConfig{})

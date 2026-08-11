@@ -1,6 +1,7 @@
 package system
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -436,5 +437,53 @@ func TestSignOutWorksWithAnUnreadableConfig(t *testing.T) {
 	// The local pairing must be gone.
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Error("the config was left in place, so the machine is still paired locally")
+	}
+}
+
+// A config that exists but cannot be read is NOT the same as no config:
+// swallowing the read error minted a fresh client id and silently registered
+// a duplicate machine on the account instead of re-registering this one.
+func TestLoginRefusesAnUnreadableConfig(t *testing.T) {
+	dir := withTempConfigDir(t)
+	path := filepath.Join(dir, "config.json")
+	elsewhere := filepath.Join(t.TempDir(), "real.json")
+	if err := os.WriteFile(elsewhere, []byte(`{"pairingToken":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+
+	_, err := performLogin(context.Background(), "wss://relay.example.test")
+	if err == nil {
+		t.Fatal("login proceeded past an unreadable config; it would have minted a duplicate machine")
+	}
+	if !contains(err.Error(), "reading the saved config") {
+		t.Errorf("the error should name what failed, got: %v", err)
+	}
+}
+
+// The same remedy separation as the key path: a corrected directory must not
+// carry the remedy for a copied pairing token — on a first run there is no
+// token, and the operator would be told to re-pair a machine that was never
+// paired.
+func TestConfigDirectoryWarningCarriesNoTokenRemedy(t *testing.T) {
+	dir := withTempHome(t)
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	// No config on disk: the only correction possible is the directory's.
+	_, warning, err := loadConfigFileChecked()
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if !contains(warning, "reachable by other local users") {
+		t.Errorf("the directory warning is missing: %q", warning)
+	}
+	for _, forbidden := range []string{"pairing token", "sign out and pair again", "already have been copied"} {
+		if contains(warning, forbidden) {
+			t.Errorf("the directory warning carries a file remedy (%q): %q", forbidden, warning)
+		}
 	}
 }

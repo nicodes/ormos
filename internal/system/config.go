@@ -273,9 +273,9 @@ var fileOwner = func(fi os.FileInfo) (int, bool) {
 // filepath.Dir of whatever path was given, which can be $HOME or any other
 // directory the agent has no business rewriting the mode of: `ormos --config
 // ~/config.json` would silently turn $HOME into 0700 on every start, breaking
-// ~/public_html and anything else that depends on being reachable. Refusing to
-// READ private files out of a loose directory stays unconditional; it is only
-// the silent write to someone else's directory that is gated.
+// ~/public_html and anything else that depends on being reachable. The read is
+// never refused on the directory's mode; only the correction is gated, so
+// under --config a loose directory is left exactly as it is.
 //
 // Best-effort and silent about the ordinary case: it returns a warning only
 // when it had to change something.
@@ -373,8 +373,8 @@ func clearLoginConfig() error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		// The config cannot be read — it is a symlink, a fifo, or owned by
-		// somebody else. Signing out must still work: this is exactly the state
+		// The config cannot be read — it is a symlink, a fifo, owned by
+		// somebody else, or too corrupt to parse. Signing out must still work: this is exactly the state
 		// the README tells the user to fix, and the file being refused is the
 		// one holding the token they are trying to revoke. Removing it revokes
 		// the token locally, which is what sign-out is for. The client id is
