@@ -35,7 +35,16 @@ func performLogin(ctx context.Context, relayWS string) (systemConfig, error) {
 
 	// Reuse this config's stable client id, or mint one on first login. Two
 	// systems on one host use two config files, hence two ids.
-	existing, _ := loadConfigFile()
+	//
+	// A config that exists but cannot be read is NOT the same as no config. It
+	// used to be swallowed here, which meant a symlinked or foreign-owned
+	// config.json silently minted a fresh client id and registered a DUPLICATE
+	// machine on the account instead of re-registering this one. Only "there is
+	// no config" may mint an id.
+	existing, cfgErr := loadConfigFile()
+	if cfgErr != nil && !os.IsNotExist(cfgErr) {
+		return systemConfig{}, fmt.Errorf("reading the saved config before pairing: %w", cfgErr)
+	}
 	clientID := existing.ClientID
 	if clientID == "" {
 		clientID = generateClientID()

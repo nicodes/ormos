@@ -1,11 +1,14 @@
 package system
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // useTempConfig points the whole local state at a temp dir for one test. It
@@ -252,5 +255,235 @@ func TestCheckRelayTransport(t *testing.T) {
 	t.Setenv("ORMOS_INSECURE", "1")
 	if err := checkRelayTransport("ws://relay.example.com"); err != nil {
 		t.Fatalf("ORMOS_INSECURE=1 must allow a cleartext remote relay: %v", err)
+	}
+}
+
+// config.json holds the pairing token — a bearer credential for the relay — so
+// it gets the same treatment identity.key does. Nothing covered this: the whole
+// self-heal could be reverted to a plain os.ReadFile and the suite stayed green.
+func TestLoosenedConfigModeIsCorrectedOnRead(t *testing.T) {
+	dir := withTempConfigDir(t)
+	if err := saveConfigFile(systemConfig{RelayURL: "wss://relay.example", PairingToken: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, warning, err := loadConfigFileChecked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PairingToken != "t" {
+		t.Errorf("the config did not survive the correction: %+v", cfg)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := st.Mode().Perm(); perm&0o077 != 0 {
+		t.Errorf("config.json left at %04o; the pairing token is still readable by other local users", perm)
+	}
+	// Tightening the mode does not un-leak a bearer token, so the operator has
+	// to be told the remedy rather than have it fixed silently.
+	if !contains(warning, "sign out and pair again") {
+		t.Errorf("the correction was not reported with its remedy: %q", warning)
+	}
+}
+
+// A symlink at config.json must not be followed: it would redirect the read and
+// the mode correction onto a file of someone else's choosing.
+func TestConfigSymlinkIsRefused(t *testing.T) {
+	dir := withTempConfigDir(t)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := filepath.Join(t.TempDir(), "planted.json")
+	if err := os.WriteFile(elsewhere, []byte(`{"relayUrl":"wss://evil.example.test"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(dir, "config.json")); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+
+	if _, err := loadConfigFile(); err == nil {
+		t.Fatal("a symlink at config.json was followed")
+	}
+}
+
+// A directory (or any non-regular file) at config.json is refused rather than
+// chmod'd and reported as a loosened config.
+func TestConfigPathMustBeARegularFile(t *testing.T) {
+	dir := withTempConfigDir(t)
+	if err := os.MkdirAll(filepath.Join(dir, "config.json"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := loadConfigFile()
+	if err == nil {
+		t.Fatal("a directory at config.json was accepted")
+	}
+	if !contains(err.Error(), "regular file") {
+		t.Errorf("the error should say what is wrong, got: %v", err)
+	}
+}
+
+// The one check here that fails CLOSED. A file owned by someone else is a
+// planted file: for identity.key, adopting one publishes the planter's public
+// half and seals every terminal to a key they hold. Creating a file owned by
+// another uid needs a second uid, which CI does not have — so fileOwner is a
+// var, and this forces the mismatch.
+func TestForeignOwnedPrivateFileIsRefused(t *testing.T) {
+	dir := withTempConfigDir(t)
+	newSystem(systemConfig{}) // creates identity.key owned by us
+
+	real := fileOwner
+	t.Cleanup(func() { fileOwner = real })
+	fileOwner = func(os.FileInfo) (int, bool) { return os.Getuid() + 1, true }
+
+	_, _, err := loadOrCreateKey()
+	if err == nil {
+		t.Fatal("a key file owned by another user was adopted")
+	}
+	for _, want := range []string{"owned by uid", "refusing to use it"} {
+		if !contains(err.Error(), want) {
+			t.Errorf("the error should say why, got: %v", err)
+		}
+	}
+	// And it must not have been rewritten or removed on the way out.
+	if _, err := os.Stat(filepath.Join(dir, keyFileName)); err != nil {
+		t.Errorf("the refused key file was disturbed: %v", err)
+	}
+}
+
+// O_NOFOLLOW does not save us from a FIFO: opening a named pipe for reading
+// BLOCKS until a writer appears, and the regular-file refusal cannot run until
+// the open returns. Without O_NONBLOCK the agent wedges at startup with nothing
+// printed — a hang, not an error, which is the worst shape a failure can take.
+// The timeout is what makes this a real test: it fails by not finishing.
+func TestFifoAtAPrivatePathDoesNotHang(t *testing.T) {
+	dir := withTempConfigDir(t)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.json")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("cannot create a fifo here: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := loadConfigFile()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a fifo at config.json was accepted")
+		}
+		if !contains(err.Error(), "regular file") {
+			t.Errorf("the error should say what is wrong, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("loadConfigFile blocked on a fifo; startup would hang with nothing printed")
+	}
+}
+
+// The remedy belongs to the file, not to the directory around it. Welding them
+// together told the operator, on a first run with no key on disk at all, to
+// "delete it to generate a new one and re-pair this machine" — about a key that
+// had never existed and a machine that had never been paired.
+func TestDirectoryWarningCarriesNoFileRemedy(t *testing.T) {
+	dir := withTempHome(t)
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	// No key on disk: the only correction possible is the directory's.
+	_, warnings, err := loadOrCreateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("want exactly the directory warning, got %q", warnings)
+	}
+	if !contains(warnings[0], "reachable by other local users") {
+		t.Errorf("the directory warning is missing: %q", warnings[0])
+	}
+	for _, forbidden := range []string{"delete it", "re-pair", "already have been copied"} {
+		if contains(warnings[0], forbidden) {
+			t.Errorf("the directory warning carries a file remedy (%q): %q", forbidden, warnings[0])
+		}
+	}
+}
+
+// Signing out must work in exactly the state the README tells the user to fix.
+// The file being refused is the one holding the token they are trying to
+// revoke, so refusing to read it must not mean refusing to revoke it.
+func TestSignOutWorksWithAnUnreadableConfig(t *testing.T) {
+	dir := withTempConfigDir(t)
+	path := filepath.Join(dir, "config.json")
+	elsewhere := filepath.Join(t.TempDir(), "real.json")
+	if err := os.WriteFile(elsewhere, []byte(`{"pairingToken":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+
+	if err := clearLoginConfig(); err != nil {
+		t.Fatalf("sign-out refused with an unreadable config: %v", err)
+	}
+	// The local pairing must be gone.
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Error("the config was left in place, so the machine is still paired locally")
+	}
+}
+
+// A config that exists but cannot be read is NOT the same as no config:
+// swallowing the read error minted a fresh client id and silently registered
+// a duplicate machine on the account instead of re-registering this one.
+func TestLoginRefusesAnUnreadableConfig(t *testing.T) {
+	dir := withTempConfigDir(t)
+	path := filepath.Join(dir, "config.json")
+	elsewhere := filepath.Join(t.TempDir(), "real.json")
+	if err := os.WriteFile(elsewhere, []byte(`{"pairingToken":"secret"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, path); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+
+	_, err := performLogin(context.Background(), "wss://relay.example.test")
+	if err == nil {
+		t.Fatal("login proceeded past an unreadable config; it would have minted a duplicate machine")
+	}
+	if !contains(err.Error(), "reading the saved config") {
+		t.Errorf("the error should name what failed, got: %v", err)
+	}
+}
+
+// The same remedy separation as the key path: a corrected directory must not
+// carry the remedy for a copied pairing token — on a first run there is no
+// token, and the operator would be told to re-pair a machine that was never
+// paired.
+func TestConfigDirectoryWarningCarriesNoTokenRemedy(t *testing.T) {
+	dir := withTempHome(t)
+	if err := os.Chmod(dir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	// No config on disk: the only correction possible is the directory's.
+	_, warning, err := loadConfigFileChecked()
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if !contains(warning, "reachable by other local users") {
+		t.Errorf("the directory warning is missing: %q", warning)
+	}
+	for _, forbidden := range []string{"pairing token", "sign out and pair again", "already have been copied"} {
+		if contains(warning, forbidden) {
+			t.Errorf("the directory warning carries a file remedy (%q): %q", forbidden, warning)
+		}
 	}
 }

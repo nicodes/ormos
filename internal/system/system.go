@@ -94,7 +94,18 @@ func newSystem(cfg systemConfig) *system {
 	// written and never called, so d.key was nil and every connect dereferenced
 	// it. Both users of the key would have failed: publishing the public half on
 	// the handshake, and deriving session keys in terminal_sessions.go.
-	k, err := loadOrCreateKey()
+	k, warnings, err := loadOrCreateKey()
+	// Warnings first, and even on the error path: "the key was world-readable"
+	// is the most important thing that happened here, and it must not be lost
+	// because the read then failed for some other reason.
+	for _, w := range warnings {
+		// Both destinations, deliberately. The ring is what the dashboard
+		// renders, and in TUI mode the alt screen wipes stderr a moment after
+		// this runs; stderr is what a headless start shows, and EchoToStderr is
+		// not switched on until runSystem, after this function returns.
+		d.logf("warning: %s", w)
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: reading terminal key: %v\n", err)
 		os.Exit(1)
