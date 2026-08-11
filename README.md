@@ -65,11 +65,25 @@ State lives under `~/.config/ormos/`:
 directory, which is useful for keeping development and production pairings
 separate.
 
-`config.json` and `identity.key` are re-tightened to `0600` whenever the agent
-reads them, so a copy restored from a backup or loosened by a stray `chmod` does
-not stay readable by other local users. That matters most for `identity.key`:
-the terminal seal has no forward secrecy, so whoever reads it can decrypt
-captured traffic from past sessions, not only future ones.
+Whenever the agent reads `config.json` or `identity.key` it re-checks what it
+finds there, so a copy restored from a backup or loosened by a stray `chmod`
+does not quietly stay readable by other local users:
+
+- group and other permission bits are cleared from the file, and from
+  `~/.config/ormos` itself — a writable state directory would let another local
+  user replace these files rather than read them;
+- a symbolic link at either path is refused rather than followed, and a new
+  `identity.key` is created with `O_EXCL` so it can never be written through
+  one;
+- a file owned by another user is refused outright. Adopting a planted
+  `identity.key` would publish the planter's public key as this machine's and
+  seal every terminal to a key they hold.
+
+Owner bits are left as they are, so a key deliberately made `0400` stays `0400`.
+A correction to `identity.key` is reported on startup and in the dashboard,
+because tightening the mode does not undo the exposure: the terminal seal has no
+forward secrecy, so whoever read the file can decrypt captured traffic from past
+sessions, not only future ones. Regenerating the key is the only real remedy.
 
 An optional policy can limit what the relay may ask this machine to do:
 

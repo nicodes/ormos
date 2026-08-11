@@ -4,12 +4,15 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // systemConfig holds configuration for the cli system. It is public-safe (no
@@ -89,7 +92,16 @@ func loadConfigFile() (systemConfig, error) {
 	if err != nil {
 		return cfg, err
 	}
-	data, err := os.ReadFile(path)
+	// Through openPrivateFile so a config.json loosened out of band is tightened
+	// on the read, not only the next time something happens to save it. It holds
+	// the pairing token, and saves are rare: a login, a logout, and nothing else
+	// for the life of the install.
+	f, _, err := openPrivateFile(path)
+	if err != nil {
+		return cfg, err
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxConfigFileSize))
 	if err != nil {
 		return cfg, err
 	}
@@ -123,6 +135,119 @@ func saveConfigFile(cfg systemConfig) error {
 		return err
 	}
 	return atomicWriteFile(path, data, 0o600)
+}
+
+// maxConfigFileSize bounds the read of config.json. The real file is a few
+// hundred bytes; this only has to be finite, so a config replaced by something
+// enormous is a failed parse rather than an out-of-memory at startup.
+const maxConfigFileSize = 1 << 20
+
+// openPrivateFile opens one of the agent's private files for reading: the
+// config holding the pairing token, or the terminal sealing key.
+//
+// Both are written 0600 into a 0700 directory. But a mode set at creation is a
+// mode nobody looks at again, and a file restored from a backup, copied by hand
+// or caught by a stray chmod stays readable by every local user for the life of
+// the install, silently. atomicWriteFile corrects that on every write and says
+// so; this is the same invariant applied on every read, which for identity.key
+// is the only one it ever gets — that file is written once and read forever.
+//
+// Three checks, in the order in which their failures matter.
+//
+// O_NOFOLLOW, because a plain open follows symlinks. Without it a link planted
+// at the path redirects both the read and the chmod below onto a file of
+// someone else's choosing — the read adopts its contents, and the chmod is
+// applied to a file that was never ours. atomicWriteFile is symlink-safe by
+// construction (a fresh O_EXCL temp, renamed over the path); an open is not, so
+// it has to say so itself.
+//
+// Ownership, because a file this user does not own is not this machine's file.
+// For identity.key that is decisive rather than tidy: adopting a planted key
+// publishes the planter's public half on the system's record, and every
+// terminal is then sealed to a key they hold. This fails closed. It is the one
+// condition here that is better answered by refusing to start than by warning
+// and carrying on.
+//
+// Mode, last, because it is the recoverable one. Group and other bits are
+// cleared through the open descriptor, so a path swapped between the stat and
+// the fix cannot redirect it. Only those bits: forcing 0600 would grant write
+// access to a file the owner had deliberately made read-only, which is a
+// loosening dressed up as a fix.
+//
+// A correction is returned as a warning string rather than printed, because the
+// right place to put it depends on the caller — stderr is wiped by the TUI's
+// alt screen a moment later, so the agent puts it in the log ring as well.
+func openPrivateFile(path string) (*os.File, string, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, "", fmt.Errorf("%s is a symbolic link; refusing to follow it (move the real file into place)", path)
+		}
+		return nil, "", err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, "", err
+	}
+	if !st.Mode().IsRegular() {
+		f.Close()
+		return nil, "", fmt.Errorf("%s is not a regular file", path)
+	}
+	if owner, ok := fileOwner(st); ok && owner != os.Getuid() {
+		f.Close()
+		return nil, "", fmt.Errorf("%s is owned by uid %d, not by this user (uid %d); refusing to use it", path, owner, os.Getuid())
+	}
+	perm := st.Mode().Perm()
+	if perm&0o077 == 0 {
+		return f, "", nil
+	}
+	want := perm &^ 0o077
+	if err := f.Chmod(want); err != nil {
+		return f, fmt.Sprintf("%s is mode %04o, readable by other local users, and its mode could not be corrected: %v", path, perm, err), nil
+	}
+	return f, fmt.Sprintf("%s was mode %04o, readable by other local users; corrected to %04o", path, perm, want), nil
+}
+
+// fileOwner returns the uid owning fi, and whether it could be determined.
+func fileOwner(fi os.FileInfo) (int, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
+}
+
+// hardenOrmosDir clears group and other bits from the state directory, for the
+// same reason openPrivateFile does it to the files inside.
+//
+// MkdirAll sets 0700 at creation and is a no-op on a directory that already
+// exists, whatever its mode — so this was the hole underneath the file checks.
+// A group- or world-WRITABLE ~/.config/ormos defeats them entirely: an attacker
+// who cannot read a 0600 identity.key can still unlink it and put their own
+// there, which is the planted-key case openPrivateFile refuses, handed to them
+// with the right owner on it.
+//
+// Best-effort and silent about the ordinary case: it returns a warning only
+// when it had to change something.
+func hardenOrmosDir() string {
+	dir, err := ormosDir()
+	if err != nil {
+		return ""
+	}
+	st, err := os.Stat(dir)
+	if err != nil || !st.IsDir() {
+		return ""
+	}
+	perm := st.Mode().Perm()
+	if perm&0o077 == 0 {
+		return ""
+	}
+	want := perm &^ 0o077
+	if err := os.Chmod(dir, want); err != nil {
+		return fmt.Sprintf("%s is mode %04o, reachable by other local users, and its mode could not be corrected: %v", dir, perm, err)
+	}
+	return fmt.Sprintf("%s was mode %04o, reachable by other local users; corrected to %04o", dir, perm, want)
 }
 
 // atomicWriteFile writes data to path crash-atomically: it writes a fresh temp
