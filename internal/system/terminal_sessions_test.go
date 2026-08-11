@@ -1,4 +1,4 @@
-//go:build unix
+//go:build linux || darwin
 
 package system
 
@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -467,31 +468,47 @@ func TestTerminalReattachRechecksSessionCwd(t *testing.T) {
 	}
 }
 
-// processState reads a pid's state from /proc: "" if the process is gone,
-// "Z" if it is a zombie (dead, awaiting a reap that may never come under a
-// non-reaping init), anything else if it is alive.
-func processState(pid int) string {
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return ""
+// processDead reports whether pid is dead for the purposes of these tests:
+// either reaped, or a zombie (dead, awaiting a reap that may never come under a
+// non-reaping init).
+//
+// This used to read /proc/<pid>/stat, which does not exist on macOS — so every
+// read errored, "" was taken to mean "the process is gone", and the
+// process-group kill and SIGKILL-escalation tests asserted nothing whatsoever
+// on darwin while reporting green. That is a check that survives the deletion
+// of the thing it guards, and it would have shipped underneath a CI job added
+// specifically to cover those paths.
+//
+// signal 0 is the portable liveness test: it runs the existence and permission
+// checks and delivers nothing. ESRCH means gone; EPERM means the pid exists but
+// belongs to somebody else now, which after a pid recycle also means our
+// process is gone.
+func processDead(t *testing.T, pid int) bool {
+	t.Helper()
+	if err := unix.Kill(pid, 0); err != nil {
+		return true
 	}
-	// comm is parenthesised and may contain spaces; the state follows the
-	// final ')'.
-	return string(data[strings.LastIndexByte(string(data), ')')+2])
+	// Alive — or a zombie, which signal 0 still finds. ps is the one state
+	// query that answers the same way on both supported platforms. Wait4 would
+	// not do: the process these tests care about is a grandchild, not ours.
+	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return true // ps cannot find it either
+	}
+	return strings.HasPrefix(strings.TrimSpace(string(out)), "Z")
 }
 
 func processGone(t *testing.T, pid int) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		switch state := processState(pid); state {
-		case "", "Z":
+		if processDead(t, pid) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("pid %d still alive (%s) after terminal close", pid, processState(pid))
+			t.Fatalf("pid %d still alive after terminal close", pid)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(25 * time.Millisecond)
 	}
 }
 

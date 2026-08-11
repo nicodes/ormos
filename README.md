@@ -15,15 +15,24 @@ machine.
 Linux and macOS, on `amd64` and `arm64`. That is the whole list.
 
 There is no Windows build and none is planned. The agent's job is to act on the
-machine it runs on — allocate a PTY, read a terminal's foreground process group,
-signal a shell that will not exit — which it does through `golang.org/x/sys/unix`.
-Every file in `internal/system` carries `//go:build unix`, so `go build .` for
-Windows reports that the package does not exist there rather than failing on a
-list of missing syscalls. The shared [`relay`](./relay) package is untagged and
-stays portable.
+machine it runs on — allocate a PTY, poll it, read a terminal's foreground
+process group, signal a shell that will not exit — which it does through
+`golang.org/x/sys/unix`. The root package and every file in `internal/system`
+carry `//go:build linux || darwin`, so `go build .` for Windows reports that the
+package does not exist there rather than failing on a list of missing syscalls.
 
-CI builds and tests on Linux and on macOS, so both halves of that claim are
-checked on every pull request rather than assumed.
+The tag names the two platforms rather than saying `unix`, which would also
+claim the BSDs and Solaris. Nothing is tested there, so nothing is claimed
+there. The shared [`relay`](./relay) package is untagged and stays portable —
+the hosted backend imports it.
+
+CI tests on Linux and macOS, cross-compiles every shipped target on Linux, and
+asserts that the agent does not build anywhere else. A release is gated on the
+macOS tests too, since the Darwin archives are what people download.
+
+Live port status is a Linux-only feature for now: the agent finds listening
+ports by reading `/proc/net/tcp`, so on macOS the dashboard shows configured
+ports without marking which are up.
 
 ## Run or install
 

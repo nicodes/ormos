@@ -1,4 +1,4 @@
-//go:build unix
+//go:build linux || darwin
 
 // Command ormos runs the system on a personal machine.
 package main

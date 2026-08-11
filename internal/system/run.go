@@ -1,4 +1,4 @@
-//go:build unix
+//go:build linux || darwin
 
 // Package system is ormos on a personal machine: it opens a single outbound
 // WebSocket to the relay and serves terminal and port-proxy streams multiplexed
@@ -7,22 +7,31 @@
 //
 // # Supported platforms
 //
-// Linux and macOS. Every file in this package carries //go:build unix, and that
-// is the whole statement — there is no Windows half to write and none is
-// planned.
+// Linux and macOS. Every file in this package carries //go:build linux ||
+// darwin, and that is the whole statement.
 //
-// The agent's job is to act on the machine it runs on: allocate a PTY, read a
-// terminal's foreground process group, deliver SIGHUP and then SIGKILL to a
-// shell that will not exit. That is golang.org/x/sys/unix, which has no Windows
-// implementation of any of it. Before the build tags, `GOOS=windows go build`
-// failed on eight undefined syscalls while the comments here described a
-// cross-platform agent, so the code said one thing and the documentation
-// another. Now `go build .` for Windows says "build constraints exclude all Go
-// files" — the package does not exist there, which is both true and a better
-// answer than a list of missing symbols.
+// The agent's job is to act on the machine it runs on: allocate a PTY, poll its
+// master descriptor, read a terminal's foreground process group, deliver SIGHUP
+// and then SIGKILL to a shell that will not exit. That is golang.org/x/sys/unix,
+// which has no Windows implementation of any of it, so `go build .` for Windows
+// reports that the package does not exist there rather than listing the ten
+// symbols it is missing.
 //
-// The shared relay package is deliberately untagged: it is pure Go, and the
-// hosted relay imports it.
+// The tag names the two platforms rather than saying `unix`, which would also
+// select the BSDs and Solaris. Nothing here is tested on those, and this is a
+// program that hands out shells on the machine it runs on — the PTY and
+// process-group paths are exactly the code that misbehaves quietly on a kernel
+// nobody exercised. A build tag is a claim about where this is known to work,
+// so it must not be wider than the set CI actually runs.
+//
+// CI holds up both halves: a macos-latest job runs the suite, and a step in
+// ci.yml asserts that the agent does not build for Windows or the BSDs and that
+// nothing but relay is even selected there. Without that step the claim would
+// be unenforceable — `go build ./...` SKIPS packages with no buildable files,
+// so a file that lost its tag would go unnoticed by every build in the pipeline.
+//
+// The shared relay package is deliberately untagged: it is pure Go, the hosted
+// relay imports it, and it cross-compiles for Windows today.
 package system
 
 import (
