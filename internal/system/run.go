@@ -1,7 +1,28 @@
+//go:build unix
+
 // Package system is ormos on a personal machine: it opens a single outbound
 // WebSocket to the relay and serves terminal and port-proxy streams multiplexed
 // over it. With no arguments it runs the tunnel; with a TTY it also shows a
 // Bubble Tea status dashboard.
+//
+// # Supported platforms
+//
+// Linux and macOS. Every file in this package carries //go:build unix, and that
+// is the whole statement — there is no Windows half to write and none is
+// planned.
+//
+// The agent's job is to act on the machine it runs on: allocate a PTY, read a
+// terminal's foreground process group, deliver SIGHUP and then SIGKILL to a
+// shell that will not exit. That is golang.org/x/sys/unix, which has no Windows
+// implementation of any of it. Before the build tags, `GOOS=windows go build`
+// failed on eight undefined syscalls while the comments here described a
+// cross-platform agent, so the code said one thing and the documentation
+// another. Now `go build .` for Windows says "build constraints exclude all Go
+// files" — the package does not exist there, which is both true and a better
+// answer than a list of missing symbols.
+//
+// The shared relay package is deliberately untagged: it is pure Go, and the
+// hosted relay imports it.
 package system
 
 import (

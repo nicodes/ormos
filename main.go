@@ -1,3 +1,5 @@
+//go:build unix
+
 // Command ormos runs the system on a personal machine.
 package main
 

@@ -1,3 +1,5 @@
+//go:build unix
+
 package system
 
 import (
@@ -19,8 +21,8 @@ import (
 )
 
 // machineName renders the box as "<distro> - <host> - <goos>/<goarch>", e.g.
-// "Arch Linux - omarchy - linux/amd64". The distro is dropped where there is
-// none to read (macOS, Windows) rather than repeating the platform.
+// "Arch Linux - omarchy - linux/amd64". The distro is dropped on macOS, where
+// there is none to read, rather than repeating the platform.
 func machineName() string {
 	parts := make([]string, 0, 3)
 	if pretty := prettyOSName(); pretty != "" {
@@ -31,6 +33,8 @@ func machineName() string {
 }
 
 // prettyOSName reads PRETTY_NAME from /etc/os-release, empty if unavailable.
+// The agent runs on Linux and macOS only, so the other case is macOS, which has
+// no such file — hence the early return rather than a failed read.
 func prettyOSName() string {
 	if runtime.GOOS != "linux" {
 		return ""

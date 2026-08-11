@@ -1,17 +1,21 @@
 name: CI
 
-# Every push and pull request: build, then test, on one runner.
+# Every push and pull request: build, then test.
 #
 # Nothing is published, so a green CI means one thing — this commit is good.
 #
-# One job, because a job is a machine: two would each pay their own checkout and
-# their own toolchain to split one green tick in two. The phases are separate
-# STEPS, so the log still shows which is which and a failure still says so.
+# TWO jobs, and only two, because a job is a machine and ormos is a two-platform
+# product. Splitting phases across machines would be waste — each would pay its
+# own checkout and toolchain to split one green tick in two — so build and test
+# are separate STEPS of the Linux job. Splitting PLATFORMS is not waste: macOS is
+# a different kernel, and the claim "this runs on macOS" is otherwise checked by
+# nobody. The Darwin job exists to make that claim falsifiable.
 #
 # The steps are .github/actions/*, the same ones Release runs. There is one
 # definition of each, and it is the one guarding a release; two would drift in a
 # single direction, with the release-side copy trimmed for speed until it no
-# longer matched what people trust on a pull request.
+# longer matched what people trust on a pull request. The Darwin job reuses the
+# same test action for the same reason — one definition of "tested".
 
 on:
   pull_request:
@@ -78,3 +82,43 @@ jobs:
 
       - name: Build
         uses: ./.github/actions/build
+
+  # macOS is half of what ormos claims to support, and until this job existed
+  # nothing verified it. The Build step above cross-compiles for darwin, but
+  # that proves only that the symbols resolve — it does not run a line of the
+  # code on the platform.
+  #
+  # It matters most for the terminal. The agent polls a raw PTY master
+  # descriptor through RawConn.Control, which on darwin goes via the libc
+  # trampoline rather than a kernel ppoll, and creack/pty builds the master
+  # differently on the two platforms (Linux os.OpenFile, macOS os.NewFile on an
+  # already-open blocking descriptor). That is exactly the difference the
+  # output-coalescing path reasons about, so it is exactly the code a
+  # cross-compile cannot vouch for.
+  #
+  # Test only, no Build: the build action archives with sha256sum and unpacks
+  # the Linux archive to check the version it reports, neither of which is a
+  # macOS thing. What a darwin binary needs proving about it is proven by
+  # compiling in the job above; what it needs proving about it HERE is that the
+  # tests pass on a Mac.
+  darwin:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: jdx/mise-action@7e36c90d9ab29c415a2384db3006f3ec8a8cc654 # v4.2.4
+
+      # runner.os is in the key, so this never collides with the Linux cache.
+      - name: Cache Go build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/Caches/go-build
+            ~/go/pkg/mod
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum', '.mise.toml') }}
+          restore-keys: |
+            go-${{ runner.os }}-
+
+      - name: Test
+        uses: ./.github/actions/test

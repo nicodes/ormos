@@ -10,9 +10,24 @@ instructions from the Ormos relay to start shells and connect to local services,
 so review the policy section below before leaving it running on an important
 machine.
 
+## Supported platforms
+
+Linux and macOS, on `amd64` and `arm64`. That is the whole list.
+
+There is no Windows build and none is planned. The agent's job is to act on the
+machine it runs on — allocate a PTY, read a terminal's foreground process group,
+signal a shell that will not exit — which it does through `golang.org/x/sys/unix`.
+Every file in `internal/system` carries `//go:build unix`, so `go build .` for
+Windows reports that the package does not exist there rather than failing on a
+list of missing syscalls. The shared [`relay`](./relay) package is untagged and
+stays portable.
+
+CI builds and tests on Linux and on macOS, so both halves of that claim are
+checked on every pull request rather than assumed.
+
 ## Run or install
 
-Ormos requires Go 1.25 and currently supports Linux and macOS.
+Ormos requires Go 1.25.
 
 Run the latest release directly:
 
