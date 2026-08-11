@@ -485,8 +485,8 @@ func TestPairingScreenStripsEscapesFromTheRelay(t *testing.T) {
 func TestPairingScreenStripsC1AndFormatCharacters(t *testing.T) {
 	var m loginModel
 	next, _ := m.Update(loginCodeMsg{start: relay.DeviceStartResponse{
-		UserCode:        "AB\u202eCD\x9bEF",
-		VerificationURL: "https://app.example.test/pair\x9bEND\u202e",
+		UserCode:        "AB\u202eCD\u009bEF",
+		VerificationURL: "https://app.example.test/pair\u009bEND\u202e",
 		ExpiresIn:       60,
 	}})
 	shown, _ := next.(loginModel).Update(tea.WindowSizeMsg{Width: 80, Height: 24})
@@ -495,7 +495,7 @@ func TestPairingScreenStripsC1AndFormatCharacters(t *testing.T) {
 		"sized":      shown.(loginModel).View(),
 		"pre-resize": next.(loginModel).View(),
 	} {
-		for _, seq := range []string{"\u202e", "\x9b"} {
+		for _, seq := range []string{"\u202e", "\u009b"} {
 			if strings.Contains(view, seq) {
 				t.Errorf("%s view: a relay-supplied %q reached the pairing screen", name, seq)
 			}
