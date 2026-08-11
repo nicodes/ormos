@@ -104,8 +104,23 @@ func scrubbedEnv() []string {
 	return out
 }
 
+// proxyStatus is the status line of a proxy refusal.
+//
+// A defined type with exactly two values rather than a plain string parameter,
+// because these bytes are written verbatim into a hand-assembled HTTP response.
+// A status that could become dynamic is a response-splitting hole waiting for
+// its first caller, and this is a type the compiler can enforce for free.
+type proxyStatus string
+
+const (
+	proxyForbidden  proxyStatus = "403 Forbidden"
+	proxyBadGateway proxyStatus = "502 Bad Gateway"
+)
+
 // writeProxyError answers a proxy stream with a complete plain-text HTTP
-// response and nothing else — the caller closes the stream immediately after.
+// response and nothing else. Nothing follows it: serveStream's deferred Close
+// ends the stream as soon as handleProxy returns, which is what makes the
+// Connection: close honest.
 //
 // Hand-assembled because there is no http.Request to answer: the relay opened a
 // raw byte pipe, and by the time this is called the agent has decided not to
@@ -113,10 +128,18 @@ func scrubbedEnv() []string {
 // would render as a blank frame; a status and a sentence render as an
 // explanation.
 //
+// NEITHER ARGUMENT MAY CONTAIN CR OR LF. They are interpolated straight into
+// the response, so a newline in either would let the caller inject headers or a
+// second response — the classic response split. status cannot: it is one of the
+// two constants above. body is the caller's, and every call site today builds
+// it from a literal plus %d of an int. Anything relay-supplied — a policy
+// reason, a path, an error string — must not be put here without stripping
+// control characters first.
+//
 // One spelling of the response, called from every refusal, so a change to its
 // shape — a security header, a charset, a Connection semantics fix — lands on
 // all of them rather than on three of four.
-func writeProxyError(w io.Writer, status, body string) {
+func writeProxyError(w io.Writer, status proxyStatus, body string) {
 	fmt.Fprintf(w, "HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\n"+
 		"Content-Length: %d\r\nConnection: close\r\n\r\n%s", status, len(body), body)
 }
@@ -133,21 +156,21 @@ func (d *system) handleProxy(stream io.ReadWriteCloser, br io.Reader, port int) 
 	pol, policyOK := d.livePolicy()
 	if !policyOK {
 		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: "policy unreadable", Allowed: false})
-		writeProxyError(stream, "403 Forbidden",
+		writeProxyError(stream, proxyForbidden,
 			"Local policy on this system could not be read; nothing is being served.\n")
 		return
 	}
 	if ok, reason := pol.proxyAllowed(port); !ok {
 		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: reason, Allowed: false})
 		d.logf("proxy refused by local policy: %s", reason)
-		writeProxyError(stream, "403 Forbidden",
+		writeProxyError(stream, proxyForbidden,
 			fmt.Sprintf("Local policy on this system refuses port %d.\n", port))
 		return
 	}
 	if !d.proxyPortAllowed(port) {
 		d.audit.record(auditEntry{Event: "proxy", Port: port, Allowed: false})
 		d.logf("proxy refused: port %d is not exposed", port)
-		writeProxyError(stream, "403 Forbidden",
+		writeProxyError(stream, proxyForbidden,
 			fmt.Sprintf("Port %d is not exposed on this system.\n", port))
 		return
 	}
@@ -160,7 +183,7 @@ func (d *system) handleProxy(stream io.ReadWriteCloser, br io.Reader, port int) 
 	}
 	if err != nil {
 		d.logf("proxy dial :%d: %v", port, err)
-		writeProxyError(stream, "502 Bad Gateway",
+		writeProxyError(stream, proxyBadGateway,
 			fmt.Sprintf("Nothing is listening on port %d on this system.\nStart your app on that port and reload.\n", port))
 		return
 	}

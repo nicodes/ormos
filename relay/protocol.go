@@ -93,10 +93,17 @@ const (
 	// KindListPorts asks the system to report its currently-listening loopback
 	// TCP ports as a JSON array of ints, then the stream is closed.
 	KindListPorts StreamKind = "listports"
-	// KindPing is a liveness stream: the agent echoes back whatever it is sent
-	// and the relay closes it. The relay opens one to answer "is this machine
-	// actually reachable", which the tunnel's own registration cannot — a
-	// yamux session survives a dead peer until something is written down it.
+	// KindPing is a liveness stream: the agent echoes back whatever it is sent,
+	// and the relay closes it.
+	//
+	// It answers a narrower question than the tunnel's own state does. A live
+	// yamux session says the socket is up and keepalive has not timed out yet
+	// (see yamuxConfig, which enables it) — an end-to-end echo says the agent
+	// is accepting and serving streams right now. The gap between those two is
+	// where this earns its place: the keepalive interval means a dead peer can
+	// look connected for tens of seconds, and an agent can hold a perfectly
+	// healthy session while serving nothing, because it is at MaxTunnelStreams
+	// or because its accept loop is wedged.
 	KindPing StreamKind = "ping"
 	// KindShutdown asks the system agent to shut down gracefully (stop the CLI).
 	KindShutdown StreamKind = "shutdown"

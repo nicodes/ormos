@@ -4,11 +4,14 @@ package system
 
 import (
 	"bufio"
+	"bytes"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -239,72 +242,144 @@ func TestPublicKeyHeaderMatchesTheProtocol(t *testing.T) {
 	}
 }
 
-// proxyResponse runs one refused proxy stream and parses what the agent wrote
-// back as an HTTP response. Parsing rather than string-matching is the point:
-// a Content-Length that disagrees with the body, or a malformed status line,
-// fails here instead of rendering as a blank iframe for the user.
-func proxyResponse(t *testing.T, d *system, port int) (*http.Response, string) {
+// proxyResponse runs one refused proxy stream and returns the exact bytes the
+// agent wrote, alongside the parsed response.
+//
+// Both, because they catch different things. Parsing catches a malformed status
+// line. The RAW bytes catch everything the parser is too forgiving about: a
+// missing Connection: close, a bare LF where the protocol wants CRLF, an
+// under-declared Content-Length. net/http accepts all three -- it bounds the
+// body BY the declared Content-Length, so `len(body) == resp.ContentLength` is
+// true by construction and can never fail.
+func proxyResponse(t *testing.T, d *system, port int) (*http.Response, string, string) {
 	t.Helper()
 	agent, client := net.Pipe()
 	defer client.Close()
-	if err := client.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
 		d.handleProxy(agent, agent, port)
+		// serveStream's deferred Close, which is what ends the response.
 		agent.Close()
 	}()
-	resp, err := http.ReadResponse(bufio.NewReader(client), nil)
+	raw, err := io.ReadAll(client)
 	if err != nil {
-		t.Fatalf("the agent's refusal is not a readable HTTP response: %v", err)
+		t.Fatalf("reading the agent's refusal: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(raw)), nil)
+	if err != nil {
+		t.Fatalf("the agent's refusal is not a readable HTTP response: %v (%q)", err, raw)
 	}
 	t.Cleanup(func() { resp.Body.Close() })
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("reading the refusal body: %v", err)
 	}
-	if resp.ContentLength != int64(len(body)) {
-		t.Errorf("Content-Length is %d but the body is %d bytes", resp.ContentLength, len(body))
-	}
-	return resp, string(body)
+	return resp, string(body), string(raw)
 }
 
-// Every refusal goes out through writeProxyError, so these pin the shape of
-// the response the browser actually receives. Four hand-assembled copies of
-// that format string is four places a future edit lands on three.
+// wantProxyError is the response every refusal must produce, spelled out once
+// here so the test does not reuse the helper's own format string to check the
+// helper. A mistake in writeProxyError has to disagree with something.
+func wantProxyError(status, body string) string {
+	return "HTTP/1.1 " + status + "\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
+		"Connection: close\r\n" +
+		"\r\n" + body
+}
+
+// Every refusal goes out through writeProxyError, so these pin the exact bytes
+// the browser receives. Four hand-assembled copies of that format string was
+// four places a future edit lands on three.
 func TestProxyRefusalsAreWellFormedHTTP(t *testing.T) {
 	withTempConfigDir(t)
-	d := newSystem(systemConfig{})
+	// A relay URL that refuses instantly, so the "not exposed" branch below
+	// fails its lookup fast instead of waiting out a real timeout.
+	closed := closedLoopbackPort(t)
+	d := newSystem(systemConfig{RelayURL: fmt.Sprintf("ws://127.0.0.1:%d", closed)})
 
-	// Refused by the built-in guard: a privileged port, no local opt-in.
-	resp, body := proxyResponse(t, d, 22)
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("policy refusal answered %s, want 403", resp.Status)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "text/plain; charset=utf-8" {
-		t.Errorf("Content-Type is %q", ct)
-	}
-	if !strings.Contains(body, "Local policy") {
-		t.Errorf("the refusal does not say why: %q", body)
-	}
+	t.Run("refused by local policy", func(t *testing.T) {
+		// A privileged port: the built-in guard refuses it with no policy file.
+		resp, body, raw := proxyResponse(t, d, 22)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("answered %s, want 403", resp.Status)
+		}
+		// "refuses port 22" rather than "Local policy", which both 403 bodies
+		// start with -- a regression into the fail-closed unreadable-policy
+		// branch would otherwise stay green.
+		want := wantProxyError("403 Forbidden", "Local policy on this system refuses port 22.\n")
+		if raw != want {
+			t.Errorf("raw response:\n%q\nwant:\n%q", raw, want)
+		}
+		if !strings.Contains(body, "refuses port 22") {
+			t.Errorf("the refusal does not say which port: %q", body)
+		}
+	})
 
-	// Allowed, exposed, but nothing is listening: a 502 with an explanation,
-	// because what the user sees is an iframe and a bare EOF renders blank.
+	t.Run("not exposed", func(t *testing.T) {
+		// An ordinary dev port local policy allows, which the relay does not
+		// list -- and the relay cannot be reached to ask, so it fails closed.
+		resp, _, raw := proxyResponse(t, d, 3000)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("answered %s, want 403", resp.Status)
+		}
+		want := wantProxyError("403 Forbidden", "Port 3000 is not exposed on this system.\n")
+		if raw != want {
+			t.Errorf("raw response:\n%q\nwant:\n%q", raw, want)
+		}
+	})
+
+	t.Run("nothing listening", func(t *testing.T) {
+		// Allowed and exposed, but dead: a 502 with an explanation, because
+		// what the user sees is an iframe and a bare EOF renders blank.
+		dead := closedLoopbackPort(t)
+		d.mu.Lock()
+		d.ports = []PortStatus{{Port: dead}}
+		d.mu.Unlock()
+
+		resp, _, raw := proxyResponse(t, d, dead)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("answered %s, want 502", resp.Status)
+		}
+		want := wantProxyError("502 Bad Gateway", fmt.Sprintf(
+			"Nothing is listening on port %d on this system.\nStart your app on that port and reload.\n", dead))
+		if raw != want {
+			t.Errorf("raw response:\n%q\nwant:\n%q", raw, want)
+		}
+	})
+
+	t.Run("policy unreadable", func(t *testing.T) {
+		// The fourth call site: a policy file that will not parse denies
+		// everything, and says so rather than serving.
+		dir := withTempConfigDir(t)
+		if err := os.WriteFile(filepath.Join(dir, policyFileName), []byte("{not json"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		d := &system{terminals: make(map[string]*terminalSession), audit: newAuditor()}
+
+		resp, _, raw := proxyResponse(t, d, 3000)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("answered %s, want 403", resp.Status)
+		}
+		want := wantProxyError("403 Forbidden",
+			"Local policy on this system could not be read; nothing is being served.\n")
+		if raw != want {
+			t.Errorf("raw response:\n%q\nwant:\n%q", raw, want)
+		}
+	})
+}
+
+// closedLoopbackPort returns a loopback port with nothing listening on it: a
+// connection there is refused immediately rather than timing out.
+func closedLoopbackPort(t *testing.T) int {
+	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	dead := l.Addr().(*net.TCPAddr).Port
+	port := l.Addr().(*net.TCPAddr).Port
 	l.Close()
-	d.mu.Lock()
-	d.ports = []PortStatus{{Port: dead}}
-	d.mu.Unlock()
-
-	resp, body = proxyResponse(t, d, dead)
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("a dead port answered %s, want 502", resp.Status)
-	}
-	if !strings.Contains(body, "Nothing is listening") {
-		t.Errorf("the 502 does not say why: %q", body)
-	}
+	return port
 }
