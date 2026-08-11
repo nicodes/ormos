@@ -12,7 +12,9 @@ machine.
 
 ## Supported platforms
 
-Linux and macOS, on `amd64` and `arm64`. That is the whole list.
+Linux and macOS, on `amd64` and `arm64`. That is the whole list: CI tests and
+releases ship exactly those four targets, and nothing else is claimed as
+supported.
 
 There is no Windows build and none is planned. The agent's job is to act on the
 machine it runs on — allocate a PTY, poll it, read a terminal's foreground
