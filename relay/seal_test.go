@@ -5,6 +5,7 @@ import (
 	"crypto/ecdh"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"testing"
 )
@@ -434,5 +435,127 @@ func TestWriteFrameIssuesOneWrite(t *testing.T) {
 	}
 	if string(frame.Data) != "x" {
 		t.Fatalf("frame data = %q, want %q", frame.Data, "x")
+	}
+}
+
+// ReadRecordInto has to hand back exactly what ReadRecord would, and reuse the
+// caller's buffer when it can — the point being that a pump reading a record
+// per chunk stops allocating one per chunk.
+func TestReadRecordIntoReusesTheBuffer(t *testing.T) {
+	var w bytes.Buffer
+	records := [][]byte{
+		bytes.Repeat([]byte("a"), 64),
+		bytes.Repeat([]byte("b"), 32),
+		bytes.Repeat([]byte("c"), 48),
+	}
+	for _, rec := range records {
+		if err := WriteRecord(&w, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	buf := make([]byte, 0, 64)
+	first := &buf[:1][0]
+	for i, want := range records {
+		got, err := ReadRecordInto(&w, buf)
+		if err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("record %d = %q, want %q", i, got, want)
+		}
+		if &got[:1][0] != first {
+			t.Fatalf("record %d was read into a fresh buffer; %d bytes fit in a cap of %d", i, len(got), cap(buf))
+		}
+		buf = got
+	}
+
+	// A record too big for the buffer gets a new one rather than a truncation.
+	big := bytes.Repeat([]byte("d"), 512)
+	if err := WriteRecord(&w, big); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadRecordInto(&w, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, big) {
+		t.Fatalf("oversized record did not round-trip: %d bytes, want %d", len(got), len(big))
+	}
+	if &got[:1][0] == first {
+		t.Fatal("a 512-byte record was read into a 64-byte buffer")
+	}
+
+	// A zero-length record is still a non-nil empty slice, as the allocating
+	// form always returned — this is a shared module and the difference is
+	// invisible at a call site in the other repository. Both paths are checked:
+	// the warm buffer, and the cold one ReadRecord itself takes, where buf[:0]
+	// on a nil slice would stay nil.
+	for _, tc := range []struct {
+		name string
+		read func(io.Reader) ([]byte, error)
+	}{
+		{"reused buffer", func(r io.Reader) ([]byte, error) { return ReadRecordInto(r, buf) }},
+		{"nil buffer", func(r io.Reader) ([]byte, error) { return ReadRecordInto(r, nil) }},
+		{"ReadRecord", ReadRecord},
+	} {
+		var empty bytes.Buffer
+		if err := WriteRecord(&empty, nil); err != nil {
+			t.Fatal(err)
+		}
+		got, err := tc.read(&empty)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got == nil || len(got) != 0 {
+			t.Fatalf("%s: zero-length record = %v, want a non-nil empty slice", tc.name, got)
+		}
+	}
+}
+
+// SealedStream.ReadFrame reuses one record buffer for the life of the stream,
+// which is only safe because Open decrypts into a slice it allocates itself and
+// DecodeFrame slices THAT. Nothing a caller holds may point into the reused
+// buffer. This is the guard on that invariant: change Open to decrypt in place
+// — the obvious next allocation to remove on this exact path — and the frame
+// held across the second read starts changing under its owner.
+func TestReadFrameDataSurvivesTheNextRead(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+	keys, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), testSalt, "alias")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire bytes.Buffer
+	send, err := NewSealedStream(&bytes.Buffer{}, &wire, keys.AgentToClient, keys.ClientToAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first record is the LARGER one, so the buffer it is read into is big
+	// enough for the second to be read back into the same memory. The other way
+	// round, ReadRecordInto allocates for the second and the first is never
+	// touched — which would make this test pass whatever Open did with dst.
+	firstPayload := bytes.Repeat([]byte("a"), 512)
+	secondPayload := bytes.Repeat([]byte("b"), 32)
+	for _, p := range [][]byte{firstPayload, secondPayload} {
+		if err := send.WriteFrame(EncodeData(p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recv, err := NewSealedStream(&wire, &bytes.Buffer{}, keys.ClientToAgent, keys.AgentToClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := recv.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := first.Data // kept across the next read, on purpose
+	if _, err := recv.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(held, firstPayload) {
+		t.Fatalf("a frame held across the next read changed under its owner: %q...", held[:min(16, len(held))])
 	}
 }

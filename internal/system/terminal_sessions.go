@@ -385,7 +385,7 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 }
 
 func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
-	if h.Cols < 1 || h.Cols > 1000 || h.Rows < 1 || h.Rows > 1000 {
+	if !relay.ValidTerminalSize(h.Cols, h.Rows) {
 		return nil, fmt.Errorf("invalid terminal size")
 	}
 
@@ -562,7 +562,7 @@ func (s *terminalSession) attach(conn *sealedConn) {
 			}
 			s.inputMu.Unlock()
 		case frame.Resize != nil:
-			if frame.Resize.Cols < 1 || frame.Resize.Cols > 1000 || frame.Resize.Rows < 1 || frame.Resize.Rows > 1000 {
+			if !relay.ValidTerminalSize(frame.Resize.Cols, frame.Resize.Rows) {
 				continue
 			}
 			_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(frame.Resize.Cols), Rows: uint16(frame.Resize.Rows)})
