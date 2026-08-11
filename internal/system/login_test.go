@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/nicodes/ormos/relay"
 )
 
@@ -474,5 +475,54 @@ func TestPairingScreenStripsEscapesFromTheRelay(t *testing.T) {
 	// readable, it just cannot act.
 	if !strings.Contains(view, "AB]0;OWNED[2JCD") {
 		t.Errorf("the pairing code did not survive sanitising:\n%s", view)
+	}
+}
+
+// stripCtl alone would leave these behind: the C1 controls and the Cf format
+// characters. U+202E (right-to-left override) is the one that can rewrite what
+// the operator reads on the screen whose whole job is which code to trust, so
+// the pairing screen sanitises, not just strips.
+func TestPairingScreenStripsC1AndFormatCharacters(t *testing.T) {
+	var m loginModel
+	next, _ := m.Update(loginCodeMsg{start: relay.DeviceStartResponse{
+		UserCode:        "AB\u202eCD\x9bEF",
+		VerificationURL: "https://app.example.test/pair\x9bEND\u202e",
+		ExpiresIn:       60,
+	}})
+	shown, _ := next.(loginModel).Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	for name, view := range map[string]string{
+		"sized":      shown.(loginModel).View(),
+		"pre-resize": next.(loginModel).View(),
+	} {
+		for _, seq := range []string{"\u202e", "\x9b"} {
+			if strings.Contains(view, seq) {
+				t.Errorf("%s view: a relay-supplied %q reached the pairing screen", name, seq)
+			}
+		}
+	}
+	// The payload survives as inert text.
+	if view := shown.(loginModel).View(); !strings.Contains(view, "ABCD") {
+		t.Errorf("the pairing code did not survive sanitising:\n%s", view)
+	}
+}
+
+// The relay picks the code's length as well as its content, so the code is
+// clipped to the terminal width: an over-wide code must not paint past the
+// screen's edge.
+func TestPairingScreenClipsTheCodeToTheWidth(t *testing.T) {
+	var m loginModel
+	next, _ := m.Update(loginCodeMsg{start: relay.DeviceStartResponse{
+		UserCode:        strings.Repeat("A", 200),
+		VerificationURL: "https://app.example.test/pair",
+		ExpiresIn:       60,
+	}})
+	shown, _ := next.(loginModel).Update(tea.WindowSizeMsg{Width: 60, Height: 24})
+	view := shown.(loginModel).View()
+
+	for _, row := range strings.Split(view, "\n") {
+		if w := lipgloss.Width(row); w > 60 {
+			t.Errorf("a %d-column row on a 60-column screen: %q", w, row)
+		}
 	}
 }
