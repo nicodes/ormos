@@ -138,9 +138,13 @@ const (
 //
 // One spelling of the response, called from every refusal, so a change to its
 // shape — a security header, a charset, a Connection semantics fix — lands on
-// all of them rather than on three of four.
+// all of them rather than on three of four. nosniff is the first of those to
+// arrive: this renders in an iframe on the relay's own origin, and while every
+// body here is a literal today, "the browser will not second-guess the type we
+// declared" is worth one header rather than an argument at each call site.
 func writeProxyError(w io.Writer, status proxyStatus, body string) {
 	fmt.Fprintf(w, "HTTP/1.1 %s\r\nContent-Type: text/plain; charset=utf-8\r\n"+
+		"X-Content-Type-Options: nosniff\r\n"+
 		"Content-Length: %d\r\nConnection: close\r\n\r\n%s", status, len(body), body)
 }
 

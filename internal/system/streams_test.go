@@ -285,6 +285,7 @@ func proxyResponse(t *testing.T, d *system, port int) (*http.Response, string, s
 func wantProxyError(status, body string) string {
 	return "HTTP/1.1 " + status + "\r\n" +
 		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"X-Content-Type-Options: nosniff\r\n" +
 		"Content-Length: " + strconv.Itoa(len(body)) + "\r\n" +
 		"Connection: close\r\n" +
 		"\r\n" + body
@@ -373,6 +374,12 @@ func TestProxyRefusalsAreWellFormedHTTP(t *testing.T) {
 
 // closedLoopbackPort returns a loopback port with nothing listening on it: a
 // connection there is refused immediately rather than timing out.
+//
+// Binding :0 and closing is the only way to name a port the OS agrees is free,
+// so this is the one non-deterministic thing in these tests: if the kernel
+// hands the same ephemeral port to something else in the gap, a subtest here
+// goes red for a reason that is not handleProxy. Rare enough to live with,
+// worth knowing before going looking in the wrong place.
 func closedLoopbackPort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
