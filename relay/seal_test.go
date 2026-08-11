@@ -365,3 +365,74 @@ func TestClientHelloRejectsWrongLength(t *testing.T) {
 		t.Fatal("writing a short client hello must be refused")
 	}
 }
+
+// writeCounter records how many Write calls a record cost, and what they
+// carried.
+type writeCounter struct {
+	bytes.Buffer
+	writes int
+}
+
+func (w *writeCounter) Write(p []byte) (int, error) {
+	w.writes++
+	return w.Buffer.Write(p)
+}
+
+// One record must be one Write. yamux emits a data frame per Stream.Write, and
+// its send loop writes that frame's header and body as separate writes on the
+// tunnel conn, each of which websocket.NetConn turns into a WebSocket message.
+// A record split across two writes therefore cost four messages and two frames,
+// one of the frames carrying nothing but a 4-byte length. Every keystroke paid
+// it.
+func TestWriteRecordIssuesOneWrite(t *testing.T) {
+	var w writeCounter
+	record := []byte("a terminal record")
+	if err := WriteRecord(&w, record); err != nil {
+		t.Fatal(err)
+	}
+	if w.writes != 1 {
+		t.Fatalf("WriteRecord made %d writes, want 1", w.writes)
+	}
+	// And the bytes on the wire are unchanged.
+	got, err := ReadRecord(&w.Buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, record) {
+		t.Fatalf("round-tripped record = %q, want %q", got, record)
+	}
+}
+
+func TestWriteFrameIssuesOneWrite(t *testing.T) {
+	agent := fixedKey(t, agentSeed)
+	client := fixedKey(t, clientSeed)
+	keys, err := DeriveSessionKeys(agent, client.PublicKey().Bytes(), testSalt, "one-write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var w writeCounter
+	send, err := NewSealedStream(&bytes.Buffer{}, &w, keys.AgentToClient, keys.ClientToAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := send.WriteFrame(EncodeData([]byte("x"))); err != nil {
+		t.Fatal(err)
+	}
+	if w.writes != 1 {
+		t.Fatalf("WriteFrame made %d writes, want 1", w.writes)
+	}
+
+	// And the receiving end, with the directions the other way round, still
+	// reads exactly what was sent.
+	recv, err := NewSealedStream(&w.Buffer, &bytes.Buffer{}, keys.ClientToAgent, keys.AgentToClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := recv.ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(frame.Data) != "x" {
+		t.Fatalf("frame data = %q, want %q", frame.Data, "x")
+	}
+}
