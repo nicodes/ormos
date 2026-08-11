@@ -27,6 +27,15 @@ func NetConn(ctx context.Context, c *websocket.Conn) net.Conn {
 // workspace is a handful of terminals and one proxied port.
 const MaxTunnelStreams = 128
 
+// MaxStreamWindow is the per-stream receive window both ends of the tunnel
+// advertise, and MaxTunnelWindowBytes is what that costs across every stream a
+// peer may open at once. The second is the number worth watching: raising
+// either factor raises the memory an adversarial peer can pin.
+const (
+	MaxStreamWindow      = 4 << 20
+	MaxTunnelWindowBytes = MaxStreamWindow * MaxTunnelStreams
+)
+
 // yamuxConfig returns a shared yamux config with keepalive enabled so both ends
 // detect a dead tunnel, and bounded buffering so neither end can be made to
 // hold an unreasonable amount of memory for the other.
@@ -38,6 +47,19 @@ func yamuxConfig() *yamux.Config {
 	cfg.AcceptBacklog = 64
 	cfg.StreamOpenTimeout = 30 * time.Second
 	cfg.StreamCloseTimeout = 2 * time.Minute
+	// yamux defaults MaxStreamWindowSize to 256 KiB, which caps one stream at
+	// 256 KiB per tunnel round trip. The port proxy shares this window and dev
+	// servers routinely serve multi-megabyte bundles, so a preview reload paid
+	// a round trip every quarter megabyte.
+	//
+	// The window is what a peer may have in flight unacknowledged, so it is
+	// also the per-stream memory the other end can be made to hold. Against
+	// MaxTunnelStreams that is MaxTunnelWindowBytes — the number the guard in
+	// transport_test.go pins, because the trade being made here is the product
+	// of the two, not either one alone. yamux allocates the window as data
+	// arrives rather than up front, and a peer must already be authenticated to
+	// open a stream at all.
+	cfg.MaxStreamWindowSize = MaxStreamWindow
 	// Silence yamux's internal logging; callers do their own logging.
 	cfg.LogOutput = io.Discard
 	return cfg

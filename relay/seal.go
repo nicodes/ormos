@@ -202,8 +202,15 @@ func (s *Sealer) nonce() [chacha20poly1305.NonceSize]byte {
 
 // Seal encrypts one plaintext record.
 func (s *Sealer) Seal(plaintext []byte) []byte {
+	return s.sealAppend(nil, plaintext)
+}
+
+// sealAppend encrypts one plaintext record onto the end of dst, so a caller
+// that has already reserved room for a length prefix pays neither a second
+// allocation nor a copy. It is the single place the nonce counter is consumed.
+func (s *Sealer) sealAppend(dst, plaintext []byte) []byte {
 	n := s.nonce()
-	return s.aead.Seal(nil, n[:], plaintext, nil)
+	return s.aead.Seal(dst, n[:], plaintext, nil)
 }
 
 // Open decrypts one record, or returns ErrSealFailed.
@@ -216,24 +223,41 @@ func (s *Sealer) Open(record []byte) ([]byte, error) {
 	return out, nil
 }
 
-// WriteRecord writes a length-prefixed record.
+// recordPrefixSize is the fixed big-endian length prefix on every sealed
+// record. The single spelling of that 4: WriteRecord writes it and ReadRecord
+// reads it.
+const recordPrefixSize = 4
+
+// WriteRecord writes a length-prefixed record in a single Write.
 //
 // The length prefix exists for the yamux side, which is a byte stream. Over the
 // browser WebSocket each record is already one binary message, so the server
 // adds this prefix in one direction and strips it in the other — which is the
 // whole of its involvement in terminal traffic.
+//
+// One Write, not two, because of what sits underneath. yamux emits a data frame
+// per Stream.Write (up to its send window), and its send loop writes that
+// frame's 12-byte header and its body as two separate writes on the tunnel
+// conn, which websocket.NetConn turns into one WebSocket message each. So a
+// record split across two writes cost four WebSocket messages and two yamux
+// frames — one of the frames carrying nothing but a 4-byte length — and every
+// keystroke paid it. It now costs two messages and one frame. The bytes on the
+// wire are otherwise unchanged.
+//
+// The whole record is copied into one buffer to do that. Inside this repo that
+// only ever carries the two 32-byte hellos, but relay/ is shared: the server's
+// browser-to-agent pump calls this per inbound record, so it trades a copy
+// there for a frame and a message on every one.
 func WriteRecord(w io.Writer, record []byte) error {
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(record)))
-	if err := writeAll(w, hdr[:]); err != nil {
-		return err
-	}
-	return writeAll(w, record)
+	buf := make([]byte, recordPrefixSize+len(record))
+	binary.BigEndian.PutUint32(buf, uint32(len(record)))
+	copy(buf[recordPrefixSize:], record)
+	return writeAll(w, buf)
 }
 
 // ReadRecord reads a single length-prefixed record.
 func ReadRecord(r io.Reader) ([]byte, error) {
-	var hdr [4]byte
+	var hdr [recordPrefixSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
@@ -351,8 +375,15 @@ func NewSealedStream(r io.Reader, w io.Writer, sendKey, recvKey []byte) (*Sealed
 }
 
 // WriteFrame seals an encoded frame and writes it as one record.
+//
+// The record is sealed straight into a buffer that already carries room for the
+// length prefix, so one allocation and one Write carry the whole thing — see
+// WriteRecord for what the second Write cost.
 func (s *SealedStream) WriteFrame(frame []byte) error {
-	return WriteRecord(s.w, s.send.Seal(frame))
+	buf := make([]byte, recordPrefixSize, recordPrefixSize+len(frame)+sealOverhead)
+	buf = s.send.sealAppend(buf, frame)
+	binary.BigEndian.PutUint32(buf, uint32(len(buf)-recordPrefixSize))
+	return writeAll(s.w, buf)
 }
 
 // ReadFrame reads one record, opens it, and decodes the frame inside.
