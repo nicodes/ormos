@@ -447,3 +447,32 @@ func TestLoginModelRendersCode(t *testing.T) {
 		t.Fatalf("finish should quit with the approved payload, out = %+v", m.out)
 	}
 }
+
+// The pairing screen owns the whole terminal, runs before any token exists,
+// and its entire job is telling the operator which code to trust. A relay that
+// could paint over it would be forging exactly the thing being verified.
+func TestPairingScreenStripsEscapesFromTheRelay(t *testing.T) {
+	var m loginModel
+	next, _ := m.Update(loginCodeMsg{start: relay.DeviceStartResponse{
+		UserCode:        "AB\x1b]0;OWNED\a\x1b[2JCD",
+		VerificationURL: "https://app.example.test/pair\x1b]0;PWN\a",
+		ExpiresIn:       60,
+	}})
+	shown, _ := next.(loginModel).Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	view := shown.(loginModel).View()
+
+	// Named sequences rather than a bare ESC: this screen emits its own OSC 8
+	// hyperlink for the URL, so "\x1b]" is legitimately present. What must not
+	// be is a title-set, an erase-display, or a BEL — none of which this screen
+	// has any reason to write.
+	for _, seq := range []string{"\x1b]0;", "\x1b[2J", "\a"} {
+		if strings.Contains(view, seq) {
+			t.Errorf("a relay-supplied %q reached the pairing screen", seq)
+		}
+	}
+	// The payload survives as inert text, which is the point — the code stays
+	// readable, it just cannot act.
+	if !strings.Contains(view, "AB]0;OWNED[2JCD") {
+		t.Errorf("the pairing code did not survive sanitising:\n%s", view)
+	}
+}

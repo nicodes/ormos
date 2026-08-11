@@ -1,6 +1,7 @@
 package system
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"unicode"
@@ -348,5 +349,47 @@ func TestLongRelayTextCannotPushTheHeaderOffScreen(t *testing.T) {
 	// thing that must not be what falls off.
 	if !strings.Contains(lastRows(view, 24), "sealing") {
 		t.Error("the sealing fingerprint was pushed off the screen")
+	}
+}
+
+// The error and notice lines are relay text too: system.go builds
+// "relay returned %s" from an HTTP reason phrase, and Go does not sanitise
+// that. Round 2 sanitised them and nothing checked it — all three assignments
+// could be reverted with the suite still green.
+func TestDashboardStripsEscapesFromErrorsAndNotices(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	evil := "relay returned 403 \x1b]0;OWNED\a\x1b[2J"
+
+	for name, msg := range map[string]tea.Msg{
+		"projects load error": projectsMsg{err: errors.New(evil)},
+		"mutation error":      mutatedMsg{err: errors.New(evil)},
+		"mutation notice":     mutatedMsg{ok: evil},
+	} {
+		m := sized(t, d, 80, 24)
+		next, _ := m.Update(msg)
+		view := next.(model).View()
+		for _, seq := range []string{"\x1b]", "\a", "\x1b[2J"} {
+			if strings.Contains(view, seq) {
+				t.Errorf("%s: a relay-supplied %q reached the screen", name, seq)
+			}
+		}
+		if !strings.Contains(view, "relay returned 403") {
+			t.Errorf("%s: sanitising removed the message along with the escapes", name)
+		}
+	}
+}
+
+// The operator's own ORMOS_API_URL is not relay text, but it is painted into
+// the same alt screen and checkRelayTransport does not parse it.
+func TestDashboardStripsEscapesFromTheRelayURL(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{RelayURL: "wss://relay.test\x1b]0;OWNED\a", Email: "you\x1b[2J@example.test"})
+
+	view := sized(t, d, 80, 24).View()
+	for _, seq := range []string{"\x1b]", "\a", "\x1b[2J"} {
+		if strings.Contains(view, seq) {
+			t.Errorf("a %q in the configured relay URL or email reached the screen", seq)
+		}
 	}
 }

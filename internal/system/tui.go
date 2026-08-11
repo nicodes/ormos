@@ -627,7 +627,7 @@ func (m model) View() string {
 	// agent can be paired to any account, and a terminal here is a shell on this
 	// box, so "who is this connected as" should never need looking up.
 	head := titleStyle.Render("ormos")
-	if email := m.d.cfg.Email; email != "" {
+	if email := sanitize(m.d.cfg.Email); email != "" {
 		head += "  " + labelStyle.Render(email)
 	}
 	b.WriteString(head + "   " + state + "\n\n")
@@ -644,7 +644,13 @@ func (m model) View() string {
 	// Which relay this agent is talking to. ORMOS_API_URL and the saved config
 	// can each set it, so "connected to what" is worth stating outright rather
 	// than leaving to be inferred from a connect line in the activity pane.
-	b.WriteString("  " + labelStyle.Render("relay    ") + s.RelayURL + "\n")
+	// Sanitised like everything else on this screen. checkRelayTransport does
+	// not parse the URL, so an ORMOS_API_URL carrying an escape sequence would
+	// otherwise reach the alt screen intact. It is the operator's own
+	// environment rather than the relay's, which is why it is here rather than
+	// at a boundary — but the point of sanitising at all is that no site has to
+	// be remembered, and this line was the sixth.
+	b.WriteString("  " + labelStyle.Render("relay    ") + sanitize(s.RelayURL) + "\n")
 	// The sealing-key fingerprint, for out-of-band verification against the app:
 	// if the two do not match, a relay has swapped the key.
 	b.WriteString("  " + labelStyle.Render("sealing  ") + m.fingerprint + hintStyle.Render("  verify in app") + "\n\n")
@@ -734,11 +740,11 @@ func (m model) View() string {
 		hints += " · L sign out · q quit"
 		f.WriteString(hintStyle.Render(hints))
 	}
-	// Status line: last error or success notice, under the hints. The error is
-	// sanitised: it can be relay text (see sanitize), and it is painted into
-	// the alt screen just like the activity pane.
+	// Status line: last error or success notice, under the hints. Both are
+	// sanitised where they are ASSIGNED rather than here — one place per
+	// string, so there is no asymmetry for a future field to inherit.
 	if m.err != "" {
-		f.WriteString("\n" + errStyle.Render("✗ "+sanitize(m.err)))
+		f.WriteString("\n" + errStyle.Render("✗ "+m.err))
 	} else if m.notice != "" {
 		f.WriteString("\n" + noticeStyle.Render("✓ "+m.notice))
 	}
@@ -761,8 +767,11 @@ func (m model) View() string {
 		body = clipLines(strings.TrimRight(a.String(), "\n"), m.width)
 	}
 
-	// Pin the footer to the bottom when the body fits; otherwise let it follow
-	// the content so nothing is clipped on a short terminal.
+	// Pin the footer to the bottom when the body fits. When it does not, the
+	// view goes out over-tall and Bubble Tea keeps its LAST height rows — so
+	// the TOP of the body is what is lost, not the footer. That is what
+	// activityBudget exists to stop the pane from causing; a project list long
+	// enough to overflow on its own still does it.
 	if m.width > 0 && m.height > 0 {
 		if avail := m.height - lipgloss.Height(footer); avail >= 1 && lipgloss.Height(body) <= avail {
 			return lipgloss.Place(m.width, avail, lipgloss.Left, lipgloss.Top, body) + "\n" + footer
