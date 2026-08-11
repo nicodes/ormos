@@ -63,6 +63,11 @@ const (
 	// public keys and a per-connection server salt (scheduleInfo), so a client
 	// derives a key against the exact agent it thinks it is talking to.
 	sealInfo = "ormos terminal seal v2"
+	// maxReusedRecord bounds the record buffer SealedStream.ReadFrame keeps
+	// between calls. Terminal input is keystrokes; anything larger is a paste,
+	// and holding one for the life of the connection would turn a transient
+	// allocation into steady-state retention per stream.
+	maxReusedRecord = 64 << 10
 )
 
 // ErrSealFailed is returned when a record does not authenticate. It is
@@ -255,17 +260,45 @@ func WriteRecord(w io.Writer, record []byte) error {
 	return writeAll(w, buf)
 }
 
-// ReadRecord reads a single length-prefixed record.
+// ReadRecord reads a single length-prefixed record into a fresh buffer. Use it
+// wherever the record outlives the next read — the handshake paths, which keep
+// the hello they read.
 func ReadRecord(r io.Reader) ([]byte, error) {
+	return ReadRecordInto(r, nil)
+}
+
+// ReadRecordInto reads a single length-prefixed record, reusing buf when it is
+// big enough and returning the buffer it used.
+//
+// The returned slice aliases buf, so it is valid only until the next call with
+// the same buffer. That suits a pump that hands each record straight to a Write
+// and is provably done with it. It saves one allocation per record, not the
+// record's cost: opening it still allocates the plaintext, which is what makes
+// SealedStream.ReadFrame safe to build on this at all.
+func ReadRecordInto(r io.Reader, buf []byte) ([]byte, error) {
 	var hdr [recordPrefixSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
-	n := binary.BigEndian.Uint32(hdr[:])
-	if n > MaxSealedRecord {
-		return nil, fmt.Errorf("sealed record length %d exceeds max %d", n, MaxSealedRecord)
+	// Bounded as a uint32 before any conversion to int: on a 32-bit build the
+	// conversion would wrap a large declared length negative, and a negative
+	// length reaches make and the reslice below as a panic rather than as the
+	// error this is here to return. relay/ is shared, so the peer that chooses
+	// this number is the one on the other end of the tunnel.
+	size := binary.BigEndian.Uint32(hdr[:])
+	if size > MaxSealedRecord {
+		return nil, fmt.Errorf("sealed record length %d exceeds max %d", size, MaxSealedRecord)
 	}
-	buf := make([]byte, n)
+	n := int(size)
+	if cap(buf) < n {
+		buf = make([]byte, n)
+	} else if buf == nil {
+		// cap(nil) is 0, so this is only reachable at n == 0 — where buf[:0]
+		// would stay nil and change what the allocating form has always
+		// returned for an empty record.
+		buf = []byte{}
+	}
+	buf = buf[:n]
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err
 	}
@@ -358,6 +391,19 @@ type SealedStream struct {
 	w    io.Writer
 	send *Sealer
 	recv *Sealer
+	// rbuf is ReadFrame's record buffer, reused across calls.
+	//
+	// Nothing a caller holds points into it: Open decrypts into a slice it
+	// allocates itself, and DecodeFrame slices that plaintext. That invariant
+	// is the whole basis for reusing this, so it has its own test — change
+	// Open to decrypt in place and TestReadFrameDataSurvivesTheNextRead is what
+	// says so.
+	//
+	// It grows to the largest record the peer has sent and is held for the life
+	// of the stream, so one large paste retains it. Capped for that reason: a
+	// terminal's steady state is keystrokes, and the reuse is worth having for
+	// those, not for holding a megabyte per idle connection.
+	rbuf []byte
 }
 
 // NewSealedStream builds the transport for one connection. sendKey seals what
@@ -388,9 +434,16 @@ func (s *SealedStream) WriteFrame(frame []byte) error {
 
 // ReadFrame reads one record, opens it, and decodes the frame inside.
 func (s *SealedStream) ReadFrame() (TermFrame, error) {
-	rec, err := ReadRecord(s.r)
+	rec, err := ReadRecordInto(s.r, s.rbuf)
 	if err != nil {
 		return TermFrame{}, err
+	}
+	// Keep it only if it is worth keeping. No else: a record too large to reuse
+	// leaves the previous buffer in place, which is never over the cap by
+	// construction, so the record after a paste does not have to allocate its
+	// way back up from nothing.
+	if cap(rec) <= maxReusedRecord {
+		s.rbuf = rec
 	}
 	plain, err := s.recv.Open(rec)
 	if err != nil {
