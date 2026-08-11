@@ -9,10 +9,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/nicodes/ormos/relay"
 )
 
@@ -165,6 +167,7 @@ type model struct {
 	conf  *confirmPrompt
 
 	status      Status
+	logs        []string          // tail of the agent's log ring, for the ACTIVITY pane
 	info        *relay.SystemInfo // system's own name/etc. from the relay
 	machine     string            // "<distro> - <host> - <goos>/<goarch>"
 	fingerprint string            // sealing-key fingerprint for out-of-band verification
@@ -175,11 +178,27 @@ type model struct {
 	width, height int
 }
 
+// activityLines is the most log lines the ACTIVITY pane will show. It shows
+// fewer when the rest of the dashboard needs the rows — see activityBudget.
+//
+// Small on purpose: these are the last few things that happened, not a log
+// viewer. The whole ring belongs to the agent, and `ormos` run without a TTY
+// prints every line to stderr.
+const activityLines = 6
+
 func newModel(d *system) model {
 	ti := textinput.New()
 	ti.Prompt = "› "
 	ti.CharLimit = 512
-	return model{d: d, status: d.Snapshot(), input: ti, live: map[int]bool{}, machine: machineName(), fingerprint: d.Fingerprint()}
+	return model{
+		d:           d,
+		status:      d.Snapshot(),
+		logs:        d.RecentLogs(activityLines),
+		input:       ti,
+		live:        map[int]bool{},
+		machine:     machineName(),
+		fingerprint: d.Fingerprint(),
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -238,6 +257,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		m.status = m.d.Snapshot()
+		m.logs = m.d.RecentLogs(activityLines)
 		m.live = m.status.Live
 		m.ticks++
 		// Fallback refresh (~10s) in case a pushed nudge was missed; the relay's
@@ -249,7 +269,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case projectsMsg:
 		if msg.err != nil {
-			m.err = "load: " + msg.err.Error()
+			m.err = sanitize("load: " + msg.err.Error())
 			return m, nil
 		}
 		// Clear it: every pane starts at once under `make dev`, so the first
@@ -257,14 +277,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// "connection refused" used to stay on screen for the rest of the
 		// session even though the very next poll succeeded.
 		m.err = ""
-		m.projects = msg.projects
+		m.projects = sanitizeProjects(msg.projects)
 		sort.SliceStable(m.projects, func(i, j int) bool { return m.projects[i].Name < m.projects[j].Name })
 		m.rebuildRows()
 		return m, nil
 
 	case systemInfoMsg:
 		if msg.err == nil && msg.info != nil {
-			m.info = msg.info
+			info := *msg.info
+			info.Name = sanitize(info.Name)
+			m.info = &info
 		}
 		return m, nil
 
@@ -274,10 +296,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case mutatedMsg:
 		if msg.err != nil {
-			m.err = msg.err.Error()
+			m.err = sanitize(msg.err.Error())
 		} else {
 			m.err = ""
-			m.notice = msg.ok
+			// Sanitised like m.err even though every ok string is an agent
+			// literal today: the two sit one line apart, and an asymmetry with
+			// no reason written down is one a future relay-derived notice
+			// inherits silently.
+			m.notice = sanitize(msg.ok)
 		}
 		// Refresh both the project list and system info (a rename changes the header).
 		return m, tea.Batch(m.refreshCmd(), m.infoCmd())
@@ -579,6 +605,18 @@ func (m model) View() string {
 	if s.Connected {
 		state = onStyle.Render("● connected")
 	}
+	// How many streams the relay currently has open against this machine. Every
+	// one of them is a shell or a connection to a local service, so "is anything
+	// happening on my machine right now" should be answerable from the header
+	// rather than by reading the activity pane.
+	// Always, including zero: "nothing is happening" and "this field is not
+	// rendered" must not look the same, and an unbalanced addSession showing a
+	// negative should be visible rather than hidden.
+	if s.Sessions == 1 {
+		state += labelStyle.Render("  1 session")
+	} else {
+		state += labelStyle.Render(fmt.Sprintf("  %d sessions", s.Sessions))
+	}
 
 	name := "ormos system"
 	if m.info != nil && m.info.Name != "" {
@@ -589,7 +627,7 @@ func (m model) View() string {
 	// agent can be paired to any account, and a terminal here is a shell on this
 	// box, so "who is this connected as" should never need looking up.
 	head := titleStyle.Render("ormos")
-	if email := m.d.cfg.Email; email != "" {
+	if email := sanitize(m.d.cfg.Email); email != "" {
 		head += "  " + labelStyle.Render(email)
 	}
 	b.WriteString(head + "   " + state + "\n\n")
@@ -603,6 +641,16 @@ func (m model) View() string {
 	}
 	b.WriteString(nameCursor + labelStyle.Render("name     ") + nameVal + "\n")
 	b.WriteString("  " + labelStyle.Render("machine  ") + m.machine + "\n")
+	// Which relay this agent is talking to. ORMOS_API_URL and the saved config
+	// can each set it, so "connected to what" is worth stating outright rather
+	// than leaving to be inferred from a connect line in the activity pane.
+	// Sanitised like everything else on this screen. checkRelayTransport does
+	// not parse the URL, so an ORMOS_API_URL carrying an escape sequence would
+	// otherwise reach the alt screen intact. It is the operator's own
+	// environment rather than the relay's, which is why it is here rather than
+	// at a boundary — but the point of sanitising at all is that no site has to
+	// be remembered, and this line was the sixth.
+	b.WriteString("  " + labelStyle.Render("relay    ") + sanitize(s.RelayURL) + "\n")
 	// The sealing-key fingerprint, for out-of-band verification against the app:
 	// if the two do not match, a relay has swapped the key.
 	b.WriteString("  " + labelStyle.Render("sealing  ") + m.fingerprint + hintStyle.Render("  verify in app") + "\n\n")
@@ -657,7 +705,9 @@ func (m model) View() string {
 			b.WriteString(cursor + label + "\n")
 		}
 	}
-	body := strings.TrimRight(b.String(), "\n")
+
+	// Clipped as a block, so the line count below is also the ROW count.
+	body := clipLines(strings.TrimRight(b.String(), "\n"), m.width)
 
 	// Footer: input wizard, confirm prompt, or key hints — fenced from the body
 	// by a full-width divider and pinned to the bottom of the terminal.
@@ -690,16 +740,38 @@ func (m model) View() string {
 		hints += " · L sign out · q quit"
 		f.WriteString(hintStyle.Render(hints))
 	}
-	// Status line: last error or success notice, under the hints.
+	// Status line: last error or success notice, under the hints. Both are
+	// sanitised where they are ASSIGNED rather than here — one place per
+	// string, so there is no asymmetry for a future field to inherit.
 	if m.err != "" {
 		f.WriteString("\n" + errStyle.Render("✗ "+m.err))
 	} else if m.notice != "" {
 		f.WriteString("\n" + noticeStyle.Render("✓ "+m.notice))
 	}
-	footer := divider(m.width) + "\n" + f.String()
+	footer := clipLines(divider(m.width)+"\n"+f.String(), m.width)
 
-	// Pin the footer to the bottom when the body fits; otherwise let it follow
-	// the content so nothing is clipped on a short terminal.
+	// ACTIVITY: the tail of the agent's log ring, rendered last and given only
+	// the rows nothing above it needed. Headless mode echoes every line to
+	// stderr; the dashboard owns the whole screen, so without this pane a
+	// tunnel that will not connect shows as "offline" and nothing else — the
+	// reason goes to a ring the operator has no way to look at.
+	if n := m.activityBudget(body, footer); n > 0 {
+		var a strings.Builder
+		a.WriteString(body + "\n\n" + sectionStyle.Render("ACTIVITY") + "\n")
+		for _, line := range m.logs[len(m.logs)-n:] {
+			// Sanitised because part of the ring is relay-influenced and an
+			// escape sequence must never reach the terminal. The width is
+			// handled by clipLines below, with every other row.
+			a.WriteString("  " + hintStyle.Render(sanitize(line)) + "\n")
+		}
+		body = clipLines(strings.TrimRight(a.String(), "\n"), m.width)
+	}
+
+	// Pin the footer to the bottom when the body fits. When it does not, the
+	// view goes out over-tall and Bubble Tea keeps its LAST height rows — so
+	// the TOP of the body is what is lost, not the footer. That is what
+	// activityBudget exists to stop the pane from causing; a project list long
+	// enough to overflow on its own still does it.
 	if m.width > 0 && m.height > 0 {
 		if avail := m.height - lipgloss.Height(footer); avail >= 1 && lipgloss.Height(body) <= avail {
 			return lipgloss.Place(m.width, avail, lipgloss.Left, lipgloss.Top, body) + "\n" + footer
@@ -722,13 +794,119 @@ func portSummary(p relay.ProjectInfo, live map[int]bool) string {
 	return fmt.Sprintf("%d ports · %d live", len(p.Ports), liveN)
 }
 
-// pad right-pads (or truncates with an ellipsis) s to width w for column layout.
-func pad(s string, w int) string {
-	if len(s) > w {
-		if w <= 1 {
-			return s[:w]
-		}
-		return s[:w-1] + "…"
+// activityBudget returns how many log lines the ACTIVITY pane may draw.
+//
+// The pane is the last thing on the screen and the first thing that should give
+// way. Everything above it is worth more than a sixth line of history — the
+// connection state, the account this machine is paired to, and the sealing
+// fingerprint the user reads against the app to catch a relay that swapped the
+// key. And an over-tall view does not scroll: Bubble Tea's renderer keeps the
+// LAST height rows, so it deletes the header rather than the oldest log line.
+// Unbudgeted, four projects were enough to push the whole SYSTEM block off an
+// 80x24 terminal.
+//
+// A height of zero means no WindowSizeMsg has arrived yet, so there is nothing
+// to budget against; the pane draws at full size and the first resize corrects
+// it.
+func (m model) activityBudget(body, footer string) int {
+	if m.height <= 0 {
+		// No WindowSizeMsg yet, so there is nothing to budget against: draw
+		// what there is and let the first resize correct it.
+		return min(activityLines, len(m.logs))
 	}
-	return s + strings.Repeat(" ", w-len(s))
+	// The pane costs a blank separator and a heading before any log line, and
+	// it can never draw more lines than the ring has.
+	avail := m.height - lipgloss.Height(body) - lipgloss.Height(footer) - 2
+	return min(max(avail, 0), activityLines, len(m.logs))
+}
+
+// sanitizeProjects copies the relay's project list with every string it chose
+// stripped of control characters.
+//
+// At the boundary, not at each render site: the names and directories here are
+// painted in five places, and a sanitiser applied per site is one someone
+// forgets at the sixth. Everything downstream of this inherits it.
+func sanitizeProjects(in []relay.ProjectInfo) []relay.ProjectInfo {
+	out := make([]relay.ProjectInfo, len(in))
+	for i, p := range in {
+		p.Name = sanitize(p.Name)
+		p.RootDir = sanitize(p.RootDir)
+		ports := make([]relay.PortEntry, len(p.Ports))
+		for j, pt := range p.Ports {
+			pt.Label = sanitize(pt.Label)
+			ports[j] = pt
+		}
+		p.Ports = ports
+		out[i] = p
+	}
+	return out
+}
+
+// sanitize strips anything unprintable from text before it is painted into the
+// terminal.
+//
+// Most of what reaches this screen is chosen by the relay: the system name, the
+// project names and root directories, the port labels, and — inside "relay
+// returned %s" — an HTTP reason phrase, which Go does not sanitise either.
+// Painted raw into the alt screen, a relay could set the window title, clear
+// the display, move the cursor, or paint a convincing line of its own — from a
+// pane whose whole purpose is to tell the operator the truth about their
+// machine. A newline is dropped for a second reason: it would add a full-width
+// row and make the pane's height depend on what the relay sent.
+func sanitize(s string) string {
+	return strings.Map(func(r rune) rune {
+		if !unicode.IsPrint(r) {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// clipLines caps every line in s at w columns, so a block's line count is also
+// its ROW count.
+//
+// lipgloss.Height counts newlines, not the rows a terminal will use, and
+// lipgloss.Place pads every line out to the width of the widest one — so one
+// over-wide row inflates the whole block, and the budget above is then computed
+// against a number that no longer describes the screen. A single long project
+// name was enough to turn a 24-line view into 41 rows; since Bubble Tea keeps
+// the LAST height rows, what falls off the top is the header and the sealing
+// fingerprint. Clipping every row is what makes lipgloss.Height honest.
+func clipLines(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = clip(line, w)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// clip shortens s to at most w display columns, marking the cut with an
+// ellipsis. A width of zero or less means the terminal size is not known yet
+// (no WindowSizeMsg has arrived), in which case nothing is clipped.
+//
+// Columns, not bytes: "→→→→→→→→→→" is ten columns and thirty bytes, so slicing
+// by length both truncated lines that fitted and cut runes in half, producing
+// invalid UTF-8 on screen.
+func clip(s string, w int) string {
+	if w <= 0 {
+		return s
+	}
+	return ansi.Truncate(s, w, "…")
+}
+
+// pad right-pads s to w display columns, truncating with an ellipsis when it is
+// too long, for column layout. Width-aware for the same reason clip is: these
+// are project names and root directories, which are the user's own text.
+func pad(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	s = ansi.Truncate(s, w, "…")
+	if gap := w - ansi.StringWidth(s); gap > 0 {
+		return s + strings.Repeat(" ", gap)
+	}
+	return s
 }

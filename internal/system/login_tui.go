@@ -63,8 +63,16 @@ func (m loginModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case loginCodeMsg:
-		m.code = msg.start.UserCode
-		m.url = msg.start.VerificationURL
+		// Sanitised at the boundary, like every other relay string that reaches
+		// a screen. This one matters more than most: the pairing screen owns
+		// the whole terminal, it runs before any token exists, and its entire
+		// job is telling the operator which code to trust — so a relay that
+		// could paint over it would be forging exactly the thing being
+		// verified. stripCtl is not enough here; it drops C0 and DEL and
+		// leaves C1 and the Cf format characters, which is why this uses
+		// sanitize.
+		m.code = sanitize(msg.start.UserCode)
+		m.url = sanitize(msg.start.VerificationURL)
 		m.expiresIn = msg.start.ExpiresIn
 		// Start the countdown exactly once; a re-issued code just resets the
 		// number the single ticker is counting down.
@@ -99,7 +107,9 @@ func (m loginModel) View() string {
 			title,
 			"",
 			"Open " + link + " and enter the code:",
-			selStyle.Render(m.code),
+			// Clipped for the same reason the dashboard clips: the relay picks
+			// this string's length as well as its content.
+			selStyle.Render(clip(m.code, m.width)),
 			hintStyle.Render(fmt.Sprintf("expires in %d seconds", m.expiresIn)),
 		}, "\n")
 	}
