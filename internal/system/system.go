@@ -91,11 +91,6 @@ func newSystem(cfg systemConfig) *system {
 
 	// The terminal key, for the same reason and in the same way: an agent
 	// without one cannot seal a frame, and must not start pretending it can.
-	//
-	// This was the missing half of the sealing work -- loadOrCreateKey was
-	// written and never called, so d.key was nil and every connect dereferenced
-	// it. Both users of the key would have failed: publishing the public half on
-	// the handshake, and deriving session keys in terminal_sessions.go.
 	k, warnings, err := loadOrCreateKey()
 	// Warnings first, and even on the error path: "the key was world-readable"
 	// is the most important thing that happened here, and it must not be lost
