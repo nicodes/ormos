@@ -57,13 +57,37 @@ State lives under `~/.config/ormos/`:
 | File | Purpose |
 | --- | --- |
 | `config.json` | Pairing token and system identity; mode `0600` |
-| `key` | Long-lived terminal sealing key; mode `0600` |
+| `identity.key` | Long-lived terminal sealing key; mode `0600` |
 | `policy.json` | Optional restrictions enforced by this machine |
 | `sessions.log` | Local JSON-lines audit trail of relay requests |
 
 `--config /some/path/config.json` moves all four files into that config file's
 directory, which is useful for keeping development and production pairings
 separate.
+
+Whenever the agent reads `config.json` or `identity.key` it re-checks what it
+finds there, so a copy restored from a backup or loosened by a stray `chmod`
+does not quietly stay readable by other local users:
+
+- group and other permission bits are cleared from the file, and from
+  `~/.config/ormos` itself — a writable state directory would let another local
+  user replace these files rather than read them;
+- a symbolic link at either path is refused rather than followed. If you keep
+  `config.json` in a dotfiles repo, point `--config` at the real file instead of
+  symlinking it into place — a link is now a startup error, not a warning;
+- a named pipe or directory at either path is refused too, rather than blocking
+  the agent forever on an open that never returns;
+- a file owned by another user is refused outright. Adopting a planted
+  `identity.key` would publish the planter's public key as this machine's and
+  seal every terminal to a key they hold.
+
+A correction to either file is reported on startup, because tightening a mode
+does not undo the exposure. For `identity.key` the seal has no forward secrecy,
+so whoever read it can decrypt captured traffic from past sessions and the only
+real remedy is regenerating the key. For `config.json` the pairing token in it
+is a bearer credential, so the remedy is signing out and pairing again.
+
+Owner bits are left as they are, so a key deliberately made `0400` stays `0400`.
 
 An optional policy can limit what the relay may ask this machine to do:
 
