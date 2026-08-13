@@ -14,8 +14,14 @@
 # breaking-change boundary.
 version: 2
 updates:
+  # The workflows at /.github/workflows AND the composite actions at
+  # /.github/actions/* -- each action.yml pins its own `uses:` refs, and the
+  # default `directory: /` scan would not look inside them. `directories`
+  # with a glob covers every composite action without naming them one by one.
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: weekly
     groups:
