@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/nicodes/ormos/relay"
 )
 
 // The agent does whatever the relay asks: open a stream marked "terminal" and it
@@ -134,7 +136,7 @@ var sensitivePorts = map[int]bool{
 // thought about it, and it keeps the worst case (ssh, the databases) off the
 // table without breaking the ordinary one (a dev server on 3000).
 func (p policy) proxyAllowed(port int) (bool, string) {
-	if port < 1 || port > 65535 {
+	if !relay.ValidPort(port) {
 		return false, "port out of range"
 	}
 	for _, denied := range p.DeniedPorts {

@@ -348,7 +348,7 @@ func (d *system) cachedPortConfigured(port int) bool {
 // A failed fetch falls back to the last list this agent successfully retrieved,
 // and denies when it has never retrieved one.
 func (d *system) proxyPortAllowed(port int) bool {
-	if port < 1 || port > 65535 {
+	if !relay.ValidPort(port) {
 		return false
 	}
 	if d.cachedPortConfigured(port) {
@@ -576,7 +576,7 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 			// Published on every connect rather than once at pairing, so an
 			// agent whose key is new — or which predates sealing — starts
 			// working again by reconnecting instead of being re-paired.
-			publicKeyHeader: {encodePublicKey(d.key)},
+			relay.PublicKeyHeader: {encodePublicKey(d.key)},
 		},
 	})
 	if err != nil {
