@@ -35,6 +35,15 @@ jobs:
       # action gives, without taking on another third-party action to lint the
       # others. shellcheck is already on the runner; actionlint finds it and
       # runs it over every `run:` block.
+      #
+      # This curl is a DECISION, not an oversight. Dependabot cannot watch a
+      # curl'd binary, and the fix that would make it watchable does not
+      # exist: rhysd/actionlint shipped a GitHub Action once, but no
+      # action.yml exists in the repository at v1.7.x -- upstream's own docs
+      # recommend this same download-and-run recipe. A wrapper action would
+      # add a third party to the trust path to gain the dependabot entry.
+      # So the pin moves by hand, in lockstep across the three ormos repos,
+      # and the sha256 line is what makes the moving tag irrelevant.
       - name: Install actionlint
         shell: bash
         run: |
