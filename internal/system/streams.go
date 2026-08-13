@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nicodes/ormos/relay"
@@ -177,6 +178,36 @@ func (p progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// proxyIdleDeadline owns the ONE idle deadline shared by both ends of a proxy
+// pipe. A reset is a two-connection transaction: calculate the deadline and
+// update both conns while holding mu. net.Conn only promises each SetDeadline
+// call is concurrency-safe; without this serialization, an older reset could
+// set stream, pause, a newer reset could advance both, then the older one could
+// resume and move local backwards — timing out a healthy preview before the
+// latest byte's full idle budget elapsed.
+type proxyIdleDeadline struct {
+	mu      sync.Mutex
+	conns   [2]net.Conn
+	timeout time.Duration
+	now     func() time.Time
+}
+
+func newProxyIdleDeadline(timeout time.Duration, a, b net.Conn) *proxyIdleDeadline {
+	return &proxyIdleDeadline{conns: [2]net.Conn{a, b}, timeout: timeout, now: time.Now}
+}
+
+func (d *proxyIdleDeadline) reset() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Deliberately inside the lock: a deadline calculated before waiting for
+	// another reset would already be stale when it was eventually installed.
+	deadline := d.now().Add(d.timeout)
+	for _, conn := range d.conns {
+		_ = conn.SetDeadline(deadline)
+	}
+}
+
 // handleProxy dials a local TCP port and pipes raw bytes both ways.
 func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
 	d.addSession(1)
@@ -230,17 +261,13 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
 	// the slot and the local socket, while a pipe that is merely quiet between
 	// bursts keeps both. Read-side progress alone suffices — every byte
 	// transferred passes through exactly one of the two Reads.
-	reset := func() {
-		deadline := time.Now().Add(proxyIdleTO)
-		_ = stream.SetDeadline(deadline)
-		_ = local.SetDeadline(deadline)
-	}
-	reset()
+	idle := newProxyIdleDeadline(proxyIdleTO, stream, local)
+	idle.reset()
 
 	done := make(chan struct{}, 2)
 	// stream -> local (use buffered reader from header parse).
-	go func() { io.Copy(local, progressReader{br, reset}); done <- struct{}{} }()
+	go func() { io.Copy(local, progressReader{br, idle.reset}); done <- struct{}{} }()
 	// local -> stream.
-	go func() { io.Copy(stream, progressReader{local, reset}); done <- struct{}{} }()
+	go func() { io.Copy(stream, progressReader{local, idle.reset}); done <- struct{}{} }()
 	<-done
 }
