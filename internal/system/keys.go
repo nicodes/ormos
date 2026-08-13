@@ -104,15 +104,6 @@ func loadOrCreateKey() (*ecdh.PrivateKey, []string, error) {
 	return key, warnings, nil
 }
 
-// publicKeyHeader is how the agent publishes its public key: on the tunnel
-// handshake, every connect, rather than once at pairing.
-//
-// Sending it every time means an agent that predates this — or one whose key
-// was regenerated — starts working again by reconnecting, instead of needing to
-// be re-paired. The server stores whatever the pairing token's owner sends,
-// which is exactly the authority that already controls the record.
-const publicKeyHeader = "X-Ormos-Public-Key"
-
 // encodePublicKey renders a public key for the handshake header.
 func encodePublicKey(key *ecdh.PrivateKey) string {
 	return base64.StdEncoding.EncodeToString(key.PublicKey().Bytes())
