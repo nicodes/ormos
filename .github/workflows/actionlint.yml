@@ -38,12 +38,14 @@ jobs:
       #
       # This curl is a DECISION, not an oversight. Dependabot cannot watch a
       # curl'd binary, and the fix that would make it watchable does not
-      # exist: rhysd/actionlint shipped a GitHub Action once, but no
-      # action.yml exists in the repository at v1.7.x -- upstream's own docs
-      # recommend this same download-and-run recipe. A wrapper action would
-      # add a third party to the trust path to gain the dependabot entry.
-      # So the pin moves by hand, in lockstep across the three ormos repos,
-      # and the sha256 line is what makes the moving tag irrelevant.
+      # exist: rhysd/actionlint has never shipped a GitHub Action -- no
+      # action.yml exists at any tag back to v1.0.0, or anywhere in the
+      # repository's commit history -- and upstream's own docs recommend this
+      # same download-and-run recipe. Third-party wrapper actions exist, but
+      # one of those would add a party to the trust path to gain the
+      # dependabot entry. So the pin moves by hand, in lockstep across the
+      # three ormos repos, and the sha256 line is what makes the moving tag
+      # irrelevant.
       - name: Install actionlint
         shell: bash
         run: |
