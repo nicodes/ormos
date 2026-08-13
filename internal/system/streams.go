@@ -62,7 +62,8 @@ func expandRelayCwd(p string) (string, error) {
 func (d *system) serveStream(stream net.Conn) {
 	defer stream.Close()
 	// The deadline covers only the header; a stream that has announced itself
-	// gets its handler's own pacing (or none, for a proxy pipe).
+	// gets its handler's own pacing (the terminal handshake's deadline, the
+	// proxy pipe's idle bound).
 	_ = stream.SetReadDeadline(time.Now().Add(headerReadTO))
 	header, br, err := relay.ReadHeader(stream)
 	_ = stream.SetReadDeadline(time.Time{})
@@ -71,8 +72,6 @@ func (d *system) serveStream(stream net.Conn) {
 		return
 	}
 	switch header.Kind {
-	case relay.KindPing:
-		io.Copy(stream, br) // echo until closed
 	case relay.KindTerminal:
 		d.handleTerminal(stream, br, header)
 	case relay.KindProxy:
@@ -148,8 +147,38 @@ func writeProxyError(w io.Writer, status proxyStatus, body string) {
 		"Content-Length: %d\r\nConnection: close\r\n\r\n%s", status, len(body), body)
 }
 
+// proxyIdleTO bounds how long a proxy pipe may sit without a byte moving in
+// either direction. handleProxy holds a stream slot (relay.MaxTunnelStreams)
+// and a local TCP connection until one side closes, and a relay that passed
+// the policy checks — a compromised one is in the threat model — could hold
+// both forever by simply saying nothing. A fixed deadline would kill the
+// legitimate case: a proxy pipe is honestly long-lived (a previewed app's
+// WebSocket, a sparse event stream), so the bound is an IDLE one that resets
+// on every byte transferred. Five minutes of silence is what no healthy pipe
+// does: the relay's own transport retires idle pooled connections at 30s, so
+// an ordinary preview request never comes close, and a browser EventSource or
+// HMR socket reconnects on its own if a genuinely quiet connection is
+// dropped. A var so tests can shrink it.
+var proxyIdleTO = 5 * time.Minute
+
+// progressReader calls onProgress after every successful read, so a byte
+// moving in either direction of a pipe re-arms the pipe's shared idle
+// deadline.
+type progressReader struct {
+	r          io.Reader
+	onProgress func()
+}
+
+func (p progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.onProgress()
+	}
+	return n, err
+}
+
 // handleProxy dials a local TCP port and pipes raw bytes both ways.
-func (d *system) handleProxy(stream io.ReadWriteCloser, br io.Reader, port int) {
+func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
 	d.addSession(1)
 	defer d.addSession(-1)
 
@@ -196,10 +225,22 @@ func (d *system) handleProxy(stream io.ReadWriteCloser, br io.Reader, port int) 
 	d.logf("proxy session -> :%d", port)
 	defer d.logf("proxy session closed (:%d)", port)
 
+	// One shared idle deadline over both ends, re-armed by every byte that
+	// moves in either direction: a peer that has stopped making progress loses
+	// the slot and the local socket, while a pipe that is merely quiet between
+	// bursts keeps both. Read-side progress alone suffices — every byte
+	// transferred passes through exactly one of the two Reads.
+	reset := func() {
+		deadline := time.Now().Add(proxyIdleTO)
+		_ = stream.SetDeadline(deadline)
+		_ = local.SetDeadline(deadline)
+	}
+	reset()
+
 	done := make(chan struct{}, 2)
 	// stream -> local (use buffered reader from header parse).
-	go func() { io.Copy(local, br); done <- struct{}{} }()
+	go func() { io.Copy(local, progressReader{br, reset}); done <- struct{}{} }()
 	// local -> stream.
-	go func() { io.Copy(stream, local); done <- struct{}{} }()
+	go func() { io.Copy(stream, progressReader{local, reset}); done <- struct{}{} }()
 	<-done
 }
