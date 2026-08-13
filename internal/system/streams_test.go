@@ -103,17 +103,24 @@ func TestServeStreamDropsHeaderlessStream(t *testing.T) {
 }
 
 // The deadline covers the header only: a stream that announced itself
-// promptly must keep working past it (a proxy pipe has no pacing of its own).
+// promptly must keep working past it — a proxy pipe's only pacing after the
+// header is the idle bound, which bytes must keep resetting.
 func TestServeStreamClearsHeaderDeadline(t *testing.T) {
 	prev := headerReadTO
 	headerReadTO = 150 * time.Millisecond
 	t.Cleanup(func() { headerReadTO = prev })
 
+	withTempConfigDir(t)
+	port := echoServer(t)
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+
 	agent, client := net.Pipe()
 	defer client.Close()
-	d := &system{}
-	go d.serveStream(agent) // KindPing echoes until closed
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindPing}); err != nil {
+	go d.serveStream(agent)
+	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * headerReadTO)
@@ -122,11 +129,114 @@ func TestServeStreamClearsHeaderDeadline(t *testing.T) {
 	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, len(msg))
 	if _, err := io.ReadFull(client, buf); err != nil {
-		t.Fatalf("ping echo after the header deadline: %v", err)
+		t.Fatalf("proxy pipe after the header deadline: %v", err)
 	}
 	if string(buf) != string(msg) {
 		t.Fatalf("echo = %q, want %q", buf, msg)
 	}
+}
+
+// The same hole #211 closed in the terminal handshake, on the last dispatch
+// target that still had it: a relay that passes the policy checks could open
+// a proxy stream, send the header, and then say nothing, pinning a stream
+// slot and a local socket for as long as the agent runs. With the idle bound
+// the pipe is dropped and both are freed. Proved by pinning, per the standard
+// in #211: without the bound this never returns.
+func TestProxyPipeDropsASilentPeer(t *testing.T) {
+	prev := proxyIdleTO
+	proxyIdleTO = 150 * time.Millisecond
+	t.Cleanup(func() { proxyIdleTO = prev })
+
+	withTempConfigDir(t)
+	port := echoServer(t)
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		d.serveStream(agent)
+		close(done)
+	}()
+	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+		t.Fatal(err)
+	}
+	// ...and then nothing, ever.
+	start := time.Now()
+	select {
+	case <-done:
+		// Bounded both ways: returning EARLY would mean something other than
+		// the idle bound ended the pipe, and a future guard placed before the
+		// copies would keep this green with the bound gone.
+		if elapsed := time.Since(start); elapsed < proxyIdleTO {
+			t.Fatalf("the pipe ended after %s, before the idle bound; it was not the bound that dropped it", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a proxy pipe whose peer went silent was not dropped")
+	}
+}
+
+// The other half, and the one that fails as a user-visible disconnect rather
+// than as a red test: the bound must RESET on transferred bytes, not run from
+// when the pipe opened. A proxy pipe is honestly long-lived — a previewed
+// app's WebSocket, a sparse event stream — so a pipe with traffic every
+// proxyIdleTO/2 must still be alive after four idle bounds.
+func TestProxyPipeResetsItsIdleDeadlineOnBytes(t *testing.T) {
+	prev := proxyIdleTO
+	proxyIdleTO = 150 * time.Millisecond
+	t.Cleanup(func() { proxyIdleTO = prev })
+
+	withTempConfigDir(t)
+	port := echoServer(t)
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	go d.serveStream(agent)
+	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
+	deadline := time.Now().Add(4 * proxyIdleTO)
+	for time.Now().Before(deadline) {
+		if _, err := client.Write([]byte("x")); err != nil {
+			t.Fatalf("a busy pipe was dropped inside the idle bound: %v", err)
+		}
+		if _, err := io.ReadFull(client, make([]byte, 1)); err != nil {
+			t.Fatalf("echo on a busy pipe: %v", err)
+		}
+		time.Sleep(proxyIdleTO / 2)
+	}
+}
+
+// echoServer stands up a loopback TCP echoer and returns its port: the local
+// end a proxy pipe test dials, with an answer for whatever it is sent.
+func echoServer(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}()
+		}
+	}()
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 // The threat model includes a compromised relay. Such a relay could open a
