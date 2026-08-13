@@ -157,8 +157,12 @@ port list is an additional check, not a replacement for local policy.
 The agent holds a per-system pairing token and an X25519 terminal key. Terminal
 frames are sealed end to end between the browser and agent; the relay carries
 the ciphertext but cannot read terminal contents. Port-preview traffic is
-proxied in plaintext at the relay because HTTP responses must be rewritten and
-served to the browser.
+proxied in plaintext at the relay, and this is structural, not a missing
+feature: the server terminates TLS to the browser's iframe, so it must hand
+over plaintext however the bytes arrived from the agent. Terminals can be
+sealed because xterm.js is JavaScript running in the page and can hold a key;
+an iframe has no such hook — the browser's own HTTP stack loads the document
+and its sub-resources.
 
 A compromised or malicious relay can still request shells and local
 connections within the limits of `policy.json`. Run the agent as an
