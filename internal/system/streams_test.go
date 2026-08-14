@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,17 +104,24 @@ func TestServeStreamDropsHeaderlessStream(t *testing.T) {
 }
 
 // The deadline covers the header only: a stream that announced itself
-// promptly must keep working past it (a proxy pipe has no pacing of its own).
+// promptly must keep working past it — a proxy pipe's only pacing after the
+// header is the idle bound, which bytes must keep resetting.
 func TestServeStreamClearsHeaderDeadline(t *testing.T) {
 	prev := headerReadTO
 	headerReadTO = 150 * time.Millisecond
 	t.Cleanup(func() { headerReadTO = prev })
 
+	withTempConfigDir(t)
+	port := echoServer(t)
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+
 	agent, client := net.Pipe()
 	defer client.Close()
-	d := &system{}
-	go d.serveStream(agent) // KindPing echoes until closed
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindPing}); err != nil {
+	go d.serveStream(agent)
+	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * headerReadTO)
@@ -122,11 +130,259 @@ func TestServeStreamClearsHeaderDeadline(t *testing.T) {
 	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, len(msg))
 	if _, err := io.ReadFull(client, buf); err != nil {
-		t.Fatalf("ping echo after the header deadline: %v", err)
+		t.Fatalf("proxy pipe after the header deadline: %v", err)
 	}
 	if string(buf) != string(msg) {
 		t.Fatalf("echo = %q, want %q", buf, msg)
 	}
+}
+
+// The same hole #211 closed in the terminal handshake, on the last dispatch
+// target that still had it: a relay that passes the policy checks could open
+// a proxy stream, send the header, and then say nothing, pinning a stream
+// slot and a local socket for as long as the agent runs. With the idle bound
+// the pipe is dropped and both are freed. Proved by pinning, per the standard
+// in #211: without the bound this never returns.
+func TestProxyPipeDropsASilentPeer(t *testing.T) {
+	prev := proxyIdleTO
+	proxyIdleTO = 150 * time.Millisecond
+	t.Cleanup(func() { proxyIdleTO = prev })
+
+	withTempConfigDir(t)
+	port := echoServer(t)
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		d.serveStream(agent)
+		close(done)
+	}()
+	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+		t.Fatal(err)
+	}
+	// ...and then nothing, ever.
+	start := time.Now()
+	select {
+	case <-done:
+		// Bounded both ways: returning EARLY would mean something other than
+		// the idle bound ended the pipe, and a future guard placed before the
+		// copies would keep this green with the bound gone.
+		if elapsed := time.Since(start); elapsed < proxyIdleTO {
+			t.Fatalf("the pipe ended after %s, before the idle bound; it was not the bound that dropped it", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a proxy pipe whose peer went silent was not dropped")
+	}
+}
+
+// The other half, and the one that fails as a user-visible disconnect rather
+// than as a red test: the bound must RESET on transferred bytes, not run from
+// when the pipe opened. A proxy pipe is honestly long-lived — a previewed
+// app's WebSocket, a sparse event stream — so a pipe with traffic every
+// proxyIdleTO/2 must still be alive after four idle bounds.
+func TestProxyPipeResetsItsIdleDeadlineOnBytes(t *testing.T) {
+	prev := proxyIdleTO
+	proxyIdleTO = 150 * time.Millisecond
+	t.Cleanup(func() { proxyIdleTO = prev })
+
+	withTempConfigDir(t)
+	port := echoServer(t)
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	go d.serveStream(agent)
+	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
+	deadline := time.Now().Add(4 * proxyIdleTO)
+	for time.Now().Before(deadline) {
+		if _, err := client.Write([]byte("x")); err != nil {
+			t.Fatalf("a busy pipe was dropped inside the idle bound: %v", err)
+		}
+		if _, err := io.ReadFull(client, make([]byte, 1)); err != nil {
+			t.Fatalf("echo on a busy pipe: %v", err)
+		}
+		time.Sleep(proxyIdleTO / 2)
+	}
+}
+
+// One-way traffic is progress too: an SSE response or a WebSocket whose
+// server is the only side currently speaking must re-arm BOTH ends of the
+// pipe. No client payload follows the stream header here; repeated bytes from
+// the local service alone keep the pipe alive past four idle bounds.
+func TestProxyPipeOneWayTrafficResetsItsIdleDeadline(t *testing.T) {
+	prev := proxyIdleTO
+	proxyIdleTO = 150 * time.Millisecond
+	t.Cleanup(func() { proxyIdleTO = prev })
+
+	withTempConfigDir(t)
+	port := pulseServer(t, proxyIdleTO/2)
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	go d.serveStream(agent)
+	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	deadline := time.Now().Add(4 * proxyIdleTO)
+	for time.Now().Before(deadline) {
+		if _, err := io.ReadFull(client, make([]byte, 1)); err != nil {
+			t.Fatalf("one-way traffic did not keep the proxy pipe alive: %v", err)
+		}
+	}
+}
+
+// A reset is shared state across TWO conns, not two independent safe calls.
+// Hold the first reset halfway through (stream advanced, local not yet), launch
+// a concurrent reset, and prove the lock covers the complete operation. Once
+// released, the second reset calculates a later deadline and leaves BOTH conns
+// at it. Without serialization the old activity can resume last and overwrite
+// local with its stale deadline.
+func TestProxyIdleDeadlineSerializesConcurrentResets(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	times := make(chan time.Time, 2)
+	times <- base
+	times <- base.Add(time.Minute)
+
+	stream := &deadlineConn{}
+	localEntered := make(chan struct{})
+	releaseLocal := make(chan struct{})
+	local := &deadlineConn{beforeFirstSet: func() {
+		close(localEntered)
+		<-releaseLocal
+	}}
+	idle := newProxyIdleDeadline(5*time.Minute, stream, local)
+	idle.now = func() time.Time { return <-times }
+
+	firstDone := make(chan struct{})
+	go func() {
+		idle.reset()
+		close(firstDone)
+	}()
+	<-localEntered // first reset is halfway through its two-conn transaction
+
+	// The mutex must remain held until local receives the same deadline.
+	if idle.mu.TryLock() {
+		idle.mu.Unlock()
+		t.Fatal("the shared reset lock was released between the two SetDeadline calls")
+	}
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		idle.reset()
+		close(secondDone)
+	}()
+	<-secondStarted
+	close(releaseLocal)
+	<-firstDone
+	<-secondDone
+
+	want := base.Add(time.Minute + 5*time.Minute)
+	if got := stream.deadline(); !got.Equal(want) {
+		t.Fatalf("stream deadline = %s, want latest activity deadline %s", got, want)
+	}
+	if got := local.deadline(); !got.Equal(want) {
+		t.Fatalf("local deadline = %s, want latest activity deadline %s", got, want)
+	}
+}
+
+// deadlineConn is the smallest controllable net.Conn for the concurrent-reset
+// test. Only SetDeadline is called; embedding net.Conn supplies the rest of the
+// interface without pretending those methods participate in the test.
+type deadlineConn struct {
+	net.Conn
+	mu             sync.Mutex
+	set            time.Time
+	sets           int
+	beforeFirstSet func()
+}
+
+func (c *deadlineConn) SetDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.sets++
+	first := c.sets == 1
+	hook := c.beforeFirstSet
+	c.mu.Unlock()
+	if first && hook != nil {
+		hook()
+	}
+	c.mu.Lock()
+	c.set = deadline
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *deadlineConn) deadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.set
+}
+
+// echoServer stands up a loopback TCP echoer and returns its port: the local
+// end a proxy pipe test dials, with an answer for whatever it is sent.
+func echoServer(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}()
+		}
+	}()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+// pulseServer writes one byte at interval for as long as its client remains
+// connected; it never reads, making the test traffic strictly one-way.
+func pulseServer(t *testing.T, interval time.Duration) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if _, err := c.Write([]byte("x")); err != nil {
+				return
+			}
+		}
+	}()
+	return l.Addr().(*net.TCPAddr).Port
 }
 
 // The threat model includes a compromised relay. Such a relay could open a
