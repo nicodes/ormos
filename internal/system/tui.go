@@ -483,7 +483,7 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if f.numeric && val != "" {
 			n, err := strconv.Atoi(val)
-			if err != nil || n < 1 || n > 65535 {
+			if err != nil || !relay.ValidPort(n) {
 				m.err = "port must be a number 1-65535"
 				return m, nil
 			}

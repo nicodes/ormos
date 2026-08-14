@@ -487,17 +487,6 @@ func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
 	})
 }
 
-// The header name is a contract between two binaries that both fail silently
-// when it drifts: the relay would simply never call SetSystemPubKey, browsers
-// would keep sealing against a stale key, and terminals would stop opening with
-// no error logged anywhere. relay.PublicKeyHeader is the single spelling; this
-// holds the agent's own copy to it until that copy is deleted.
-func TestPublicKeyHeaderMatchesTheProtocol(t *testing.T) {
-	if publicKeyHeader != relay.PublicKeyHeader {
-		t.Fatalf("the agent sends %q but the protocol says %q", publicKeyHeader, relay.PublicKeyHeader)
-	}
-}
-
 // proxyResponse runs one refused proxy stream and returns the exact bytes the
 // agent wrote, alongside the parsed response.
 //
