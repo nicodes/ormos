@@ -71,15 +71,9 @@ func ValidTerminalSize(cols, rows int) bool {
 		rows >= MinTerminalDim && rows <= MaxTerminalDim
 }
 
-// ValidPort reports whether p is a usable TCP port number.
-//
-// It has no caller in this repository yet. The remaining agent-side literals
-// live in files a concurrent workstream is editing, and the relay's live in the
-// other repository, which re-pins to this one; both conversions are tracked
-// rather than taken here so that two workstreams never edit one file. Until
-// they land, the port bound is the one invariant here with two spellings and no
-// check tying them together — unlike PublicKeyHeader, which the agent names and
-// can therefore be pinned to.
+// ValidPort reports whether p is a usable TCP port number. The single
+// spelling of the bound: both binaries import this package, so the check
+// cannot drift between the agent's policy/TUI guards and the relay's.
 func ValidPort(p int) bool { return p >= MinPort && p <= MaxPort }
 
 // StreamKind identifies what a newly opened yamux stream is for.
