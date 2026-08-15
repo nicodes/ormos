@@ -286,6 +286,7 @@ func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testin
 	defer srv.Close()
 
 	root, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
 	d := newSystem(systemConfig{
 		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
 		PairingToken: "test-pairing-token",
