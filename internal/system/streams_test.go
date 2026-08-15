@@ -150,13 +150,27 @@ func TestShutdownRequiresLiveAgentFence(t *testing.T) {
 
 	expired := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
 	expired.NotAfterMilli = time.Now().Add(-time.Millisecond).UnixMilli()
-	if ack := send(expired); ack.Status != relay.ActionAckExpired {
-		t.Fatalf("expired shutdown ack = %q", ack.Status)
+	agent, client := net.Pipe()
+	done := make(chan struct{})
+	go func() { d.serveStream(agent); close(done) }()
+	if err := relay.WriteHeader(client, expired); err != nil {
+		t.Fatal(err)
 	}
+	if _, err := relay.ReadActionAck(client); err == nil {
+		t.Fatal("already-expired fence produced an ACK after NotAfter")
+	}
+	_ = client.Close()
+	<-done
 	select {
 	case <-stopped:
 		t.Fatal("expired shutdown fence stopped the agent")
 	default:
+	}
+
+	refused := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	refused.ActionFence = "short"
+	if ack := send(refused); ack.Status != relay.ActionAckRefused {
+		t.Fatalf("refused shutdown ack = %q", ack.Status)
 	}
 
 	if ack := send(fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})); ack.Status != relay.ActionAckSuccess {
@@ -196,12 +210,8 @@ func TestShutdownRechecksFenceImmediatelyBeforeExecution(t *testing.T) {
 	<-parked
 	time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
 	close(release)
-	ack, err := relay.ReadActionAck(client)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ack.Status != relay.ActionAckExpired || relay.ValidateActionAck(header, ack) != nil {
-		t.Fatalf("parked shutdown ack = %+v", ack)
+	if _, err := relay.ReadActionAck(client); err == nil {
+		t.Fatal("parked shutdown wrote an expired ACK after NotAfter")
 	}
 	select {
 	case <-stopped:
@@ -241,6 +251,170 @@ func TestShutdownAckFailureLeavesAgentRunning(t *testing.T) {
 	case <-stopped:
 		t.Fatal("failed success acknowledgment cancelled the agent")
 	default:
+	}
+}
+
+func TestSuccessfulShutdownAckImmediatelyFulfillsRootCancellation(t *testing.T) {
+	var order []string
+	if !commitShutdown(func() { order = append(order, "cancel") }, func() bool {
+		order = append(order, "ack")
+		return true
+	}) {
+		t.Fatal("successful ACK did not commit shutdown")
+	}
+	if got := strings.Join(order, ","); got != "ack,cancel" {
+		t.Fatalf("shutdown commit order = %q, want ack,cancel", got)
+	}
+}
+
+type stalledAckConn struct {
+	net.Conn
+	reader    *bytes.Reader
+	started   chan struct{}
+	release   chan struct{}
+	writeDone chan struct{}
+	mu        sync.Mutex
+	deadline  time.Time
+}
+
+func (c *stalledAckConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+func (c *stalledAckConn) Write(p []byte) (int, error) {
+	close(c.started)
+	<-c.release // deliberately ignores both SetWriteDeadline and Close
+	close(c.writeDone)
+	return len(p), nil
+}
+func (c *stalledAckConn) Close() error                    { return nil }
+func (c *stalledAckConn) SetReadDeadline(time.Time) error { return nil }
+func (c *stalledAckConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.deadline = deadline
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *stalledAckConn) writeDeadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deadline
+}
+
+func TestShutdownAckCannotCommitPastNotAfterWhenWriteStalls(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	base := time.Now()
+	var clock atomic.Int64
+	clock.Store(base.UnixNano())
+	d.shutdownNow = func() time.Time { return time.Unix(0, clock.Load()) }
+	stopped := make(chan struct{}, 1)
+	d.setCancel(func() { stopped <- struct{}{} })
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	header.NotAfterMilli = base.Add(500 * time.Millisecond).UnixMilli()
+	var wire bytes.Buffer
+	if err := relay.WriteHeader(&wire, header); err != nil {
+		t.Fatal(err)
+	}
+	conn := &stalledAckConn{
+		reader: bytes.NewReader(wire.Bytes()), started: make(chan struct{}),
+		release: make(chan struct{}), writeDone: make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() { d.serveStream(conn); close(done) }()
+	<-conn.started
+	clock.Store(time.UnixMilli(header.NotAfterMilli).Add(time.Millisecond).UnixNano())
+	close(conn.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stalled ACK was not bounded by NotAfter")
+	}
+	if got, want := conn.writeDeadline(), time.UnixMilli(header.NotAfterMilli); !got.Equal(want) {
+		t.Fatalf("ACK deadline = %s, want NotAfter %s", got, want)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("ACK that stalled past NotAfter cancelled the agent")
+	default:
+	}
+	select {
+	case <-conn.writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("late ACK writer did not retire")
+	}
+}
+
+func TestShutdownAckDeadlineUsesOneSecondWhenFenceIsLater(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	release := make(chan struct{})
+	close(release)
+	conn := &stalledAckConn{
+		reader: bytes.NewReader(nil), started: make(chan struct{}),
+		release: release, writeDone: make(chan struct{}),
+	}
+	before := time.Now()
+	if !d.writeShutdownAck(conn, header, relay.ActionAckSuccess) {
+		t.Fatal("immediate ACK did not complete")
+	}
+	after := time.Now()
+	deadline := conn.writeDeadline()
+	if deadline.Before(before.Add(900*time.Millisecond)) || deadline.After(after.Add(shutdownAckWriteTO)) {
+		t.Fatalf("ACK deadline = %s, want now + %s", deadline, shutdownAckWriteTO)
+	}
+}
+
+func TestShutdownAckAsyncWritersAreCapped(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	header.NotAfterMilli = time.Now().Add(300 * time.Millisecond).UnixMilli()
+	conns := make([]*stalledAckConn, 0, maxAsyncShutdownAckWrites)
+	results := make(chan bool, maxAsyncShutdownAckWrites)
+	for range maxAsyncShutdownAckWrites {
+		conn := &stalledAckConn{
+			reader: bytes.NewReader(nil), started: make(chan struct{}),
+			release: make(chan struct{}), writeDone: make(chan struct{}),
+		}
+		conns = append(conns, conn)
+		go func() { results <- d.writeShutdownAck(conn, header, relay.ActionAckSuccess) }()
+	}
+	for _, conn := range conns {
+		select {
+		case <-conn.started:
+		case <-time.After(time.Second):
+			t.Fatal("capped ACK writer did not start")
+		}
+	}
+	extra := &stalledAckConn{
+		reader: bytes.NewReader(nil), started: make(chan struct{}),
+		release: make(chan struct{}), writeDone: make(chan struct{}),
+	}
+	if d.writeShutdownAck(extra, fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown}), relay.ActionAckSuccess) {
+		t.Fatal("ACK beyond the global writer cap succeeded")
+	}
+	select {
+	case <-extra.started:
+		t.Fatal("ACK beyond the global writer cap spawned a writer")
+	default:
+	}
+	for range maxAsyncShutdownAckWrites {
+		select {
+		case committed := <-results:
+			if committed {
+				t.Fatal("stalled ACK unexpectedly committed")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("stalled capped ACK caller did not return")
+		}
+	}
+	for _, conn := range conns {
+		close(conn.release)
+		select {
+		case <-conn.writeDone:
+		case <-time.After(time.Second):
+			t.Fatal("stalled capped ACK writer did not retire")
+		}
 	}
 }
 

@@ -161,9 +161,11 @@ func ValidateStreamFence(h StreamHeader, now time.Time) error {
 	return nil
 }
 
-// ActionAckStatus is the terminal result of a shutdown action. Success means
-// the agent committed the shutdown before acknowledging; refused and expired
-// mean it performed no shutdown action.
+// ActionAckStatus is the terminal result of a shutdown action. Completing a
+// success ACK write before NotAfter is the irrevocable shutdown commit point;
+// root cancellation is its infallible fulfillment and may run after NotAfter
+// if the scheduler pauses after that commit. Refused and expired mean the agent
+// performed no shutdown action.
 type ActionAckStatus string
 
 const (

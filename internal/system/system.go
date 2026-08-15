@@ -60,6 +60,8 @@ type system struct {
 	afterProxyDial       func()
 	beforeTerminalAction func()
 	proxyDialContext     func(context.Context, string, string) (net.Conn, error)
+	shutdownAckSlots     chan struct{}
+	shutdownNow          func() time.Time
 }
 
 // setCancel lets the agent shut itself down when the relay asks it to.
@@ -85,8 +87,9 @@ const logRing = 200
 func newSystem(cfg systemConfig) *system {
 	d := &system{
 		cfg: cfg, events: make(chan struct{}, 1),
-		terminals: make(map[string]*terminalSession),
-		audit:     newAuditor(),
+		terminals:        make(map[string]*terminalSession),
+		audit:            newAuditor(),
+		shutdownAckSlots: make(chan struct{}, maxAsyncShutdownAckWrites),
 	}
 	p, err := loadPolicy()
 	if err != nil {

@@ -27,6 +27,10 @@ var headerReadTO = 10 * time.Second
 const (
 	shutdownAckWriteTO = time.Second
 	proxyConnectTO     = 10 * time.Second
+	// A yamux stream deadline should interrupt a blocked Write, but its session
+	// send path is outside the stream. Keep the async fallback finite even if a
+	// broken transport ignores both the deadline and stream closure.
+	maxAsyncShutdownAckWrites = 4
 )
 
 // expandHomeDir resolves a leading ~ (or ~/) to the agent's home directory —
@@ -111,12 +115,13 @@ func (d *system) serveStream(stream net.Conn) {
 			d.writeShutdownAck(stream, header, fenceRefusalStatus(err))
 			return
 		}
-		if !d.writeShutdownAck(stream, header, relay.ActionAckSuccess) {
+		if !commitShutdown(cancel, func() bool {
+			return d.writeShutdownAck(stream, header, relay.ActionAckSuccess)
+		}) {
 			return
 		}
 		d.audit.record(auditEntry{Event: "shutdown", Allowed: true})
 		d.logf("shutdown requested by relay; exiting")
-		cancel()
 	case relay.KindEvent:
 		d.notifyEvent() // upstream data changed (web UI); TUI refetches
 	default:
@@ -131,13 +136,108 @@ func fenceRefusalStatus(err error) relay.ActionAckStatus {
 	return relay.ActionAckRefused
 }
 
-func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, status relay.ActionAckStatus) bool {
-	_ = stream.SetWriteDeadline(time.Now().Add(shutdownAckWriteTO))
-	if err := relay.WriteActionAck(stream, relay.NewActionAck(h, status)); err != nil {
-		d.logf("shutdown acknowledgment failed: %v", err)
+// commitShutdown defines the irrevocable shutdown commit point. A successful
+// ACK write completed inside the action fence authorizes shutdown permanently;
+// root cancellation is its infallible fulfillment. The defer guarantees that
+// cancellation is the very next operation, with no logging, audit I/O, or other
+// fallible work between the successful write and fulfillment.
+func commitShutdown(cancel context.CancelFunc, acknowledge func() bool) (committed bool) {
+	if !acknowledge() {
 		return false
 	}
+	defer cancel()
 	return true
+}
+
+type shutdownAckWriteResult struct {
+	err       error
+	completed time.Time
+}
+
+func (d *system) shutdownTime() time.Time {
+	if d.shutdownNow != nil {
+		return d.shutdownNow()
+	}
+	return time.Now()
+}
+
+func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, status relay.ActionAckStatus) bool {
+	now := d.shutdownTime()
+	deadline := now.Add(shutdownAckWriteTO)
+	if fence := time.UnixMilli(h.NotAfterMilli); fence.Before(deadline) {
+		deadline = fence
+	}
+	// This also covers an already-expired fence. No ACK, including an expired or
+	// refused result, is allowed to complete after the capability's NotAfter.
+	if !now.Before(deadline) {
+		return false
+	}
+
+	// newSystem initializes this in production. The guarded lazy path keeps
+	// narrow tests that construct a system literal safe without adding a second
+	// source of unbounded writer goroutines.
+	d.mu.Lock()
+	if d.shutdownAckSlots == nil {
+		d.shutdownAckSlots = make(chan struct{}, maxAsyncShutdownAckWrites)
+	}
+	slots := d.shutdownAckSlots
+	d.mu.Unlock()
+	select {
+	case slots <- struct{}{}:
+	default:
+		d.logf("shutdown acknowledgment refused: writer limit reached")
+		return false
+	}
+
+	_ = stream.SetWriteDeadline(deadline)
+	result := make(chan shutdownAckWriteResult, 1)
+	go func() {
+		if !d.shutdownTime().Before(deadline) {
+			<-slots
+			result <- shutdownAckWriteResult{err: context.DeadlineExceeded, completed: d.shutdownTime()}
+			return
+		}
+		err := relay.WriteActionAck(stream, relay.NewActionAck(h, status))
+		completed := d.shutdownTime()
+		<-slots
+		result <- shutdownAckWriteResult{err: err, completed: completed}
+	}()
+
+	accept := func(r shutdownAckWriteResult) bool {
+		if r.err != nil {
+			d.logf("shutdown acknowledgment failed: %v", r.err)
+			return false
+		}
+		if !r.completed.Before(deadline) {
+			_ = stream.Close()
+			d.logf("shutdown acknowledgment exceeded its action fence")
+			return false
+		}
+		return true
+	}
+	// Prefer a write that completed before the deadline even if this goroutine
+	// was not scheduled again until the timer also became ready. The completed
+	// timestamp is the commit point; a later scheduler pause cannot revoke it.
+	select {
+	case r := <-result:
+		return accept(r)
+	default:
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case r := <-result:
+		return accept(r)
+	case <-timer.C:
+		select {
+		case r := <-result:
+			return accept(r)
+		default:
+			_ = stream.Close()
+			d.logf("shutdown acknowledgment exceeded its action fence")
+			return false
+		}
+	}
 }
 
 // scrubbedEnv returns the process environment with every ORMOS_* variable
