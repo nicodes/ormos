@@ -302,7 +302,11 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, h relay.StreamHeader
 	local, err := dial(ctx, "tcp", net.JoinHostPort("127.0.0.1", p))
 	if err != nil {
 		// Dev servers (Vite, Node, …) often bind IPv6 loopback only; try ::1 too.
-		local, err = dial(ctx, "tcp", net.JoinHostPort("::1", p))
+		if fenceErr := relay.ValidateStreamFence(h, time.Now()); fenceErr != nil {
+			err = fenceErr
+		} else {
+			local, err = dial(ctx, "tcp", net.JoinHostPort("::1", p))
+		}
 	}
 	if err != nil {
 		d.logf("proxy dial :%d: %v", port, err)

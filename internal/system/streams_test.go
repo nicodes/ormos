@@ -251,7 +251,9 @@ func TestProxyFenceBoundsBothDialsAndPostDialBoundary(t *testing.T) {
 		d.mu.Unlock()
 		var calls atomic.Int32
 		d.proxyDialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-			calls.Add(1)
+			if calls.Add(1) == 1 {
+				return nil, fmt.Errorf("IPv4 dropped")
+			}
 			<-ctx.Done()
 			return nil, ctx.Err()
 		}
