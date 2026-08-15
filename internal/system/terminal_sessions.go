@@ -331,7 +331,7 @@ func (c *sealedConn) kill() {
 	})
 }
 
-func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader) {
+func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
 	if h.SessionID == "" {
 		d.logf("terminal refused: missing session id")
 		return
@@ -342,8 +342,8 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 	// is cleared only once there is a sealed stream to hand to attach, past
 	// which point there must be no read deadline at all: an idle terminal is
 	// not a broken one, and only the writer goroutine is paced.
-	handshakeDeadline := time.Now().Add(terminalHandshakeTO)
-	if actionDeadline := time.UnixMilli(h.NotAfterMilli); actionDeadline.Before(handshakeDeadline) {
+	handshakeDeadline := d.actionTime().Add(terminalHandshakeTO)
+	if actionDeadline.Before(handshakeDeadline) {
 		handshakeDeadline = actionDeadline
 	}
 	_ = stream.SetDeadline(handshakeDeadline)
@@ -382,7 +382,7 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 	}
 	_ = stream.SetDeadline(time.Time{})
 
-	s, err := d.terminal(h)
+	s, err := d.terminal(h, actionDeadline)
 	if err != nil {
 		d.logf("terminal session: %v", err)
 		return
@@ -390,7 +390,7 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 	s.attach(newSealedConn(stream, sealed))
 }
 
-func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
+func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*terminalSession, error) {
 	if !relay.ValidTerminalSize(h.Cols, h.Rows) {
 		return nil, fmt.Errorf("invalid terminal size")
 	}
@@ -444,7 +444,7 @@ func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
 		if d.beforeTerminalAction != nil {
 			d.beforeTerminalAction()
 		}
-		if err := relay.ValidateStreamFence(h, time.Now()); err != nil {
+		if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
 			d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: false})
 			return nil, err
 		}
@@ -462,7 +462,7 @@ func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
 	if d.beforeTerminalAction != nil {
 		d.beforeTerminalAction()
 	}
-	if err := relay.ValidateStreamFence(h, time.Now()); err != nil {
+	if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
 		d.audit.record(auditEntry{Event: "terminal", Detail: cwd, Allowed: false})
 		return nil, err
 	}

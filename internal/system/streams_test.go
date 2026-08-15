@@ -33,6 +33,15 @@ func fencedHeader(h relay.StreamHeader) relay.StreamHeader {
 	return h
 }
 
+func acceptedFenceDeadline(t *testing.T, h relay.StreamHeader) time.Time {
+	t.Helper()
+	deadline, err := relay.AcceptStreamFence(h, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deadline
+}
+
 func TestExpandHomeExpandsTildeAndEnv(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -85,7 +94,7 @@ func TestTerminalRefusesDollarCwd(t *testing.T) {
 	withTempConfigDir(t) // no policy file: everything would otherwise be allowed
 	d := &system{terminals: make(map[string]*terminalSession), audit: newAuditor()}
 	header := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "probe", Cwd: "$HOME", Cols: 80, Rows: 24})
-	if _, err := d.terminal(header); err == nil || !strings.Contains(err.Error(), "$") {
+	if _, err := d.terminal(header, acceptedFenceDeadline(t, header)); err == nil || !strings.Contains(err.Error(), "$") {
 		t.Fatalf("terminal($HOME) error = %v, want a refusal", err)
 	}
 	if d.terminals["probe"] != nil {
@@ -299,25 +308,31 @@ func TestShutdownAckCannotCommitPastNotAfterWhenWriteStalls(t *testing.T) {
 	withTempConfigDir(t)
 	d := newSystem(systemConfig{})
 	base := time.Now()
-	var clock atomic.Int64
-	clock.Store(base.UnixNano())
-	d.shutdownNow = func() time.Time { return time.Unix(0, clock.Load()) }
+	var elapsed atomic.Int64
+	d.actionNow = func() time.Time { return base.Add(time.Duration(elapsed.Load())) }
 	stopped := make(chan struct{}, 1)
 	d.setCancel(func() { stopped <- struct{}{} })
 	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
 	header.NotAfterMilli = base.Add(500 * time.Millisecond).UnixMilli()
-	var wire bytes.Buffer
-	if err := relay.WriteHeader(&wire, header); err != nil {
+	actionDeadline, err := relay.AcceptStreamFence(header, d.actionTime())
+	if err != nil {
 		t.Fatal(err)
 	}
 	conn := &stalledAckConn{
-		reader: bytes.NewReader(wire.Bytes()), started: make(chan struct{}),
+		reader: bytes.NewReader(nil), started: make(chan struct{}),
 		release: make(chan struct{}), writeDone: make(chan struct{}),
 	}
 	done := make(chan struct{})
-	go func() { d.serveStream(conn); close(done) }()
+	go func() {
+		if commitShutdown(d.shutdownCancel(), func() bool {
+			return d.writeShutdownAck(conn, header, actionDeadline, relay.ActionAckSuccess)
+		}) {
+			// commitShutdown itself invokes cancellation; no additional action.
+		}
+		close(done)
+	}()
 	<-conn.started
-	clock.Store(time.UnixMilli(header.NotAfterMilli).Add(time.Millisecond).UnixNano())
+	elapsed.Store(int64(actionDeadline.Sub(base) + time.Millisecond))
 	close(conn.release)
 	select {
 	case <-done:
@@ -350,7 +365,7 @@ func TestShutdownAckDeadlineUsesOneSecondWhenFenceIsLater(t *testing.T) {
 		release: release, writeDone: make(chan struct{}),
 	}
 	before := time.Now()
-	if !d.writeShutdownAck(conn, header, relay.ActionAckSuccess) {
+	if !d.writeShutdownAck(conn, header, acceptedFenceDeadline(t, header), relay.ActionAckSuccess) {
 		t.Fatal("immediate ACK did not complete")
 	}
 	after := time.Now()
@@ -365,6 +380,7 @@ func TestShutdownAckAsyncWritersAreCapped(t *testing.T) {
 	d := newSystem(systemConfig{})
 	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
 	header.NotAfterMilli = time.Now().Add(300 * time.Millisecond).UnixMilli()
+	actionDeadline := acceptedFenceDeadline(t, header)
 	conns := make([]*stalledAckConn, 0, maxAsyncShutdownAckWrites)
 	results := make(chan bool, maxAsyncShutdownAckWrites)
 	for range maxAsyncShutdownAckWrites {
@@ -373,7 +389,7 @@ func TestShutdownAckAsyncWritersAreCapped(t *testing.T) {
 			release: make(chan struct{}), writeDone: make(chan struct{}),
 		}
 		conns = append(conns, conn)
-		go func() { results <- d.writeShutdownAck(conn, header, relay.ActionAckSuccess) }()
+		go func() { results <- d.writeShutdownAck(conn, header, actionDeadline, relay.ActionAckSuccess) }()
 	}
 	for _, conn := range conns {
 		select {
@@ -386,7 +402,8 @@ func TestShutdownAckAsyncWritersAreCapped(t *testing.T) {
 		reader: bytes.NewReader(nil), started: make(chan struct{}),
 		release: make(chan struct{}), writeDone: make(chan struct{}),
 	}
-	if d.writeShutdownAck(extra, fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown}), relay.ActionAckSuccess) {
+	extraHeader := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	if d.writeShutdownAck(extra, extraHeader, acceptedFenceDeadline(t, extraHeader), relay.ActionAckSuccess) {
 		t.Fatal("ACK beyond the global writer cap succeeded")
 	}
 	select {
@@ -523,7 +540,8 @@ func TestProxyFenceBoundsBothDialsAndPostDialBoundary(t *testing.T) {
 		done := make(chan struct{})
 		header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
 		header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
-		go func() { d.handleProxy(agent, agent, header); agent.Close(); close(done) }()
+		actionDeadline := acceptedFenceDeadline(t, header)
+		go func() { d.handleProxy(agent, agent, header, actionDeadline); agent.Close(); close(done) }()
 		<-parked
 		time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
 		close(release)
@@ -553,7 +571,8 @@ func TestProxyFenceBoundsBothDialsAndPostDialBoundary(t *testing.T) {
 		header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
 		done := make(chan struct{})
 		start := time.Now()
-		go func() { d.handleProxy(agent, agent, header); agent.Close(); close(done) }()
+		actionDeadline := acceptedFenceDeadline(t, header)
+		go func() { d.handleProxy(agent, agent, header, actionDeadline); agent.Close(); close(done) }()
 		select {
 		case <-done:
 		case <-time.After(time.Second):
@@ -583,7 +602,8 @@ func TestProxyFenceBoundsBothDialsAndPostDialBoundary(t *testing.T) {
 		header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
 		header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
 		done := make(chan struct{})
-		go func() { d.handleProxy(agent, agent, header); agent.Close(); close(done) }()
+		actionDeadline := acceptedFenceDeadline(t, header)
+		go func() { d.handleProxy(agent, agent, header, actionDeadline); agent.Close(); close(done) }()
 		<-parked
 		time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
 		close(release)
@@ -593,6 +613,51 @@ func TestProxyFenceBoundsBothDialsAndPostDialBoundary(t *testing.T) {
 			t.Fatal("post-deadline proxy connection remained open")
 		}
 	})
+}
+
+func TestProxyRollbackDuringStallCannotExtendAcceptedFence(t *testing.T) {
+	withTempConfigDir(t)
+	const port = 3000
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+	accepted := time.Now()
+	var elapsed atomic.Int64
+	d.actionNow = func() time.Time { return accepted.Add(time.Duration(elapsed.Load())) }
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
+	header.NotAfterMilli = accepted.Add(200 * time.Millisecond).UnixMilli()
+	actionDeadline, err := relay.AcceptStreamFence(header, d.actionTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Equivalent to a wall rollback after acceptance: the unchanged absolute
+	// timestamp would now appear much farther away if the handler reconstructed
+	// it. The carried monotonic deadline must remain the sole authority.
+	header.NotAfterMilli = accepted.Add(time.Hour).UnixMilli()
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	d.beforeProxyDial = func() { close(parked); <-release }
+	var dials atomic.Int32
+	d.proxyDialContext = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("unexpected dial")
+	}
+	agent, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() { d.handleProxy(agent, agent, header, actionDeadline); agent.Close(); close(done) }()
+	<-parked
+	elapsed.Store(int64(250 * time.Millisecond))
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("wall rollback extended a stalled proxy fence")
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("wall rollback permitted %d post-deadline dials", dials.Load())
+	}
 }
 
 func TestTerminalRechecksFenceAfterHandshakeBeforeCreate(t *testing.T) {
@@ -647,7 +712,8 @@ func TestTerminalRechecksFenceBeforeReattach(t *testing.T) {
 	})
 	header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
 	done := make(chan error, 1)
-	go func() { _, err := d.terminal(header); done <- err }()
+	deadline := acceptedFenceDeadline(t, header)
+	go func() { _, err := d.terminal(header, deadline); done <- err }()
 	<-parked
 	time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
 	close(release)
@@ -1056,8 +1122,10 @@ func proxyResponse(t *testing.T, d *system, port int) (*http.Response, string, s
 	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
+	actionDeadline := acceptedFenceDeadline(t, header)
 	go func() {
-		d.handleProxy(agent, agent, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port}))
+		d.handleProxy(agent, agent, header, actionDeadline)
 		// serveStream's deferred Close, which is what ends the response.
 		agent.Close()
 	}()

@@ -82,19 +82,20 @@ func (d *system) serveStream(stream net.Conn) {
 		d.logf("stream header error: %v", err)
 		return
 	}
-	if err := relay.ValidateStreamFence(header, time.Now()); err != nil {
+	actionDeadline, err := relay.AcceptStreamFence(header, d.actionTime())
+	if err != nil {
 		d.audit.record(auditEntry{Event: string(header.Kind), Allowed: false, Detail: err.Error()})
 		d.logf("refusing %s stream: %v", header.Kind, err)
 		if header.Kind == relay.KindShutdown {
-			d.writeShutdownAck(stream, header, fenceRefusalStatus(err))
+			d.writeShutdownAck(stream, header, actionDeadline, fenceRefusalStatus(err))
 		}
 		return
 	}
 	switch header.Kind {
 	case relay.KindTerminal:
-		d.handleTerminal(stream, br, header)
+		d.handleTerminal(stream, br, header, actionDeadline)
 	case relay.KindProxy:
-		d.handleProxy(stream, br, header)
+		d.handleProxy(stream, br, header, actionDeadline)
 	case relay.KindListPorts:
 		d.handleListPorts(stream)
 	case relay.KindShutdown:
@@ -104,19 +105,19 @@ func (d *system) serveStream(stream net.Conn) {
 		cancel := d.shutdownCancel()
 		if cancel == nil {
 			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: "shutdown unavailable"})
-			d.writeShutdownAck(stream, header, relay.ActionAckRefused)
+			d.writeShutdownAck(stream, header, actionDeadline, relay.ActionAckRefused)
 			return
 		}
 		// Keep the final authorization check immediately adjacent to the ACK.
 		// A success ACK commits an infallible root cancellation; if the ACK cannot
 		// be written, leave the agent running so the relay can truthfully retry.
-		if err := relay.ValidateStreamFence(header, time.Now()); err != nil {
+		if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
 			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: err.Error()})
-			d.writeShutdownAck(stream, header, fenceRefusalStatus(err))
+			d.writeShutdownAck(stream, header, actionDeadline, fenceRefusalStatus(err))
 			return
 		}
 		if !commitShutdown(cancel, func() bool {
-			return d.writeShutdownAck(stream, header, relay.ActionAckSuccess)
+			return d.writeShutdownAck(stream, header, actionDeadline, relay.ActionAckSuccess)
 		}) {
 			return
 		}
@@ -154,23 +155,22 @@ type shutdownAckWriteResult struct {
 	completed time.Time
 }
 
-func (d *system) shutdownTime() time.Time {
-	if d.shutdownNow != nil {
-		return d.shutdownNow()
+func (d *system) actionTime() time.Time {
+	if d.actionNow != nil {
+		return d.actionNow()
 	}
 	return time.Now()
 }
 
-func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, status relay.ActionAckStatus) bool {
-	now := d.shutdownTime()
+func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, actionDeadline time.Time, status relay.ActionAckStatus) bool {
+	now := d.actionTime()
 	deadline := now.Add(shutdownAckWriteTO)
-	fence := time.UnixMilli(h.NotAfterMilli)
 	// Success carries authority and therefore must complete inside NotAfter. A
 	// non-success result carries no authority: while its fence is live it uses
 	// the same bound, but an already-expired/refused action still gets one second
 	// to report that truthful terminal result to the relay.
-	if (status == relay.ActionAckSuccess || now.Before(fence)) && fence.Before(deadline) {
-		deadline = fence
+	if (status == relay.ActionAckSuccess || now.Before(actionDeadline)) && actionDeadline.Before(deadline) {
+		deadline = actionDeadline
 	}
 	if !now.Before(deadline) {
 		return false
@@ -195,13 +195,13 @@ func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, status 
 	_ = stream.SetWriteDeadline(deadline)
 	result := make(chan shutdownAckWriteResult, 1)
 	go func() {
-		if !d.shutdownTime().Before(deadline) {
+		if !d.actionTime().Before(deadline) {
 			<-slots
-			result <- shutdownAckWriteResult{err: context.DeadlineExceeded, completed: d.shutdownTime()}
+			result <- shutdownAckWriteResult{err: context.DeadlineExceeded, completed: d.actionTime()}
 			return
 		}
 		err := relay.WriteActionAck(stream, relay.NewActionAck(h, status))
-		completed := d.shutdownTime()
+		completed := d.actionTime()
 		<-slots
 		result <- shutdownAckWriteResult{err: err, completed: completed}
 	}()
@@ -363,7 +363,7 @@ func (d *proxyIdleDeadline) reset() {
 }
 
 // handleProxy dials a local TCP port and pipes raw bytes both ways.
-func (d *system) handleProxy(stream net.Conn, br io.Reader, h relay.StreamHeader) {
+func (d *system) handleProxy(stream net.Conn, br io.Reader, h relay.StreamHeader, actionDeadline time.Time) {
 	d.addSession(1)
 	defer d.addSession(-1)
 	port := h.Port
@@ -397,12 +397,11 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, h relay.StreamHeader
 	if d.beforeProxyDial != nil {
 		d.beforeProxyDial()
 	}
-	if err := relay.ValidateStreamFence(h, time.Now()); err != nil {
+	if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
 		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: err.Error(), Allowed: false})
 		d.logf("proxy refused at dial boundary: %v", err)
 		return
 	}
-	actionDeadline := time.UnixMilli(h.NotAfterMilli)
 	_ = stream.SetDeadline(actionDeadline)
 	ctx, cancel := context.WithDeadline(context.Background(), actionDeadline)
 	defer cancel()
@@ -415,7 +414,7 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, h relay.StreamHeader
 	local, err := dial(ctx, "tcp", net.JoinHostPort("127.0.0.1", p))
 	if err != nil {
 		// Dev servers (Vite, Node, …) often bind IPv6 loopback only; try ::1 too.
-		if fenceErr := relay.ValidateStreamFence(h, time.Now()); fenceErr != nil {
+		if fenceErr := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); fenceErr != nil {
 			err = fenceErr
 		} else {
 			local, err = dial(ctx, "tcp", net.JoinHostPort("::1", p))
@@ -431,7 +430,7 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, h relay.StreamHeader
 	if d.afterProxyDial != nil {
 		d.afterProxyDial()
 	}
-	if err := relay.ValidateStreamFence(h, time.Now()); err != nil || ctx.Err() != nil {
+	if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil || ctx.Err() != nil {
 		if err == nil {
 			err = ctx.Err()
 		}

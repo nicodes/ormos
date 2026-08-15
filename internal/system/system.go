@@ -61,7 +61,7 @@ type system struct {
 	beforeTerminalAction func()
 	proxyDialContext     func(context.Context, string, string) (net.Conn, error)
 	shutdownAckSlots     chan struct{}
-	shutdownNow          func() time.Time
+	actionNow            func() time.Time
 }
 
 // setCancel lets the agent shut itself down when the relay asks it to.

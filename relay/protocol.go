@@ -135,28 +135,53 @@ func StreamKindRequiresFence(kind StreamKind) bool {
 	return kind == KindTerminal || kind == KindProxy || kind == KindShutdown
 }
 
-// ValidateStreamFence lets the agent reject a relay action that was parked past
-// its durable authorization. The fence is opaque but strictly shaped so an old
-// relay (which sends neither field) fails closed rather than silently regaining
-// the pre-fence behavior.
-func ValidateStreamFence(h StreamHeader, now time.Time) error {
+// AcceptStreamFence validates a header once, when it is accepted, and converts
+// its wall-clock NotAfter into a deadline attached to acceptedAt's monotonic
+// clock. Every later action check must carry this returned deadline; rebuilding
+// time.UnixMilli later would let an NTP/manual wall-clock jump extend or shrink
+// an already-accepted capability. The wall remaining duration is clamped before
+// Add, while the same one-minute skew tolerance remains enforced below.
+func AcceptStreamFence(h StreamHeader, acceptedAt time.Time) (time.Time, error) {
 	if !StreamKindRequiresFence(h.Kind) {
-		return nil
+		return time.Time{}, nil
 	}
+	wallRemaining := time.UnixMilli(h.NotAfterMilli).Sub(acceptedAt.Round(0))
+	clamped := wallRemaining
+	if clamped < 0 {
+		clamped = 0
+	} else if clamped > maxActionFenceFuture {
+		clamped = maxActionFenceFuture
+	}
+	deadline := acceptedAt.Add(clamped)
 	if len(h.ActionFence) < 32 || len(h.ActionFence) > 64 {
-		return fmt.Errorf("stream action fence has invalid length")
+		return deadline, fmt.Errorf("stream action fence has invalid length")
 	}
 	for _, c := range h.ActionFence {
 		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-			return fmt.Errorf("stream action fence has invalid characters")
+			return deadline, fmt.Errorf("stream action fence has invalid characters")
 		}
 	}
-	notAfter := time.UnixMilli(h.NotAfterMilli)
-	if !now.Before(notAfter) {
-		return errStreamFenceExpired
+	if wallRemaining <= 0 {
+		return deadline, errStreamFenceExpired
 	}
-	if notAfter.After(now.Add(maxActionFenceFuture)) {
-		return fmt.Errorf("stream action fence is too far in the future")
+	if wallRemaining > maxActionFenceFuture {
+		return deadline, fmt.Errorf("stream action fence is too far in the future")
+	}
+	return deadline, nil
+}
+
+// ValidateStreamFence is the point-in-time compatibility helper. Agent stream
+// handlers use AcceptStreamFence instead so they never recreate a wall deadline.
+func ValidateStreamFence(h StreamHeader, now time.Time) error {
+	_, err := AcceptStreamFence(h, now)
+	return err
+}
+
+// ValidateStreamFenceDeadline performs a later check solely against the
+// monotonic deadline captured by AcceptStreamFence.
+func ValidateStreamFenceDeadline(deadline, now time.Time) error {
+	if !now.Before(deadline) {
+		return errStreamFenceExpired
 	}
 	return nil
 }

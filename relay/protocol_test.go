@@ -36,6 +36,36 @@ func TestValidateStreamFence(t *testing.T) {
 	}
 }
 
+func TestAcceptedStreamFenceCarriesOneClampedDeadline(t *testing.T) {
+	accepted := time.Now()
+	header := StreamHeader{
+		Kind: KindProxy, ActionFence: strings.Repeat("a", 40),
+		NotAfterMilli: accepted.Add(200 * time.Millisecond).UnixMilli(),
+	}
+	deadline, err := AcceptStreamFence(header, accepted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A wall rollback makes the original absolute timestamp appear farther in
+	// the future; a wall jump forward makes it appear expired. Neither mutation
+	// can affect the accepted monotonic deadline carried by the stream.
+	header.NotAfterMilli = accepted.Add(time.Hour).UnixMilli()
+	if err := ValidateStreamFenceDeadline(deadline, accepted.Add(100*time.Millisecond)); err != nil {
+		t.Fatalf("wall rollback shrank a live accepted fence: %v", err)
+	}
+	header.NotAfterMilli = accepted.Add(-time.Hour).UnixMilli()
+	if err := ValidateStreamFenceDeadline(deadline, accepted.Add(250*time.Millisecond)); !IsStreamFenceExpired(err) {
+		t.Fatalf("wall jump extended an expired accepted fence: %v", err)
+	}
+
+	far := header
+	far.NotAfterMilli = accepted.Add(2 * time.Minute).UnixMilli()
+	clamped, err := AcceptStreamFence(far, accepted)
+	if err == nil || !clamped.Equal(accepted.Add(maxActionFenceFuture)) {
+		t.Fatalf("far-future fence = (%s, %v), want clamped %s and refusal", clamped, err, accepted.Add(maxActionFenceFuture))
+	}
+}
+
 func TestShutdownActionAckRoundTripAndBinding(t *testing.T) {
 	header := StreamHeader{
 		Kind: KindShutdown, ActionFence: strings.Repeat("a", 40),
