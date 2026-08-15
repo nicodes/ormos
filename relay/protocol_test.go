@@ -36,6 +36,34 @@ func TestValidateStreamFence(t *testing.T) {
 	}
 }
 
+func TestShutdownActionAckRoundTripAndBinding(t *testing.T) {
+	header := StreamHeader{
+		Kind: KindShutdown, ActionFence: strings.Repeat("a", 40),
+		NotAfterMilli: time.Now().Add(time.Second).UnixMilli(),
+	}
+	want := NewActionAck(header, ActionAckSuccess)
+	var buf bytes.Buffer
+	if err := WriteActionAck(&buf, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadActionAck(&buf)
+	if err != nil || got != want {
+		t.Fatalf("ack = (%+v, %v), want %+v", got, err, want)
+	}
+	if err := ValidateActionAck(header, got); err != nil {
+		t.Fatalf("valid ack: %v", err)
+	}
+	got.ActionFence = strings.Repeat("b", 40)
+	if err := ValidateActionAck(header, got); err == nil {
+		t.Fatal("ack for another durable fence was accepted")
+	}
+	got = want
+	got.Status = "maybe"
+	if err := ValidateActionAck(header, got); err == nil {
+		t.Fatal("unknown ack status was accepted")
+	}
+}
+
 func TestHeaderRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	want := StreamHeader{Kind: KindTerminal, Cols: 120, Rows: 40, Cwd: "/code/app", SessionID: "project:tab"}

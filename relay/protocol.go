@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -68,7 +69,10 @@ const (
 	// cannot send agent-enforced action fences must not connect to an agent that
 	// promises to enforce them (and vice versa).
 	StreamFenceVersionHeader = "X-Ormos-Stream-Fence-Version"
-	StreamFenceVersion       = "1"
+	// Version 2 adds a terminal shutdown acknowledgment. Exact-version tunnel
+	// negotiation prevents a v2 relay from sending that framing to a connected
+	// v1 agent during a backend-first rollout.
+	StreamFenceVersion = "2"
 )
 
 // ValidTerminalSize reports whether a terminal's dimensions are within bounds.
@@ -117,6 +121,12 @@ type StreamHeader struct {
 
 const maxActionFenceFuture = time.Minute
 
+var errStreamFenceExpired = errors.New("stream action fence expired")
+
+// IsStreamFenceExpired distinguishes an expired otherwise-shaped fence from a
+// malformed refusal so action protocols can report a stable terminal status.
+func IsStreamFenceExpired(err error) bool { return errors.Is(err, errStreamFenceExpired) }
+
 // StreamKindRequiresFence identifies streams that cause an external action.
 // Informational list/event streams remain compatible without a fence.
 func StreamKindRequiresFence(kind StreamKind) bool {
@@ -141,12 +151,77 @@ func ValidateStreamFence(h StreamHeader, now time.Time) error {
 	}
 	notAfter := time.UnixMilli(h.NotAfterMilli)
 	if !now.Before(notAfter) {
-		return fmt.Errorf("stream action fence expired")
+		return errStreamFenceExpired
 	}
 	if notAfter.After(now.Add(maxActionFenceFuture)) {
 		return fmt.Errorf("stream action fence is too far in the future")
 	}
 	return nil
+}
+
+// ActionAckStatus is the terminal result of a shutdown action. Success means
+// the agent committed the shutdown before acknowledging; refused and expired
+// mean it performed no shutdown action.
+type ActionAckStatus string
+
+const (
+	ActionAckSuccess ActionAckStatus = "success"
+	ActionAckRefused ActionAckStatus = "refused"
+	ActionAckExpired ActionAckStatus = "expired"
+)
+
+// ActionAck binds the terminal result to the exact durable capability and
+// deadline from the shutdown header. Echoing both prevents a delayed response
+// from completing a later stop request on a reused tunnel.
+type ActionAck struct {
+	ActionFence   string          `json:"action_fence"`
+	NotAfterMilli int64           `json:"not_after_milli"`
+	Status        ActionAckStatus `json:"status"`
+}
+
+// NewActionAck constructs an acknowledgment for h without letting callers
+// accidentally omit either replay-binding field.
+func NewActionAck(h StreamHeader, status ActionAckStatus) ActionAck {
+	return ActionAck{ActionFence: h.ActionFence, NotAfterMilli: h.NotAfterMilli, Status: status}
+}
+
+// ValidateActionAck accepts only terminal shutdown results for the exact header
+// that opened the stream.
+func ValidateActionAck(h StreamHeader, ack ActionAck) error {
+	if h.Kind != KindShutdown {
+		return fmt.Errorf("action acknowledgment is only valid for shutdown")
+	}
+	if ack.ActionFence != h.ActionFence || ack.NotAfterMilli != h.NotAfterMilli {
+		return fmt.Errorf("action acknowledgment does not match its shutdown fence")
+	}
+	switch ack.Status {
+	case ActionAckSuccess, ActionAckRefused, ActionAckExpired:
+		return nil
+	default:
+		return fmt.Errorf("unknown action acknowledgment status %q", ack.Status)
+	}
+}
+
+// WriteActionAck writes one newline-delimited terminal shutdown result.
+func WriteActionAck(w io.Writer, ack ActionAck) error {
+	b, err := json.Marshal(ack)
+	if err != nil {
+		return err
+	}
+	return writeAll(w, append(b, '\n'))
+}
+
+// ReadActionAck reads one bounded newline-delimited shutdown result.
+func ReadActionAck(r io.Reader) (ActionAck, error) {
+	line, _, err := readBoundedJSONLine(r)
+	if err != nil {
+		return ActionAck{}, err
+	}
+	var ack ActionAck
+	if err := json.Unmarshal(line, &ack); err != nil {
+		return ActionAck{}, fmt.Errorf("decode action acknowledgment: %w", err)
+	}
+	return ack, nil
 }
 
 // WriteHeader encodes h as a single newline-terminated JSON line on w.
@@ -163,6 +238,18 @@ func WriteHeader(w io.Writer, h StreamHeader) error {
 // bufio.Reader MUST be used for any subsequent reads on the stream, since it may
 // have buffered bytes past the header's newline.
 func ReadHeader(r io.Reader) (StreamHeader, *bufio.Reader, error) {
+	line, br, err := readBoundedJSONLine(r)
+	if err != nil {
+		return StreamHeader{}, br, err
+	}
+	var h StreamHeader
+	if err := json.Unmarshal(line, &h); err != nil {
+		return StreamHeader{}, br, fmt.Errorf("decode stream header: %w", err)
+	}
+	return h, br, nil
+}
+
+func readBoundedJSONLine(r io.Reader) ([]byte, *bufio.Reader, error) {
 	br := bufio.NewReader(r)
 	// Read up to the newline byte-by-byte so a peer that never sends one can't
 	// make us buffer without bound. bufio still batches the underlying reads,
@@ -172,21 +259,17 @@ func ReadHeader(r io.Reader) (StreamHeader, *bufio.Reader, error) {
 	for {
 		b, err := br.ReadByte()
 		if err != nil {
-			return StreamHeader{}, br, err
+			return nil, br, err
 		}
 		if b == '\n' {
 			break
 		}
 		line = append(line, b)
 		if len(line) > MaxHeaderSize {
-			return StreamHeader{}, br, fmt.Errorf("stream header exceeds %d bytes", MaxHeaderSize)
+			return nil, br, fmt.Errorf("stream protocol message exceeds %d bytes", MaxHeaderSize)
 		}
 	}
-	var h StreamHeader
-	if err := json.Unmarshal(line, &h); err != nil {
-		return StreamHeader{}, br, fmt.Errorf("decode stream header: %w", err)
-	}
-	return h, br, nil
+	return line, br, nil
 }
 
 // Terminal frame protocol. Terminal streams carry length-prefixed, tagged

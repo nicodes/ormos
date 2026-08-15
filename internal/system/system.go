@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -51,6 +52,14 @@ type system struct {
 	// sealed against it, so the server carries them without being able to read
 	// them — see relay/seal.go.
 	key *ecdh.PrivateKey
+
+	// Test seams for parking execution at the external-action boundaries. They
+	// remain nil in production. proxyDialContext defaults to net.Dialer.
+	beforeShutdownAction func()
+	beforeProxyDial      func()
+	afterProxyDial       func()
+	beforeTerminalAction func()
+	proxyDialContext     func(context.Context, string, string) (net.Conn, error)
 }
 
 // setCancel lets the agent shut itself down when the relay asks it to.
@@ -63,14 +72,16 @@ func (d *system) setCancel(cancel context.CancelFunc) {
 // handleShutdown is invoked when the relay opens a KindShutdown stream (the user
 // clicked Stop or Forget in the UI). It cancels the root context so Run/TUI exit
 // and the process stops.
-func (d *system) handleShutdown() {
+func (d *system) handleShutdown() bool {
 	d.logf("shutdown requested by relay; exiting")
 	d.mu.Lock()
 	c := d.cancel
 	d.mu.Unlock()
 	if c != nil {
 		c()
+		return true
 	}
+	return false
 }
 
 const logRing = 200

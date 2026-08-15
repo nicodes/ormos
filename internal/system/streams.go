@@ -3,6 +3,7 @@
 package system
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,11 @@ import (
 // streams and says nothing pins every slot the agent has. A var so tests can
 // shrink it.
 var headerReadTO = 10 * time.Second
+
+const (
+	shutdownAckWriteTO = time.Second
+	proxyConnectTO     = 10 * time.Second
+)
 
 // expandHomeDir resolves a leading ~ (or ~/) to the agent's home directory —
 // the daemon sets cmd.Dir directly, so no shell is around to expand it.
@@ -75,22 +81,52 @@ func (d *system) serveStream(stream net.Conn) {
 	if err := relay.ValidateStreamFence(header, time.Now()); err != nil {
 		d.audit.record(auditEntry{Event: string(header.Kind), Allowed: false, Detail: err.Error()})
 		d.logf("refusing %s stream: %v", header.Kind, err)
+		if header.Kind == relay.KindShutdown {
+			d.writeShutdownAck(stream, header, fenceRefusalStatus(err))
+		}
 		return
 	}
 	switch header.Kind {
 	case relay.KindTerminal:
 		d.handleTerminal(stream, br, header)
 	case relay.KindProxy:
-		d.handleProxy(stream, br, header.Port)
+		d.handleProxy(stream, br, header)
 	case relay.KindListPorts:
 		d.handleListPorts(stream)
 	case relay.KindShutdown:
+		if d.beforeShutdownAction != nil {
+			d.beforeShutdownAction()
+		}
+		if err := relay.ValidateStreamFence(header, time.Now()); err != nil {
+			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: err.Error()})
+			d.writeShutdownAck(stream, header, fenceRefusalStatus(err))
+			return
+		}
+		if !d.handleShutdown() {
+			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: "shutdown unavailable"})
+			d.writeShutdownAck(stream, header, relay.ActionAckRefused)
+			return
+		}
 		d.audit.record(auditEntry{Event: "shutdown", Allowed: true})
-		d.handleShutdown()
+		d.writeShutdownAck(stream, header, relay.ActionAckSuccess)
 	case relay.KindEvent:
 		d.notifyEvent() // upstream data changed (web UI); TUI refetches
 	default:
 		d.logf("unknown stream kind %q", header.Kind)
+	}
+}
+
+func fenceRefusalStatus(err error) relay.ActionAckStatus {
+	if relay.IsStreamFenceExpired(err) {
+		return relay.ActionAckExpired
+	}
+	return relay.ActionAckRefused
+}
+
+func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, status relay.ActionAckStatus) {
+	_ = stream.SetWriteDeadline(time.Now().Add(shutdownAckWriteTO))
+	if err := relay.WriteActionAck(stream, relay.NewActionAck(h, status)); err != nil {
+		d.logf("shutdown acknowledgment failed: %v", err)
 	}
 }
 
@@ -214,9 +250,10 @@ func (d *proxyIdleDeadline) reset() {
 }
 
 // handleProxy dials a local TCP port and pipes raw bytes both ways.
-func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
+func (d *system) handleProxy(stream net.Conn, br io.Reader, h relay.StreamHeader) {
 	d.addSession(1)
 	defer d.addSession(-1)
+	port := h.Port
 
 	// Two independent checks, both of which must pass. Local policy is decided
 	// here and comes from this machine's own config file; the exposed-port list
@@ -244,11 +281,28 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
 		return
 	}
 
+	if d.beforeProxyDial != nil {
+		d.beforeProxyDial()
+	}
+	if err := relay.ValidateStreamFence(h, time.Now()); err != nil {
+		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: err.Error(), Allowed: false})
+		d.logf("proxy refused at dial boundary: %v", err)
+		return
+	}
+	actionDeadline := time.UnixMilli(h.NotAfterMilli)
+	_ = stream.SetDeadline(actionDeadline)
+	ctx, cancel := context.WithDeadline(context.Background(), actionDeadline)
+	defer cancel()
+	dial := d.proxyDialContext
+	if dial == nil {
+		dialer := &net.Dialer{Timeout: proxyConnectTO}
+		dial = dialer.DialContext
+	}
 	p := strconv.Itoa(port)
-	local, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", p))
+	local, err := dial(ctx, "tcp", net.JoinHostPort("127.0.0.1", p))
 	if err != nil {
 		// Dev servers (Vite, Node, …) often bind IPv6 loopback only; try ::1 too.
-		local, err = net.Dial("tcp", net.JoinHostPort("::1", p))
+		local, err = dial(ctx, "tcp", net.JoinHostPort("::1", p))
 	}
 	if err != nil {
 		d.logf("proxy dial :%d: %v", port, err)
@@ -257,6 +311,18 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
 		return
 	}
 	defer local.Close()
+	if d.afterProxyDial != nil {
+		d.afterProxyDial()
+	}
+	if err := relay.ValidateStreamFence(h, time.Now()); err != nil || ctx.Err() != nil {
+		if err == nil {
+			err = ctx.Err()
+		}
+		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: err.Error(), Allowed: false})
+		d.logf("proxy refused after dial: %v", err)
+		return
+	}
+	_ = stream.SetDeadline(time.Time{})
 	d.audit.record(auditEntry{Event: "proxy", Port: port, Allowed: true})
 	d.logf("proxy session -> :%d", port)
 	defer d.logf("proxy session closed (:%d)", port)
