@@ -582,7 +582,10 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 	d.logf("connecting to %s", url)
 	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		HTTPHeader: map[string][]string{
-			"Authorization":                {"Bearer " + d.cfg.PairingToken},
+			"Authorization": {"Bearer " + d.cfg.PairingToken},
+			// Always advertise the current fenced+ACK protocol. The shared
+			// LegacyV0 constant represents absence for old released binaries;
+			// it is not a downgrade this agent may request.
 			relay.StreamFenceVersionHeader: {relay.StreamFenceVersion},
 			// Published on every connect rather than once at pairing, so an
 			// agent whose key is new — or which predates sealing — starts

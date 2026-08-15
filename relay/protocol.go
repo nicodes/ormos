@@ -65,16 +65,18 @@ const (
 	// browsers keep sealing against a stale key, and terminals stop opening
 	// with no error anywhere.
 	PublicKeyHeader = "X-Ormos-Public-Key"
-	// StreamFenceVersionHeader is required on the tunnel handshake. A relay that
-	// cannot send agent-enforced action fences must not connect to an agent that
-	// promises to enforce them (and vice versa).
+	// StreamFenceVersionHeader negotiates agent-enforced action behavior on the
+	// tunnel handshake. Its absence is reserved for the already-released v0.1.5
+	// wire format; current agents always advertise an explicit supported version.
 	StreamFenceVersionHeader = "X-Ormos-Stream-Fence-Version"
-	// Version 1 introduced agent-enforced action fences. Version 2 adds the
-	// terminal shutdown acknowledgment. Relays accept both during the rolling
-	// upgrade, but must send acknowledgment-dependent shutdowns only to v2.
-	StreamFenceVersionV1 = "1"
-	StreamFenceVersionV2 = "2"
-	StreamFenceVersion   = StreamFenceVersionV2
+	// LegacyV0 is a backend capability sentinel for header absence, never a
+	// value an agent may send. Explicit "0" is unsupported. Version 1 introduced
+	// agent-enforced action fences; version 2 adds the terminal shutdown
+	// acknowledgment. This agent advertises only the current v2 capability.
+	StreamFenceVersionLegacyV0 = ""
+	StreamFenceVersionV1       = "1"
+	StreamFenceVersionV2       = "2"
+	StreamFenceVersion         = StreamFenceVersionV2
 )
 
 // ValidTerminalSize reports whether a terminal's dimensions are within bounds.

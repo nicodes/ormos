@@ -8,6 +8,15 @@ import (
 	"time"
 )
 
+func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
+	if StreamFenceVersionLegacyV0 != "" {
+		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
+	}
+	if StreamFenceVersion != StreamFenceVersionV2 {
+		t.Fatalf("advertised stream-fence version = %q, want v2 %q", StreamFenceVersion, StreamFenceVersionV2)
+	}
+}
+
 func TestValidateStreamFence(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	valid := StreamHeader{
