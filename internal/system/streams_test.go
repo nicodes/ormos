@@ -150,17 +150,9 @@ func TestShutdownRequiresLiveAgentFence(t *testing.T) {
 
 	expired := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
 	expired.NotAfterMilli = time.Now().Add(-time.Millisecond).UnixMilli()
-	agent, client := net.Pipe()
-	done := make(chan struct{})
-	go func() { d.serveStream(agent); close(done) }()
-	if err := relay.WriteHeader(client, expired); err != nil {
-		t.Fatal(err)
+	if ack := send(expired); ack.Status != relay.ActionAckExpired {
+		t.Fatalf("expired shutdown ack = %q", ack.Status)
 	}
-	if _, err := relay.ReadActionAck(client); err == nil {
-		t.Fatal("already-expired fence produced an ACK after NotAfter")
-	}
-	_ = client.Close()
-	<-done
 	select {
 	case <-stopped:
 		t.Fatal("expired shutdown fence stopped the agent")
@@ -210,8 +202,12 @@ func TestShutdownRechecksFenceImmediatelyBeforeExecution(t *testing.T) {
 	<-parked
 	time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
 	close(release)
-	if _, err := relay.ReadActionAck(client); err == nil {
-		t.Fatal("parked shutdown wrote an expired ACK after NotAfter")
+	ack, err := relay.ReadActionAck(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Status != relay.ActionAckExpired || relay.ValidateActionAck(header, ack) != nil {
+		t.Fatalf("parked shutdown ack = %+v", ack)
 	}
 	select {
 	case <-stopped:

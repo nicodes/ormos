@@ -164,11 +164,14 @@ func (d *system) shutdownTime() time.Time {
 func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, status relay.ActionAckStatus) bool {
 	now := d.shutdownTime()
 	deadline := now.Add(shutdownAckWriteTO)
-	if fence := time.UnixMilli(h.NotAfterMilli); fence.Before(deadline) {
+	fence := time.UnixMilli(h.NotAfterMilli)
+	// Success carries authority and therefore must complete inside NotAfter. A
+	// non-success result carries no authority: while its fence is live it uses
+	// the same bound, but an already-expired/refused action still gets one second
+	// to report that truthful terminal result to the relay.
+	if (status == relay.ActionAckSuccess || now.Before(fence)) && fence.Before(deadline) {
 		deadline = fence
 	}
-	// This also covers an already-expired fence. No ACK, including an expired or
-	// refused result, is allowed to complete after the capability's NotAfter.
 	if !now.Before(deadline) {
 		return false
 	}
