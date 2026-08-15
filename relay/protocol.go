@@ -143,6 +143,14 @@ func StreamKindRequiresFence(kind StreamKind) bool {
 // time.UnixMilli later would let an NTP/manual wall-clock jump extend or shrink
 // an already-accepted capability. The wall remaining duration is clamped before
 // Add, while the same one-minute skew tolerance remains enforced below.
+//
+// The returned deadline is valid and required even when the error is non-nil,
+// which is deliberate and not the usual Go convention. A refused shutdown still
+// has to answer the relay, and writeShutdownAck bounds that refusal ACK with
+// this deadline: for an expired fence the clamp yields exactly acceptedAt, which
+// is what routes the ACK down the non-success branch and grants it the full
+// write timeout to report a truthful terminal result. Discarding the deadline on
+// the error path would silently shorten that window to nothing.
 func AcceptStreamFence(h StreamHeader, acceptedAt time.Time) (time.Time, error) {
 	if !StreamKindRequiresFence(h.Kind) {
 		return time.Time{}, nil
