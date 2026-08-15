@@ -8,10 +8,12 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/nicodes/ormos/relay"
 )
 
@@ -209,6 +212,121 @@ func TestShutdownRechecksFenceImmediatelyBeforeExecution(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("expired shutdown stream did not finish")
+	}
+}
+
+type failingAckConn struct {
+	net.Conn
+	reader *bytes.Reader
+}
+
+func (c *failingAckConn) Read(p []byte) (int, error)       { return c.reader.Read(p) }
+func (c *failingAckConn) Write([]byte) (int, error)        { return 0, errors.New("tunnel lost") }
+func (c *failingAckConn) Close() error                     { return nil }
+func (c *failingAckConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *failingAckConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestShutdownAckFailureLeavesAgentRunning(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	stopped := make(chan struct{}, 1)
+	d.setCancel(func() { stopped <- struct{}{} })
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	var wire bytes.Buffer
+	if err := relay.WriteHeader(&wire, header); err != nil {
+		t.Fatal(err)
+	}
+	d.serveStream(&failingAckConn{reader: bytes.NewReader(wire.Bytes())})
+	select {
+	case <-stopped:
+		t.Fatal("failed success acknowledgment cancelled the agent")
+	default:
+	}
+}
+
+func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testing.T) {
+	withTempConfigDir(t)
+	received := make(chan relay.ActionAck)
+	tunnelClosed := make(chan struct{})
+	serverErr := make(chan error, 1)
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer ws.Close(websocket.StatusNormalClosure, "")
+		sess, err := relay.ClientSession(relay.NetConn(context.Background(), ws))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer sess.Close()
+		stream, err := sess.Open()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer stream.Close()
+		if err := relay.WriteHeader(stream, header); err != nil {
+			serverErr <- err
+			return
+		}
+		ack, err := relay.ReadActionAck(stream)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		received <- ack
+		<-sess.CloseChan()
+		close(tunnelClosed)
+	}))
+	defer srv.Close()
+
+	root, cancelRoot := context.WithCancel(context.Background())
+	d := newSystem(systemConfig{
+		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
+		PairingToken: "test-pairing-token",
+	})
+	cancelInvoked := make(chan struct{})
+	d.setCancel(func() {
+		close(cancelInvoked)
+		cancelRoot()
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := d.connectAndServe(root)
+		result <- err
+	}()
+
+	select {
+	case err := <-serverErr:
+		t.Fatal(err)
+	case ack := <-received:
+		if ack.Status != relay.ActionAckSuccess || relay.ValidateActionAck(header, ack) != nil {
+			t.Fatalf("shutdown acknowledgment = %+v", ack)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("backend did not receive shutdown acknowledgment")
+	}
+	select {
+	case <-cancelInvoked:
+	case <-time.After(time.Second):
+		t.Fatal("root cancellation was not invoked after acknowledgment")
+	}
+	select {
+	case <-tunnelClosed:
+	case err := <-serverErr:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel stayed open after acknowledged shutdown")
+	}
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("agent tunnel did not return after root cancellation")
 	}
 }
 

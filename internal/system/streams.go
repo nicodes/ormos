@@ -97,18 +97,26 @@ func (d *system) serveStream(stream net.Conn) {
 		if d.beforeShutdownAction != nil {
 			d.beforeShutdownAction()
 		}
+		cancel := d.shutdownCancel()
+		if cancel == nil {
+			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: "shutdown unavailable"})
+			d.writeShutdownAck(stream, header, relay.ActionAckRefused)
+			return
+		}
+		// Keep the final authorization check immediately adjacent to the ACK.
+		// A success ACK commits an infallible root cancellation; if the ACK cannot
+		// be written, leave the agent running so the relay can truthfully retry.
 		if err := relay.ValidateStreamFence(header, time.Now()); err != nil {
 			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: err.Error()})
 			d.writeShutdownAck(stream, header, fenceRefusalStatus(err))
 			return
 		}
-		if !d.handleShutdown() {
-			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: "shutdown unavailable"})
-			d.writeShutdownAck(stream, header, relay.ActionAckRefused)
+		if !d.writeShutdownAck(stream, header, relay.ActionAckSuccess) {
 			return
 		}
 		d.audit.record(auditEntry{Event: "shutdown", Allowed: true})
-		d.writeShutdownAck(stream, header, relay.ActionAckSuccess)
+		d.logf("shutdown requested by relay; exiting")
+		cancel()
 	case relay.KindEvent:
 		d.notifyEvent() // upstream data changed (web UI); TUI refetches
 	default:
@@ -123,11 +131,13 @@ func fenceRefusalStatus(err error) relay.ActionAckStatus {
 	return relay.ActionAckRefused
 }
 
-func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, status relay.ActionAckStatus) {
+func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, status relay.ActionAckStatus) bool {
 	_ = stream.SetWriteDeadline(time.Now().Add(shutdownAckWriteTO))
 	if err := relay.WriteActionAck(stream, relay.NewActionAck(h, status)); err != nil {
 		d.logf("shutdown acknowledgment failed: %v", err)
+		return false
 	}
+	return true
 }
 
 // scrubbedEnv returns the process environment with every ORMOS_* variable

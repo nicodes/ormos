@@ -69,10 +69,12 @@ const (
 	// cannot send agent-enforced action fences must not connect to an agent that
 	// promises to enforce them (and vice versa).
 	StreamFenceVersionHeader = "X-Ormos-Stream-Fence-Version"
-	// Version 2 adds a terminal shutdown acknowledgment. Exact-version tunnel
-	// negotiation prevents a v2 relay from sending that framing to a connected
-	// v1 agent during a backend-first rollout.
-	StreamFenceVersion = "2"
+	// Version 1 introduced agent-enforced action fences. Version 2 adds the
+	// terminal shutdown acknowledgment. Relays accept both during the rolling
+	// upgrade, but must send acknowledgment-dependent shutdowns only to v2.
+	StreamFenceVersionV1 = "1"
+	StreamFenceVersionV2 = "2"
+	StreamFenceVersion   = StreamFenceVersionV2
 )
 
 // ValidTerminalSize reports whether a terminal's dimensions are within bounds.

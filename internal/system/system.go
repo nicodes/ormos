@@ -69,19 +69,15 @@ func (d *system) setCancel(cancel context.CancelFunc) {
 	d.mu.Unlock()
 }
 
-// handleShutdown is invoked when the relay opens a KindShutdown stream (the user
-// clicked Stop or Forget in the UI). It cancels the root context so Run/TUI exit
-// and the process stops.
-func (d *system) handleShutdown() bool {
-	d.logf("shutdown requested by relay; exiting")
+// shutdownCancel returns the root cancellation installed by Run. Looking it up
+// does not execute the shutdown: the success acknowledgment must cross the
+// tunnel first, otherwise cancelling this context can tear down WebSocket/yamux
+// before the relay receives the terminal result.
+func (d *system) shutdownCancel() context.CancelFunc {
 	d.mu.Lock()
 	c := d.cancel
 	d.mu.Unlock()
-	if c != nil {
-		c()
-		return true
-	}
-	return false
+	return c
 }
 
 const logRing = 200
