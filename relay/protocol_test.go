@@ -3,8 +3,38 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestValidateStreamFence(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	valid := StreamHeader{
+		Kind: KindShutdown, ActionFence: strings.Repeat("a", 40),
+		NotAfterMilli: now.Add(5 * time.Second).UnixMilli(),
+	}
+	if err := ValidateStreamFence(valid, now); err != nil {
+		t.Fatalf("valid fence: %v", err)
+	}
+	for name, mutate := range map[string]func(*StreamHeader){
+		"missing capability": func(h *StreamHeader) { h.ActionFence = "" },
+		"invalid capability": func(h *StreamHeader) { h.ActionFence = strings.Repeat("!", 40) },
+		"expired":            func(h *StreamHeader) { h.NotAfterMilli = now.UnixMilli() },
+		"far future":         func(h *StreamHeader) { h.NotAfterMilli = now.Add(2 * time.Minute).UnixMilli() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := valid
+			mutate(&h)
+			if err := ValidateStreamFence(h, now); err == nil {
+				t.Fatal("invalid fence was accepted")
+			}
+		})
+	}
+	if err := ValidateStreamFence(StreamHeader{Kind: KindEvent}, now); err != nil {
+		t.Fatalf("informational stream unexpectedly required a fence: %v", err)
+	}
+}
 
 func TestHeaderRoundTrip(t *testing.T) {
 	var buf bytes.Buffer

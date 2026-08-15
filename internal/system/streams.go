@@ -72,6 +72,11 @@ func (d *system) serveStream(stream net.Conn) {
 		d.logf("stream header error: %v", err)
 		return
 	}
+	if err := relay.ValidateStreamFence(header, time.Now()); err != nil {
+		d.audit.record(auditEntry{Event: string(header.Kind), Allowed: false, Detail: err.Error()})
+		d.logf("refusing %s stream: %v", header.Kind, err)
+		return
+	}
 	switch header.Kind {
 	case relay.KindTerminal:
 		d.handleTerminal(stream, br, header)

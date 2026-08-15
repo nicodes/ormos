@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"time"
 )
 
 // Size bounds on the two attacker-influenced read paths, so a compromised or
@@ -63,6 +64,11 @@ const (
 	// browsers keep sealing against a stale key, and terminals stop opening
 	// with no error anywhere.
 	PublicKeyHeader = "X-Ormos-Public-Key"
+	// StreamFenceVersionHeader is required on the tunnel handshake. A relay that
+	// cannot send agent-enforced action fences must not connect to an agent that
+	// promises to enforce them (and vice versa).
+	StreamFenceVersionHeader = "X-Ormos-Stream-Fence-Version"
+	StreamFenceVersion       = "1"
 )
 
 // ValidTerminalSize reports whether a terminal's dimensions are within bounds.
@@ -99,12 +105,48 @@ const (
 // (yamux client) opens a stream and writes this; the system (yamux server)
 // reads it to decide how to handle the stream.
 type StreamHeader struct {
-	Kind      StreamKind `json:"kind"`
-	Port      int        `json:"port,omitempty"`       // for KindProxy: local TCP port to dial
-	Cols      int        `json:"cols,omitempty"`       // for KindTerminal: initial columns
-	Rows      int        `json:"rows,omitempty"`       // for KindTerminal: initial rows
-	Cwd       string     `json:"cwd,omitempty"`        // for KindTerminal: working directory
-	SessionID string     `json:"session_id,omitempty"` // for KindTerminal: stable tab identity
+	Kind          StreamKind `json:"kind"`
+	Port          int        `json:"port,omitempty"`            // for KindProxy: local TCP port to dial
+	Cols          int        `json:"cols,omitempty"`            // for KindTerminal: initial columns
+	Rows          int        `json:"rows,omitempty"`            // for KindTerminal: initial rows
+	Cwd           string     `json:"cwd,omitempty"`             // for KindTerminal: working directory
+	SessionID     string     `json:"session_id,omitempty"`      // for KindTerminal: stable tab identity
+	ActionFence   string     `json:"action_fence,omitempty"`    // opaque durable side-effect capability
+	NotAfterMilli int64      `json:"not_after_milli,omitempty"` // agent refuses the action at/after this instant
+}
+
+const maxActionFenceFuture = time.Minute
+
+// StreamKindRequiresFence identifies streams that cause an external action.
+// Informational list/event streams remain compatible without a fence.
+func StreamKindRequiresFence(kind StreamKind) bool {
+	return kind == KindTerminal || kind == KindProxy || kind == KindShutdown
+}
+
+// ValidateStreamFence lets the agent reject a relay action that was parked past
+// its durable authorization. The fence is opaque but strictly shaped so an old
+// relay (which sends neither field) fails closed rather than silently regaining
+// the pre-fence behavior.
+func ValidateStreamFence(h StreamHeader, now time.Time) error {
+	if !StreamKindRequiresFence(h.Kind) {
+		return nil
+	}
+	if len(h.ActionFence) < 32 || len(h.ActionFence) > 64 {
+		return fmt.Errorf("stream action fence has invalid length")
+	}
+	for _, c := range h.ActionFence {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
+			return fmt.Errorf("stream action fence has invalid characters")
+		}
+	}
+	notAfter := time.UnixMilli(h.NotAfterMilli)
+	if !now.Before(notAfter) {
+		return fmt.Errorf("stream action fence expired")
+	}
+	if notAfter.After(now.Add(maxActionFenceFuture)) {
+		return fmt.Errorf("stream action fence is too far in the future")
+	}
+	return nil
 }
 
 // WriteHeader encodes h as a single newline-terminated JSON line on w.

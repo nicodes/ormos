@@ -20,6 +20,12 @@ import (
 	"github.com/nicodes/ormos/relay"
 )
 
+func fencedHeader(h relay.StreamHeader) relay.StreamHeader {
+	h.ActionFence = strings.Repeat("a", 40)
+	h.NotAfterMilli = time.Now().Add(5 * time.Second).UnixMilli()
+	return h
+}
+
 func TestExpandHomeExpandsTildeAndEnv(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -103,6 +109,47 @@ func TestServeStreamDropsHeaderlessStream(t *testing.T) {
 	}
 }
 
+func TestShutdownRequiresLiveAgentFence(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	stopped := make(chan struct{}, 1)
+	d.setCancel(func() { stopped <- struct{}{} })
+
+	send := func(header relay.StreamHeader) {
+		agent, client := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			d.serveStream(agent)
+			close(done)
+		}()
+		if err := relay.WriteHeader(client, header); err != nil {
+			t.Fatal(err)
+		}
+		_ = client.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("shutdown stream did not finish")
+		}
+	}
+
+	expired := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	expired.NotAfterMilli = time.Now().Add(-time.Millisecond).UnixMilli()
+	send(expired)
+	select {
+	case <-stopped:
+		t.Fatal("expired shutdown fence stopped the agent")
+	default:
+	}
+
+	send(fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown}))
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("live shutdown fence did not stop the agent")
+	}
+}
+
 // The deadline covers the header only: a stream that announced itself
 // promptly must keep working past it — a proxy pipe's only pacing after the
 // header is the idle bound, which bytes must keep resetting.
@@ -121,7 +168,7 @@ func TestServeStreamClearsHeaderDeadline(t *testing.T) {
 	agent, client := net.Pipe()
 	defer client.Close()
 	go d.serveStream(agent)
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+	if err := relay.WriteHeader(client, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * headerReadTO)
@@ -162,7 +209,7 @@ func TestProxyPipeDropsASilentPeer(t *testing.T) {
 		d.serveStream(agent)
 		close(done)
 	}()
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+	if err := relay.WriteHeader(client, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})); err != nil {
 		t.Fatal(err)
 	}
 	// ...and then nothing, ever.
@@ -200,7 +247,7 @@ func TestProxyPipeResetsItsIdleDeadlineOnBytes(t *testing.T) {
 	agent, client := net.Pipe()
 	defer client.Close()
 	go d.serveStream(agent)
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+	if err := relay.WriteHeader(client, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})); err != nil {
 		t.Fatal(err)
 	}
 	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
@@ -235,7 +282,7 @@ func TestProxyPipeOneWayTrafficResetsItsIdleDeadline(t *testing.T) {
 	agent, client := net.Pipe()
 	defer client.Close()
 	go d.serveStream(agent)
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+	if err := relay.WriteHeader(client, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})); err != nil {
 		t.Fatal(err)
 	}
 	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -404,7 +451,7 @@ func TestTerminalHandshakeDeadlineDropsASilentPeer(t *testing.T) {
 		d.serveStream(agent)
 		close(done)
 	}()
-	header := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "silent", Cols: 80, Rows: 24}
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "silent", Cols: 80, Rows: 24})
 	if err := relay.WriteHeader(client, header); err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +494,7 @@ func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
 	defer client.Close()
 	go d.serveStream(agent)
 
-	h := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "idle", Cols: 80, Rows: 24}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "idle", Cols: 80, Rows: 24})
 	if err := relay.WriteHeader(client, h); err != nil {
 		t.Fatal(err)
 	}
