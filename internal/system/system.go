@@ -233,10 +233,6 @@ const (
 	maxBackoff     = 30 * time.Second // cap on reconnect backoff
 	portsPollEvery = 5 * time.Second  // how often port status is refreshed
 	portsFetchTO   = 8 * time.Second  // per-call timeout for an on-demand ports fetch
-	// maxTunnelRead caps a single tunnel WS message. yamux writes at most one
-	// stream window per message (256 KiB by default), so this is generous;
-	// it only has to be finite.
-	maxTunnelRead = 4 << 20
 )
 
 // httpClient is the shared client for all relay HTTP calls (provision, ports,
@@ -596,10 +592,16 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 	if err != nil {
 		return false, fmt.Errorf("dial: %w", err)
 	}
-	// Bound a single tunnel message. Frames are yamux-sized (well under this);
-	// the finite cap avoids an unbounded read while still fitting real traffic.
-	conn.SetReadLimit(maxTunnelRead)
-
+	// No SetReadLimit here, deliberately. relay.NetConn presents this connection
+	// as a net.Conn, and websocket.NetConn disables the read limit to do so: a
+	// byte stream may legitimately span messages, so a per-message cap cannot
+	// apply to one. Anything set here would be cleared immediately after.
+	//
+	// The tunnel's memory ceiling is yamux's rather than the WebSocket layer's.
+	// netConn.Read reads into the caller's buffer, so message size never becomes
+	// allocation size, and what a peer may hold across the tunnel is
+	// relay.MaxTunnelWindowBytes — pinned by the guard in
+	// relay/transport_test.go, which is where to change it.
 	netConn := relay.NetConn(ctx, conn)
 	sess, err := relay.ServerSession(netConn)
 	if err != nil {
