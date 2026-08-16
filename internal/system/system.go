@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sync"
@@ -51,6 +52,16 @@ type system struct {
 	// sealed against it, so the server carries them without being able to read
 	// them — see relay/seal.go.
 	key *ecdh.PrivateKey
+
+	// Test seams for parking execution at the external-action boundaries. They
+	// remain nil in production. proxyDialContext defaults to net.Dialer.
+	beforeShutdownAction func()
+	beforeProxyDial      func()
+	afterProxyDial       func()
+	beforeTerminalAction func()
+	proxyDialContext     func(context.Context, string, string) (net.Conn, error)
+	shutdownAckSlots     chan struct{}
+	actionNow            func() time.Time
 }
 
 // setCancel lets the agent shut itself down when the relay asks it to.
@@ -60,17 +71,15 @@ func (d *system) setCancel(cancel context.CancelFunc) {
 	d.mu.Unlock()
 }
 
-// handleShutdown is invoked when the relay opens a KindShutdown stream (the user
-// clicked Stop or Forget in the UI). It cancels the root context so Run/TUI exit
-// and the process stops.
-func (d *system) handleShutdown() {
-	d.logf("shutdown requested by relay; exiting")
+// shutdownCancel returns the root cancellation installed by Run. Looking it up
+// does not execute the shutdown: the success acknowledgment must cross the
+// tunnel first, otherwise cancelling this context can tear down WebSocket/yamux
+// before the relay receives the terminal result.
+func (d *system) shutdownCancel() context.CancelFunc {
 	d.mu.Lock()
 	c := d.cancel
 	d.mu.Unlock()
-	if c != nil {
-		c()
-	}
+	return c
 }
 
 const logRing = 200
@@ -78,8 +87,9 @@ const logRing = 200
 func newSystem(cfg systemConfig) *system {
 	d := &system{
 		cfg: cfg, events: make(chan struct{}, 1),
-		terminals: make(map[string]*terminalSession),
-		audit:     newAuditor(),
+		terminals:        make(map[string]*terminalSession),
+		audit:            newAuditor(),
+		shutdownAckSlots: make(chan struct{}, maxAsyncShutdownAckWrites),
 	}
 	p, err := loadPolicy()
 	if err != nil {
@@ -573,6 +583,10 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		HTTPHeader: map[string][]string{
 			"Authorization": {"Bearer " + d.cfg.PairingToken},
+			// Always advertise the current fenced+ACK protocol. The shared
+			// LegacyV0 constant represents absence for old released binaries;
+			// it is not a downgrade this agent may request.
+			relay.StreamFenceVersionHeader: {relay.StreamFenceVersion},
 			// Published on every connect rather than once at pairing, so an
 			// agent whose key is new — or which predates sealing — starts
 			// working again by reconnecting instead of being re-paired.

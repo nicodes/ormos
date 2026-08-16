@@ -447,8 +447,8 @@ func TestTerminalReattachRechecksSessionCwd(t *testing.T) {
 
 	// The request names an allowed directory; the pre-existing session is
 	// rooted outside it. Before the fix this returned the session.
-	header := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "sess", Cwd: allowed, Cols: 80, Rows: 24}
-	if _, err := d.terminal(header); err == nil {
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "sess", Cwd: allowed, Cols: 80, Rows: 24})
+	if _, err := d.terminal(header, acceptedFenceDeadline(t, header)); err == nil {
 		t.Fatal("reattach to a session rooted outside allowedRoots must be refused")
 	} else if !strings.Contains(err.Error(), "does not allow terminals") {
 		t.Fatalf("reattach error = %v, want a policy refusal", err)
@@ -459,7 +459,7 @@ func TestTerminalReattachRechecksSessionCwd(t *testing.T) {
 
 	// Sanity: a session rooted under the allowed root reattaches fine.
 	d.terminals["sess"].cwd = allowed
-	s, err := d.terminal(header)
+	s, err := d.terminal(header, acceptedFenceDeadline(t, header))
 	if err != nil {
 		t.Fatalf("reattach under allowedRoots refused: %v", err)
 	}

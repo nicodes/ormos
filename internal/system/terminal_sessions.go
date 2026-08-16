@@ -331,7 +331,7 @@ func (c *sealedConn) kill() {
 	})
 }
 
-func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader) {
+func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
 	if h.SessionID == "" {
 		d.logf("terminal refused: missing session id")
 		return
@@ -342,7 +342,11 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 	// is cleared only once there is a sealed stream to hand to attach, past
 	// which point there must be no read deadline at all: an idle terminal is
 	// not a broken one, and only the writer goroutine is paced.
-	_ = stream.SetDeadline(time.Now().Add(terminalHandshakeTO))
+	handshakeDeadline := d.actionTime().Add(terminalHandshakeTO)
+	if actionDeadline.Before(handshakeDeadline) {
+		handshakeDeadline = actionDeadline
+	}
+	_ = stream.SetDeadline(handshakeDeadline)
 	// The browser opens with its ephemeral public key. Everything after this is
 	// sealed, so a failure here has to end the stream rather than fall back to
 	// plaintext — a downgrade that a peer could ask for is not a protection.
@@ -378,7 +382,7 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 	}
 	_ = stream.SetDeadline(time.Time{})
 
-	s, err := d.terminal(h)
+	s, err := d.terminal(h, actionDeadline)
 	if err != nil {
 		d.logf("terminal session: %v", err)
 		return
@@ -386,7 +390,7 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 	s.attach(newSealedConn(stream, sealed))
 }
 
-func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
+func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*terminalSession, error) {
 	if !relay.ValidTerminalSize(h.Cols, h.Rows) {
 		return nil, fmt.Errorf("invalid terminal size")
 	}
@@ -437,19 +441,32 @@ func (d *system) terminal(h relay.StreamHeader) (*terminalSession, error) {
 			d.logf("terminal reattach refused: %s", reason)
 			return nil, fmt.Errorf("%s", reason)
 		}
+		if d.beforeTerminalAction != nil {
+			d.beforeTerminalAction()
+		}
+		if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
+			d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: false})
+			return nil, err
+		}
 		d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: true})
 		return s, nil
 	}
 	if len(d.terminals) >= maxTerminalSessions {
 		return nil, fmt.Errorf("terminal session limit reached (%d)", maxTerminalSessions)
 	}
-	d.audit.record(auditEntry{Event: "terminal", Detail: cwd, Allowed: true})
-
 	cmd := exec.Command(d.cfg.Shell)
 	cmd.Env = append(scrubbedEnv(), "TERM=xterm-256color")
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
+	if d.beforeTerminalAction != nil {
+		d.beforeTerminalAction()
+	}
+	if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
+		d.audit.record(auditEntry{Event: "terminal", Detail: cwd, Allowed: false})
+		return nil, err
+	}
+	d.audit.record(auditEntry{Event: "terminal", Detail: cwd, Allowed: true})
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("start pty: %w", err)

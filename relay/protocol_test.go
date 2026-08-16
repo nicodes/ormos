@@ -3,8 +3,105 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
+	if StreamFenceVersionLegacyV0 != "" {
+		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
+	}
+	if StreamFenceVersion != StreamFenceVersionV2 {
+		t.Fatalf("advertised stream-fence version = %q, want v2 %q", StreamFenceVersion, StreamFenceVersionV2)
+	}
+}
+
+func TestValidateStreamFence(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	valid := StreamHeader{
+		Kind: KindShutdown, ActionFence: strings.Repeat("a", 40),
+		NotAfterMilli: now.Add(5 * time.Second).UnixMilli(),
+	}
+	if err := ValidateStreamFence(valid, now); err != nil {
+		t.Fatalf("valid fence: %v", err)
+	}
+	for name, mutate := range map[string]func(*StreamHeader){
+		"missing capability": func(h *StreamHeader) { h.ActionFence = "" },
+		"invalid capability": func(h *StreamHeader) { h.ActionFence = strings.Repeat("!", 40) },
+		"expired":            func(h *StreamHeader) { h.NotAfterMilli = now.UnixMilli() },
+		"far future":         func(h *StreamHeader) { h.NotAfterMilli = now.Add(2 * time.Minute).UnixMilli() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := valid
+			mutate(&h)
+			if err := ValidateStreamFence(h, now); err == nil {
+				t.Fatal("invalid fence was accepted")
+			}
+		})
+	}
+	if err := ValidateStreamFence(StreamHeader{Kind: KindEvent}, now); err != nil {
+		t.Fatalf("informational stream unexpectedly required a fence: %v", err)
+	}
+}
+
+func TestAcceptedStreamFenceCarriesOneClampedDeadline(t *testing.T) {
+	accepted := time.Now()
+	header := StreamHeader{
+		Kind: KindProxy, ActionFence: strings.Repeat("a", 40),
+		NotAfterMilli: accepted.Add(200 * time.Millisecond).UnixMilli(),
+	}
+	deadline, err := AcceptStreamFence(header, accepted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A wall rollback makes the original absolute timestamp appear farther in
+	// the future; a wall jump forward makes it appear expired. Neither mutation
+	// can affect the accepted monotonic deadline carried by the stream.
+	header.NotAfterMilli = accepted.Add(time.Hour).UnixMilli()
+	if err := ValidateStreamFenceDeadline(deadline, accepted.Add(100*time.Millisecond)); err != nil {
+		t.Fatalf("wall rollback shrank a live accepted fence: %v", err)
+	}
+	header.NotAfterMilli = accepted.Add(-time.Hour).UnixMilli()
+	if err := ValidateStreamFenceDeadline(deadline, accepted.Add(250*time.Millisecond)); !IsStreamFenceExpired(err) {
+		t.Fatalf("wall jump extended an expired accepted fence: %v", err)
+	}
+
+	far := header
+	far.NotAfterMilli = accepted.Add(2 * time.Minute).UnixMilli()
+	clamped, err := AcceptStreamFence(far, accepted)
+	if err == nil || !clamped.Equal(accepted.Add(maxActionFenceFuture)) {
+		t.Fatalf("far-future fence = (%s, %v), want clamped %s and refusal", clamped, err, accepted.Add(maxActionFenceFuture))
+	}
+}
+
+func TestShutdownActionAckRoundTripAndBinding(t *testing.T) {
+	header := StreamHeader{
+		Kind: KindShutdown, ActionFence: strings.Repeat("a", 40),
+		NotAfterMilli: time.Now().Add(time.Second).UnixMilli(),
+	}
+	want := NewActionAck(header, ActionAckSuccess)
+	var buf bytes.Buffer
+	if err := WriteActionAck(&buf, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadActionAck(&buf)
+	if err != nil || got != want {
+		t.Fatalf("ack = (%+v, %v), want %+v", got, err, want)
+	}
+	if err := ValidateActionAck(header, got); err != nil {
+		t.Fatalf("valid ack: %v", err)
+	}
+	got.ActionFence = strings.Repeat("b", 40)
+	if err := ValidateActionAck(header, got); err == nil {
+		t.Fatal("ack for another durable fence was accepted")
+	}
+	got = want
+	got.Status = "maybe"
+	if err := ValidateActionAck(header, got); err == nil {
+		t.Fatal("unknown ack status was accepted")
+	}
+}
 
 func TestHeaderRoundTrip(t *testing.T) {
 	var buf bytes.Buffer

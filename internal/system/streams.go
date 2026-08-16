@@ -3,6 +3,7 @@
 package system
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -22,6 +23,15 @@ import (
 // streams and says nothing pins every slot the agent has. A var so tests can
 // shrink it.
 var headerReadTO = 10 * time.Second
+
+const (
+	shutdownAckWriteTO = time.Second
+	proxyConnectTO     = 10 * time.Second
+	// A yamux stream deadline should interrupt a blocked Write, but its session
+	// send path is outside the stream. Keep the async fallback finite even if a
+	// broken transport ignores both the deadline and stream closure.
+	maxAsyncShutdownAckWrites = 4
+)
 
 // expandHomeDir resolves a leading ~ (or ~/) to the agent's home directory —
 // the daemon sets cmd.Dir directly, so no shell is around to expand it.
@@ -72,20 +82,164 @@ func (d *system) serveStream(stream net.Conn) {
 		d.logf("stream header error: %v", err)
 		return
 	}
+	actionDeadline, err := relay.AcceptStreamFence(header, d.actionTime())
+	if err != nil {
+		d.audit.record(auditEntry{Event: string(header.Kind), Allowed: false, Detail: err.Error()})
+		d.logf("refusing %s stream: %v", header.Kind, err)
+		if header.Kind == relay.KindShutdown {
+			d.writeShutdownAck(stream, header, actionDeadline, fenceRefusalStatus(err))
+		}
+		return
+	}
 	switch header.Kind {
 	case relay.KindTerminal:
-		d.handleTerminal(stream, br, header)
+		d.handleTerminal(stream, br, header, actionDeadline)
 	case relay.KindProxy:
-		d.handleProxy(stream, br, header.Port)
+		d.handleProxy(stream, br, header, actionDeadline)
 	case relay.KindListPorts:
 		d.handleListPorts(stream)
 	case relay.KindShutdown:
+		if d.beforeShutdownAction != nil {
+			d.beforeShutdownAction()
+		}
+		cancel := d.shutdownCancel()
+		if cancel == nil {
+			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: "shutdown unavailable"})
+			d.writeShutdownAck(stream, header, actionDeadline, relay.ActionAckRefused)
+			return
+		}
+		// Keep the final authorization check immediately adjacent to the ACK.
+		// A success ACK commits an infallible root cancellation; if the ACK cannot
+		// be written, leave the agent running so the relay can truthfully retry.
+		if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
+			d.audit.record(auditEntry{Event: "shutdown", Allowed: false, Detail: err.Error()})
+			d.writeShutdownAck(stream, header, actionDeadline, fenceRefusalStatus(err))
+			return
+		}
+		if !commitShutdown(cancel, func() bool {
+			return d.writeShutdownAck(stream, header, actionDeadline, relay.ActionAckSuccess)
+		}) {
+			return
+		}
 		d.audit.record(auditEntry{Event: "shutdown", Allowed: true})
-		d.handleShutdown()
+		d.logf("shutdown requested by relay; exiting")
 	case relay.KindEvent:
 		d.notifyEvent() // upstream data changed (web UI); TUI refetches
 	default:
 		d.logf("unknown stream kind %q", header.Kind)
+	}
+}
+
+func fenceRefusalStatus(err error) relay.ActionAckStatus {
+	if relay.IsStreamFenceExpired(err) {
+		return relay.ActionAckExpired
+	}
+	return relay.ActionAckRefused
+}
+
+// commitShutdown defines the irrevocable shutdown commit point. A successful
+// ACK write completed inside the action fence authorizes shutdown permanently;
+// root cancellation is its infallible fulfillment. The defer guarantees that
+// cancellation is the very next operation, with no logging, audit I/O, or other
+// fallible work between the successful write and fulfillment.
+func commitShutdown(cancel context.CancelFunc, acknowledge func() bool) (committed bool) {
+	if !acknowledge() {
+		return false
+	}
+	defer cancel()
+	return true
+}
+
+type shutdownAckWriteResult struct {
+	err       error
+	completed time.Time
+}
+
+func (d *system) actionTime() time.Time {
+	if d.actionNow != nil {
+		return d.actionNow()
+	}
+	return time.Now()
+}
+
+func (d *system) writeShutdownAck(stream net.Conn, h relay.StreamHeader, actionDeadline time.Time, status relay.ActionAckStatus) bool {
+	now := d.actionTime()
+	deadline := now.Add(shutdownAckWriteTO)
+	// Success carries authority and therefore must complete inside NotAfter. A
+	// non-success result carries no authority: while its fence is live it uses
+	// the same bound, but an already-expired/refused action still gets one second
+	// to report that truthful terminal result to the relay.
+	if (status == relay.ActionAckSuccess || now.Before(actionDeadline)) && actionDeadline.Before(deadline) {
+		deadline = actionDeadline
+	}
+	if !now.Before(deadline) {
+		return false
+	}
+
+	// newSystem initializes this in production. The guarded lazy path keeps
+	// narrow tests that construct a system literal safe without adding a second
+	// source of unbounded writer goroutines.
+	d.mu.Lock()
+	if d.shutdownAckSlots == nil {
+		d.shutdownAckSlots = make(chan struct{}, maxAsyncShutdownAckWrites)
+	}
+	slots := d.shutdownAckSlots
+	d.mu.Unlock()
+	select {
+	case slots <- struct{}{}:
+	default:
+		d.logf("shutdown acknowledgment refused: writer limit reached")
+		return false
+	}
+
+	_ = stream.SetWriteDeadline(deadline)
+	result := make(chan shutdownAckWriteResult, 1)
+	go func() {
+		if !d.actionTime().Before(deadline) {
+			<-slots
+			result <- shutdownAckWriteResult{err: context.DeadlineExceeded, completed: d.actionTime()}
+			return
+		}
+		err := relay.WriteActionAck(stream, relay.NewActionAck(h, status))
+		completed := d.actionTime()
+		<-slots
+		result <- shutdownAckWriteResult{err: err, completed: completed}
+	}()
+
+	accept := func(r shutdownAckWriteResult) bool {
+		if r.err != nil {
+			d.logf("shutdown acknowledgment failed: %v", r.err)
+			return false
+		}
+		if !r.completed.Before(deadline) {
+			_ = stream.Close()
+			d.logf("shutdown acknowledgment exceeded its action fence")
+			return false
+		}
+		return true
+	}
+	// Prefer a write that completed before the deadline even if this goroutine
+	// was not scheduled again until the timer also became ready. The completed
+	// timestamp is the commit point; a later scheduler pause cannot revoke it.
+	select {
+	case r := <-result:
+		return accept(r)
+	default:
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case r := <-result:
+		return accept(r)
+	case <-timer.C:
+		select {
+		case r := <-result:
+			return accept(r)
+		default:
+			_ = stream.Close()
+			d.logf("shutdown acknowledgment exceeded its action fence")
+			return false
+		}
 	}
 }
 
@@ -209,9 +363,10 @@ func (d *proxyIdleDeadline) reset() {
 }
 
 // handleProxy dials a local TCP port and pipes raw bytes both ways.
-func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
+func (d *system) handleProxy(stream net.Conn, br io.Reader, h relay.StreamHeader, actionDeadline time.Time) {
 	d.addSession(1)
 	defer d.addSession(-1)
+	port := h.Port
 
 	// Two independent checks, both of which must pass. Local policy is decided
 	// here and comes from this machine's own config file; the exposed-port list
@@ -239,11 +394,31 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
 		return
 	}
 
+	if d.beforeProxyDial != nil {
+		d.beforeProxyDial()
+	}
+	if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
+		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: err.Error(), Allowed: false})
+		d.logf("proxy refused at dial boundary: %v", err)
+		return
+	}
+	_ = stream.SetDeadline(actionDeadline)
+	ctx, cancel := context.WithDeadline(context.Background(), actionDeadline)
+	defer cancel()
+	dial := d.proxyDialContext
+	if dial == nil {
+		dialer := &net.Dialer{Timeout: proxyConnectTO}
+		dial = dialer.DialContext
+	}
 	p := strconv.Itoa(port)
-	local, err := net.Dial("tcp", net.JoinHostPort("127.0.0.1", p))
+	local, err := dial(ctx, "tcp", net.JoinHostPort("127.0.0.1", p))
 	if err != nil {
 		// Dev servers (Vite, Node, …) often bind IPv6 loopback only; try ::1 too.
-		local, err = net.Dial("tcp", net.JoinHostPort("::1", p))
+		if fenceErr := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); fenceErr != nil {
+			err = fenceErr
+		} else {
+			local, err = dial(ctx, "tcp", net.JoinHostPort("::1", p))
+		}
 	}
 	if err != nil {
 		d.logf("proxy dial :%d: %v", port, err)
@@ -252,6 +427,18 @@ func (d *system) handleProxy(stream net.Conn, br io.Reader, port int) {
 		return
 	}
 	defer local.Close()
+	if d.afterProxyDial != nil {
+		d.afterProxyDial()
+	}
+	if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil || ctx.Err() != nil {
+		if err == nil {
+			err = ctx.Err()
+		}
+		d.audit.record(auditEntry{Event: "proxy", Port: port, Detail: err.Error(), Allowed: false})
+		d.logf("proxy refused after dial: %v", err)
+		return
+	}
+	_ = stream.SetDeadline(time.Time{})
 	d.audit.record(auditEntry{Event: "proxy", Port: port, Allowed: true})
 	d.logf("proxy session -> :%d", port)
 	defer d.logf("proxy session closed (:%d)", port)
