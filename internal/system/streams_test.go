@@ -5,20 +5,42 @@ package system
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/nicodes/ormos/relay"
 )
+
+func fencedHeader(h relay.StreamHeader) relay.StreamHeader {
+	h.ActionFence = strings.Repeat("a", 40)
+	h.NotAfterMilli = time.Now().Add(5 * time.Second).UnixMilli()
+	return h
+}
+
+func acceptedFenceDeadline(t *testing.T, h relay.StreamHeader) time.Time {
+	t.Helper()
+	deadline, err := relay.AcceptStreamFence(h, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return deadline
+}
 
 func TestExpandHomeExpandsTildeAndEnv(t *testing.T) {
 	home, err := os.UserHomeDir()
@@ -71,8 +93,8 @@ func TestExpandRelayCwdRejectsEnvVars(t *testing.T) {
 func TestTerminalRefusesDollarCwd(t *testing.T) {
 	withTempConfigDir(t) // no policy file: everything would otherwise be allowed
 	d := &system{terminals: make(map[string]*terminalSession), audit: newAuditor()}
-	header := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "probe", Cwd: "$HOME", Cols: 80, Rows: 24}
-	if _, err := d.terminal(header); err == nil || !strings.Contains(err.Error(), "$") {
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "probe", Cwd: "$HOME", Cols: 80, Rows: 24})
+	if _, err := d.terminal(header, acceptedFenceDeadline(t, header)); err == nil || !strings.Contains(err.Error(), "$") {
 		t.Fatalf("terminal($HOME) error = %v, want a refusal", err)
 	}
 	if d.terminals["probe"] != nil {
@@ -103,6 +125,603 @@ func TestServeStreamDropsHeaderlessStream(t *testing.T) {
 	}
 }
 
+func TestShutdownRequiresLiveAgentFence(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	stopped := make(chan struct{}, 1)
+	d.setCancel(func() { stopped <- struct{}{} })
+
+	send := func(header relay.StreamHeader) relay.ActionAck {
+		agent, client := net.Pipe()
+		done := make(chan struct{})
+		go func() {
+			d.serveStream(agent)
+			close(done)
+		}()
+		if err := relay.WriteHeader(client, header); err != nil {
+			t.Fatal(err)
+		}
+		ack, err := relay.ReadActionAck(client)
+		if err != nil {
+			t.Fatalf("reading shutdown ack: %v", err)
+		}
+		_ = client.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("shutdown stream did not finish")
+		}
+		if err := relay.ValidateActionAck(header, ack); err != nil {
+			t.Fatalf("shutdown ack: %v", err)
+		}
+		return ack
+	}
+
+	expired := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	expired.NotAfterMilli = time.Now().Add(-time.Millisecond).UnixMilli()
+	if ack := send(expired); ack.Status != relay.ActionAckExpired {
+		t.Fatalf("expired shutdown ack = %q", ack.Status)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("expired shutdown fence stopped the agent")
+	default:
+	}
+
+	refused := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	refused.ActionFence = "short"
+	if ack := send(refused); ack.Status != relay.ActionAckRefused {
+		t.Fatalf("refused shutdown ack = %q", ack.Status)
+	}
+
+	if ack := send(fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})); ack.Status != relay.ActionAckSuccess {
+		t.Fatalf("live shutdown ack = %q", ack.Status)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("live shutdown fence did not stop the agent")
+	}
+}
+
+func TestShutdownRechecksFenceImmediatelyBeforeExecution(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	stopped := make(chan struct{}, 1)
+	d.setCancel(func() { stopped <- struct{}{} })
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	d.beforeShutdownAction = func() {
+		close(parked)
+		<-release
+	}
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		d.serveStream(agent)
+		close(done)
+	}()
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
+	if err := relay.WriteHeader(client, header); err != nil {
+		t.Fatal(err)
+	}
+	<-parked
+	time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
+	close(release)
+	ack, err := relay.ReadActionAck(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack.Status != relay.ActionAckExpired || relay.ValidateActionAck(header, ack) != nil {
+		t.Fatalf("parked shutdown ack = %+v", ack)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("shutdown executed after its fence expired")
+	default:
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expired shutdown stream did not finish")
+	}
+}
+
+type failingAckConn struct {
+	net.Conn
+	reader *bytes.Reader
+}
+
+func (c *failingAckConn) Read(p []byte) (int, error)       { return c.reader.Read(p) }
+func (c *failingAckConn) Write([]byte) (int, error)        { return 0, errors.New("tunnel lost") }
+func (c *failingAckConn) Close() error                     { return nil }
+func (c *failingAckConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *failingAckConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestShutdownAckFailureLeavesAgentRunning(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	stopped := make(chan struct{}, 1)
+	d.setCancel(func() { stopped <- struct{}{} })
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	var wire bytes.Buffer
+	if err := relay.WriteHeader(&wire, header); err != nil {
+		t.Fatal(err)
+	}
+	d.serveStream(&failingAckConn{reader: bytes.NewReader(wire.Bytes())})
+	select {
+	case <-stopped:
+		t.Fatal("failed success acknowledgment cancelled the agent")
+	default:
+	}
+}
+
+func TestSuccessfulShutdownAckImmediatelyFulfillsRootCancellation(t *testing.T) {
+	var order []string
+	if !commitShutdown(func() { order = append(order, "cancel") }, func() bool {
+		order = append(order, "ack")
+		return true
+	}) {
+		t.Fatal("successful ACK did not commit shutdown")
+	}
+	if got := strings.Join(order, ","); got != "ack,cancel" {
+		t.Fatalf("shutdown commit order = %q, want ack,cancel", got)
+	}
+}
+
+type stalledAckConn struct {
+	net.Conn
+	reader    *bytes.Reader
+	started   chan struct{}
+	release   chan struct{}
+	writeDone chan struct{}
+	mu        sync.Mutex
+	deadline  time.Time
+}
+
+func (c *stalledAckConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+func (c *stalledAckConn) Write(p []byte) (int, error) {
+	close(c.started)
+	<-c.release // deliberately ignores both SetWriteDeadline and Close
+	close(c.writeDone)
+	return len(p), nil
+}
+func (c *stalledAckConn) Close() error                    { return nil }
+func (c *stalledAckConn) SetReadDeadline(time.Time) error { return nil }
+func (c *stalledAckConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	c.deadline = deadline
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *stalledAckConn) writeDeadline() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.deadline
+}
+
+func TestShutdownAckCannotCommitPastNotAfterWhenWriteStalls(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	base := time.Now()
+	var elapsed atomic.Int64
+	d.actionNow = func() time.Time { return base.Add(time.Duration(elapsed.Load())) }
+	stopped := make(chan struct{}, 1)
+	d.setCancel(func() { stopped <- struct{}{} })
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	header.NotAfterMilli = base.Add(500 * time.Millisecond).UnixMilli()
+	actionDeadline, err := relay.AcceptStreamFence(header, d.actionTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &stalledAckConn{
+		reader: bytes.NewReader(nil), started: make(chan struct{}),
+		release: make(chan struct{}), writeDone: make(chan struct{}),
+	}
+	done := make(chan struct{})
+	go func() {
+		if commitShutdown(d.shutdownCancel(), func() bool {
+			return d.writeShutdownAck(conn, header, actionDeadline, relay.ActionAckSuccess)
+		}) {
+			// commitShutdown itself invokes cancellation; no additional action.
+		}
+		close(done)
+	}()
+	<-conn.started
+	elapsed.Store(int64(actionDeadline.Sub(base) + time.Millisecond))
+	close(conn.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stalled ACK was not bounded by NotAfter")
+	}
+	if got, want := conn.writeDeadline(), time.UnixMilli(header.NotAfterMilli); !got.Equal(want) {
+		t.Fatalf("ACK deadline = %s, want NotAfter %s", got, want)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("ACK that stalled past NotAfter cancelled the agent")
+	default:
+	}
+	select {
+	case <-conn.writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("late ACK writer did not retire")
+	}
+}
+
+func TestShutdownAckDeadlineUsesOneSecondWhenFenceIsLater(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	release := make(chan struct{})
+	close(release)
+	conn := &stalledAckConn{
+		reader: bytes.NewReader(nil), started: make(chan struct{}),
+		release: release, writeDone: make(chan struct{}),
+	}
+	before := time.Now()
+	if !d.writeShutdownAck(conn, header, acceptedFenceDeadline(t, header), relay.ActionAckSuccess) {
+		t.Fatal("immediate ACK did not complete")
+	}
+	after := time.Now()
+	deadline := conn.writeDeadline()
+	if deadline.Before(before.Add(900*time.Millisecond)) || deadline.After(after.Add(shutdownAckWriteTO)) {
+		t.Fatalf("ACK deadline = %s, want now + %s", deadline, shutdownAckWriteTO)
+	}
+}
+
+func TestShutdownAckAsyncWritersAreCapped(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	header.NotAfterMilli = time.Now().Add(300 * time.Millisecond).UnixMilli()
+	actionDeadline := acceptedFenceDeadline(t, header)
+	conns := make([]*stalledAckConn, 0, maxAsyncShutdownAckWrites)
+	results := make(chan bool, maxAsyncShutdownAckWrites)
+	for range maxAsyncShutdownAckWrites {
+		conn := &stalledAckConn{
+			reader: bytes.NewReader(nil), started: make(chan struct{}),
+			release: make(chan struct{}), writeDone: make(chan struct{}),
+		}
+		conns = append(conns, conn)
+		go func() { results <- d.writeShutdownAck(conn, header, actionDeadline, relay.ActionAckSuccess) }()
+	}
+	for _, conn := range conns {
+		select {
+		case <-conn.started:
+		case <-time.After(time.Second):
+			t.Fatal("capped ACK writer did not start")
+		}
+	}
+	extra := &stalledAckConn{
+		reader: bytes.NewReader(nil), started: make(chan struct{}),
+		release: make(chan struct{}), writeDone: make(chan struct{}),
+	}
+	extraHeader := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+	if d.writeShutdownAck(extra, extraHeader, acceptedFenceDeadline(t, extraHeader), relay.ActionAckSuccess) {
+		t.Fatal("ACK beyond the global writer cap succeeded")
+	}
+	select {
+	case <-extra.started:
+		t.Fatal("ACK beyond the global writer cap spawned a writer")
+	default:
+	}
+	for range maxAsyncShutdownAckWrites {
+		select {
+		case committed := <-results:
+			if committed {
+				t.Fatal("stalled ACK unexpectedly committed")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("stalled capped ACK caller did not return")
+		}
+	}
+	for _, conn := range conns {
+		close(conn.release)
+		select {
+		case <-conn.writeDone:
+		case <-time.After(time.Second):
+			t.Fatal("stalled capped ACK writer did not retire")
+		}
+	}
+}
+
+func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testing.T) {
+	withTempConfigDir(t)
+	received := make(chan relay.ActionAck)
+	tunnelClosed := make(chan struct{})
+	serverErr := make(chan error, 1)
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer ws.Close(websocket.StatusNormalClosure, "")
+		sess, err := relay.ClientSession(relay.NetConn(context.Background(), ws))
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer sess.Close()
+		stream, err := sess.Open()
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer stream.Close()
+		if err := relay.WriteHeader(stream, header); err != nil {
+			serverErr <- err
+			return
+		}
+		ack, err := relay.ReadActionAck(stream)
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		received <- ack
+		<-sess.CloseChan()
+		close(tunnelClosed)
+	}))
+	defer srv.Close()
+
+	root, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	d := newSystem(systemConfig{
+		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
+		PairingToken: "test-pairing-token",
+	})
+	cancelInvoked := make(chan struct{})
+	d.setCancel(func() {
+		close(cancelInvoked)
+		cancelRoot()
+	})
+	result := make(chan error, 1)
+	go func() {
+		_, err := d.connectAndServe(root)
+		result <- err
+	}()
+
+	select {
+	case err := <-serverErr:
+		t.Fatal(err)
+	case ack := <-received:
+		if ack.Status != relay.ActionAckSuccess || relay.ValidateActionAck(header, ack) != nil {
+			t.Fatalf("shutdown acknowledgment = %+v", ack)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("backend did not receive shutdown acknowledgment")
+	}
+	select {
+	case <-cancelInvoked:
+	case <-time.After(time.Second):
+		t.Fatal("root cancellation was not invoked after acknowledgment")
+	}
+	select {
+	case <-tunnelClosed:
+	case err := <-serverErr:
+		t.Fatal(err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("tunnel stayed open after acknowledged shutdown")
+	}
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("agent tunnel did not return after root cancellation")
+	}
+}
+
+func TestProxyFenceBoundsBothDialsAndPostDialBoundary(t *testing.T) {
+	withTempConfigDir(t)
+	const port = 3000
+
+	t.Run("parked before dial", func(t *testing.T) {
+		d := newSystem(systemConfig{})
+		d.mu.Lock()
+		d.ports = []PortStatus{{Port: port}}
+		d.mu.Unlock()
+		parked := make(chan struct{})
+		release := make(chan struct{})
+		d.beforeProxyDial = func() { close(parked); <-release }
+		var calls atomic.Int32
+		d.proxyDialContext = func(context.Context, string, string) (net.Conn, error) {
+			calls.Add(1)
+			return nil, fmt.Errorf("unexpected dial")
+		}
+		agent, client := net.Pipe()
+		defer client.Close()
+		done := make(chan struct{})
+		header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
+		header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
+		actionDeadline := acceptedFenceDeadline(t, header)
+		go func() { d.handleProxy(agent, agent, header, actionDeadline); agent.Close(); close(done) }()
+		<-parked
+		time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
+		close(release)
+		<-done
+		if calls.Load() != 0 {
+			t.Fatalf("expired proxy made %d dials", calls.Load())
+		}
+	})
+
+	t.Run("blocked dials inherit not-after", func(t *testing.T) {
+		d := newSystem(systemConfig{})
+		d.mu.Lock()
+		d.ports = []PortStatus{{Port: port}}
+		d.mu.Unlock()
+		var calls atomic.Int32
+		d.proxyDialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			if calls.Add(1) == 1 {
+				return nil, fmt.Errorf("IPv4 dropped")
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		agent, client := net.Pipe()
+		defer client.Close()
+		go func() { _, _ = io.Copy(io.Discard, client) }()
+		header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
+		header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
+		done := make(chan struct{})
+		start := time.Now()
+		actionDeadline := acceptedFenceDeadline(t, header)
+		go func() { d.handleProxy(agent, agent, header, actionDeadline); agent.Close(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("blocked proxy dial outlived NotAfter")
+		}
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("proxy dial returned after %s", elapsed)
+		}
+		if calls.Load() != 2 {
+			t.Fatalf("loopback dial attempts = %d, want both addresses", calls.Load())
+		}
+	})
+
+	t.Run("parked after dial closes late connection", func(t *testing.T) {
+		d := newSystem(systemConfig{})
+		d.mu.Lock()
+		d.ports = []PortStatus{{Port: port}}
+		d.mu.Unlock()
+		local, peer := net.Pipe()
+		defer peer.Close()
+		d.proxyDialContext = func(context.Context, string, string) (net.Conn, error) { return local, nil }
+		parked := make(chan struct{})
+		release := make(chan struct{})
+		d.afterProxyDial = func() { close(parked); <-release }
+		agent, client := net.Pipe()
+		defer client.Close()
+		header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
+		header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
+		done := make(chan struct{})
+		actionDeadline := acceptedFenceDeadline(t, header)
+		go func() { d.handleProxy(agent, agent, header, actionDeadline); agent.Close(); close(done) }()
+		<-parked
+		time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
+		close(release)
+		<-done
+		_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := peer.Read(make([]byte, 1)); err == nil {
+			t.Fatal("post-deadline proxy connection remained open")
+		}
+	})
+}
+
+func TestProxyRollbackDuringStallCannotExtendAcceptedFence(t *testing.T) {
+	withTempConfigDir(t)
+	const port = 3000
+	d := newSystem(systemConfig{})
+	d.mu.Lock()
+	d.ports = []PortStatus{{Port: port}}
+	d.mu.Unlock()
+	accepted := time.Now()
+	var elapsed atomic.Int64
+	d.actionNow = func() time.Time { return accepted.Add(time.Duration(elapsed.Load())) }
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
+	header.NotAfterMilli = accepted.Add(200 * time.Millisecond).UnixMilli()
+	actionDeadline, err := relay.AcceptStreamFence(header, d.actionTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Equivalent to a wall rollback after acceptance: the unchanged absolute
+	// timestamp would now appear much farther away if the handler reconstructed
+	// it. The carried monotonic deadline must remain the sole authority.
+	header.NotAfterMilli = accepted.Add(time.Hour).UnixMilli()
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	d.beforeProxyDial = func() { close(parked); <-release }
+	var dials atomic.Int32
+	d.proxyDialContext = func(context.Context, string, string) (net.Conn, error) {
+		dials.Add(1)
+		return nil, fmt.Errorf("unexpected dial")
+	}
+	agent, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() { d.handleProxy(agent, agent, header, actionDeadline); agent.Close(); close(done) }()
+	<-parked
+	elapsed.Store(int64(250 * time.Millisecond))
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("wall rollback extended a stalled proxy fence")
+	}
+	if dials.Load() != 0 {
+		t.Fatalf("wall rollback permitted %d post-deadline dials", dials.Load())
+	}
+}
+
+func TestTerminalRechecksFenceAfterHandshakeBeforeCreate(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	d.beforeTerminalAction = func() { close(parked); <-release }
+	header := fencedHeader(relay.StreamHeader{
+		Kind: relay.KindTerminal, SessionID: "parked-create", Cols: 80, Rows: 24,
+	})
+	header.NotAfterMilli = time.Now().Add(200 * time.Millisecond).UnixMilli()
+	agent, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() { d.serveStream(agent); close(done) }()
+	if err := relay.WriteHeader(client, header); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.WriteClientHello(client, clientKey.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := relay.ReadServerHello(client); err != nil {
+		t.Fatal(err)
+	}
+	<-parked
+	time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("expired terminal create did not return")
+	}
+	if d.terminals[header.SessionID] != nil {
+		t.Fatal("terminal PTY was created after NotAfter")
+	}
+}
+
+func TestTerminalRechecksFenceBeforeReattach(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	d.terminals["parked-reattach"] = &terminalSession{id: "parked-reattach", owner: d, cwd: ""}
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	d.beforeTerminalAction = func() { close(parked); <-release }
+	header := fencedHeader(relay.StreamHeader{
+		Kind: relay.KindTerminal, SessionID: "parked-reattach", Cols: 80, Rows: 24,
+	})
+	header.NotAfterMilli = time.Now().Add(150 * time.Millisecond).UnixMilli()
+	done := make(chan error, 1)
+	deadline := acceptedFenceDeadline(t, header)
+	go func() { _, err := d.terminal(header, deadline); done <- err }()
+	<-parked
+	time.Sleep(time.Until(time.UnixMilli(header.NotAfterMilli)) + 25*time.Millisecond)
+	close(release)
+	if err := <-done; !relay.IsStreamFenceExpired(err) {
+		t.Fatalf("reattach error = %v, want expired fence", err)
+	}
+}
+
 // The deadline covers the header only: a stream that announced itself
 // promptly must keep working past it — a proxy pipe's only pacing after the
 // header is the idle bound, which bytes must keep resetting.
@@ -121,7 +740,7 @@ func TestServeStreamClearsHeaderDeadline(t *testing.T) {
 	agent, client := net.Pipe()
 	defer client.Close()
 	go d.serveStream(agent)
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+	if err := relay.WriteHeader(client, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * headerReadTO)
@@ -162,7 +781,7 @@ func TestProxyPipeDropsASilentPeer(t *testing.T) {
 		d.serveStream(agent)
 		close(done)
 	}()
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+	if err := relay.WriteHeader(client, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})); err != nil {
 		t.Fatal(err)
 	}
 	// ...and then nothing, ever.
@@ -200,7 +819,7 @@ func TestProxyPipeResetsItsIdleDeadlineOnBytes(t *testing.T) {
 	agent, client := net.Pipe()
 	defer client.Close()
 	go d.serveStream(agent)
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+	if err := relay.WriteHeader(client, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})); err != nil {
 		t.Fatal(err)
 	}
 	_ = client.SetDeadline(time.Now().Add(10 * time.Second))
@@ -235,7 +854,7 @@ func TestProxyPipeOneWayTrafficResetsItsIdleDeadline(t *testing.T) {
 	agent, client := net.Pipe()
 	defer client.Close()
 	go d.serveStream(agent)
-	if err := relay.WriteHeader(client, relay.StreamHeader{Kind: relay.KindProxy, Port: port}); err != nil {
+	if err := relay.WriteHeader(client, fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})); err != nil {
 		t.Fatal(err)
 	}
 	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -404,7 +1023,7 @@ func TestTerminalHandshakeDeadlineDropsASilentPeer(t *testing.T) {
 		d.serveStream(agent)
 		close(done)
 	}()
-	header := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "silent", Cols: 80, Rows: 24}
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "silent", Cols: 80, Rows: 24})
 	if err := relay.WriteHeader(client, header); err != nil {
 		t.Fatal(err)
 	}
@@ -447,7 +1066,7 @@ func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
 	defer client.Close()
 	go d.serveStream(agent)
 
-	h := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "idle", Cols: 80, Rows: 24}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "idle", Cols: 80, Rows: 24})
 	if err := relay.WriteHeader(client, h); err != nil {
 		t.Fatal(err)
 	}
@@ -503,8 +1122,10 @@ func proxyResponse(t *testing.T, d *system, port int) (*http.Response, string, s
 	if err := client.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindProxy, Port: port})
+	actionDeadline := acceptedFenceDeadline(t, header)
 	go func() {
-		d.handleProxy(agent, agent, port)
+		d.handleProxy(agent, agent, header, actionDeadline)
 		// serveStream's deferred Close, which is what ends the response.
 		agent.Close()
 	}()
