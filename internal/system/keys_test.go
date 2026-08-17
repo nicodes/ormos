@@ -12,7 +12,10 @@ import (
 // d.key was declared, the handshake header and DeriveSessionKeys both read
 // it -- and nothing ever assigned it. Every connect dereferenced nil.
 //
-// These pin the two halves together so they cannot come apart again.
+// These pin the two STORAGE halves together -- the write and the load -- so they
+// cannot come apart again. Not the header/DeriveSessionKeys pair named above:
+// that one is pinned in internal/system/streams_test.go, by
+// TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith (nicodes/ormos-be#423).
 
 func withTempConfigDir(t *testing.T) string {
 	t.Helper()
