@@ -43,6 +43,33 @@ func acceptedFenceDeadline(t *testing.T, h relay.StreamHeader) time.Time {
 	return deadline
 }
 
+// closeTerminals shuts down every session a test left open, in the one shape
+// that is safe: snapshot the map under terminalMu, then close outside it.
+//
+// Both halves matter. Reading d.terminals unlocked races the tunnel goroutines
+// the test started, which is a -race flake waiting for the detach path to start
+// deleting eagerly (nicodes/ormos-be#429). Closing while HOLDING the lock is
+// worse than a race: terminalSession.close takes owner.terminalMu itself to
+// unregister, so the same goroutine re-acquires a sync.Mutex it already holds
+// and parks for ever. That is a self-deadlock, not a deadlock against another
+// party -- the session's PTY reader also calls close and then parks on
+// closeOnce, so it is a casualty of the stuck goroutine rather than its
+// counterparty.
+//
+// enforcePolicy (terminal_sessions.go) takes exactly this shape in production,
+// for exactly this reason.
+func closeTerminals(d *system) {
+	d.terminalMu.Lock()
+	open := make([]*terminalSession, 0, len(d.terminals))
+	for _, s := range d.terminals {
+		open = append(open, s)
+	}
+	d.terminalMu.Unlock()
+	for _, s := range open {
+		s.close()
+	}
+}
+
 func TestExpandHomeExpandsTildeAndEnv(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -1121,11 +1148,7 @@ func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
 	if err := sealed.WriteFrame(relay.EncodeData([]byte("echo " + marker + "\n"))); err != nil {
 		t.Fatalf("an idle terminal was dropped %s after its handshake: %v", 4*terminalHandshakeTO, err)
 	}
-	t.Cleanup(func() {
-		for _, s := range d.terminals {
-			s.close()
-		}
-	})
+	t.Cleanup(func() { closeTerminals(d) })
 	// The write above only left this process. The terminal is live once the PTY
 	// has echoed the keystroke back and this side has opened it.
 	giveUp := time.After(30 * time.Second)
@@ -1386,9 +1409,13 @@ func TestAgentDialAdvertisesItsKeyAndFenceVersion(t *testing.T) {
 //     is opened here (agent -> browser), and a sealed keystroke reaches the PTY
 //     and comes back echoed (browser -> agent).
 //   - that the advertised value decodes as padded standard base64 of a
-//     SealKeySize key. That is a consequence rather than the subject; the
-//     alphabet itself is pinned to a literal by
-//     TestEncodePublicKeyIsPaddedStandardBase64 in keys_test.go.
+//     SealKeySize key. That is a consequence of needing the bytes, not the
+//     subject, and it is an uneven detector, so it must not be read as a pin on
+//     the encoding: losing the PADDING is caught every time (43 characters,
+//     which the standard decoder refuses outright), while swapping the ALPHABET
+//     alone is caught only when the key happens to encode with a '+' or a '/' --
+//     73.11% of 20,000 random X25519 keys, measured locally. A literal pin for
+//     the alphabet is nicodes/ormos-be#421, which is not on this branch.
 //
 // What it does NOT cover:
 //
@@ -1450,20 +1477,7 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 	agent, client := net.Pipe()
 	defer client.Close()
 	go d.serveStream(agent)
-	// Snapshot under the lock, close outside it: terminalSession.close takes
-	// owner.terminalMu itself to unregister, so closing while holding it
-	// deadlocks the cleanup against the session's own PTY reader.
-	t.Cleanup(func() {
-		d.terminalMu.Lock()
-		open := make([]*terminalSession, 0, len(d.terminals))
-		for _, s := range d.terminals {
-			open = append(open, s)
-		}
-		d.terminalMu.Unlock()
-		for _, s := range open {
-			s.close()
-		}
-	})
+	t.Cleanup(func() { closeTerminals(d) })
 	// One deadline over the whole exchange. A seal-side divergence shows up as a
 	// failed open, but a peer that cannot open what it reads may also simply stop
 	// talking, and this test must report that rather than hang.
@@ -1503,9 +1517,21 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 	// typed, so the agent -> browser direction is testable without waiting on
 	// the shell. Opening it is the assertion; a WriteFrame that returns nil is
 	// not, because a write succeeds whether or not the peer holds the key.
+	// The diagnosis is conditioned on the error rather than asserted over it. A
+	// failed authentication IS a key divergence; an EOF or a timeout says only
+	// that the stream ended, and handleTerminal's other early returns (a refused
+	// fence, a policy refusal, a PTY that would not start) look identical from
+	// out here.
 	if _, err := sealed.ReadFrame(); err != nil {
-		t.Fatalf("a browser sealing to the advertised %s could not open the agent's first frame: %v — the agent is sealing with a key other than the one it published, so every terminal fails on a rejected open with no error saying why",
-			relay.PublicKeyHeader, err)
+		cause := "the stream ended without a sealing failure, so this may not be a key problem at all: " +
+			"a refused fence, a policy refusal or a PTY that would not start look identical from here, " +
+			"and the agent's log line says which"
+		if errors.Is(err, relay.ErrSealFailed) {
+			cause = "the agent sealed with a key other than the one it published, which fails every terminal " +
+				"on every system immediately, with no error saying why"
+		}
+		t.Fatalf("a browser sealing to the advertised %s could not open the agent's first frame: %v — %s",
+			relay.PublicKeyHeader, err, cause)
 	}
 
 	// And the other direction, end to end through the PTY: sealed input the
@@ -1518,7 +1544,18 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 	for !bytes.Contains(seen, []byte(marker)) {
 		frame, err := sealed.ReadFrame()
 		if err != nil {
-			t.Fatalf("a sealed keystroke never came back through the PTY (%v); read %q so far — the agent could not open what the browser sealed to the key it advertised",
+			// Same discipline as above, without the ErrSealFailed branch: the
+			// agent's send key cannot change mid-stream, so by this point a
+			// sealing failure on THIS side has already fired the assertion above
+			// and only a stream that ended can arrive here. Which is exactly why
+			// the message names a suspect instead of convicting one -- the agent
+			// stops reading records it cannot open, and it also stops reading
+			// when the session ended for reasons that have nothing to do with a
+			// key.
+			t.Fatalf("a sealed keystroke never came back through the PTY (%v); opened %q so far — the agent "+
+				"stops reading a stream whose records it cannot open, so a key other than the one it "+
+				"advertised is the first suspect; a session that ended for another reason looks identical "+
+				"from here, and the agent's log line distinguishes them",
 				err, seen)
 		}
 		seen = append(seen, frame.Data...)
