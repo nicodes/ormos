@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/ecdh"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -1046,6 +1047,16 @@ func TestTerminalHandshakeDeadlineDropsASilentPeer(t *testing.T) {
 // than as a red test: the deadline must be CLEARED once the handshake is done.
 // Leaving it armed kills every terminal, busy or not, terminalHandshakeTO after
 // it opens.
+//
+// The keystroke after the idle wait is asserted to come back OPENED, not merely
+// written. A WriteFrame that returns nil says the bytes left this process; it
+// says nothing about whether the peer holds the key to open them, so it is not
+// evidence of a working seal (nicodes/ormos-be#423). What this liveness check
+// needs is that the far end acted on the frame, which the echo is.
+//
+// It is still a deadline test, not a key test. The keys here are both generated
+// in this function, so nothing about the key the agent PUBLISHES is exercised —
+// TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith is what covers that.
 func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
 	prev := terminalHandshakeTO
 	terminalHandshakeTO = 300 * time.Millisecond
@@ -1085,18 +1096,29 @@ func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Drain whatever the shell says, so the agent's writer never blocks.
+	// Drain whatever the shell says, so the agent's writer never blocks — and
+	// keep what was successfully OPENED, because that is what the assertion
+	// below needs. A drain that discarded both the frames and their errors is
+	// what let this test look like it covered the seal.
+	opened := make(chan []byte, terminalSendQueue)
 	go func() {
+		defer close(opened)
 		for {
-			if _, err := sealed.ReadFrame(); err != nil {
+			frame, err := sealed.ReadFrame()
+			if err != nil {
 				return
+			}
+			select {
+			case opened <- frame.Data:
+			default: // full: still draining, still never blocking the writer
 			}
 		}
 	}()
 
 	// An idle terminal is not a broken one.
 	time.Sleep(4 * terminalHandshakeTO)
-	if err := sealed.WriteFrame(relay.EncodeData([]byte("echo still-here\n"))); err != nil {
+	const marker = "still-here"
+	if err := sealed.WriteFrame(relay.EncodeData([]byte("echo " + marker + "\n"))); err != nil {
 		t.Fatalf("an idle terminal was dropped %s after its handshake: %v", 4*terminalHandshakeTO, err)
 	}
 	t.Cleanup(func() {
@@ -1104,6 +1126,21 @@ func TestIdleTerminalSurvivesTheHandshakeDeadline(t *testing.T) {
 			s.close()
 		}
 	})
+	// The write above only left this process. The terminal is live once the PTY
+	// has echoed the keystroke back and this side has opened it.
+	giveUp := time.After(30 * time.Second)
+	var seen []byte
+	for !bytes.Contains(seen, []byte(marker)) {
+		select {
+		case data, ok := <-opened:
+			if !ok {
+				t.Fatalf("the sealed stream ended before the keystroke came back; opened %q so far", seen)
+			}
+			seen = append(seen, data...)
+		case <-giveUp:
+			t.Fatalf("the keystroke was written but never came back opened; opened %q so far", seen)
+		}
+	}
 }
 
 // proxyResponse runs one refused proxy stream and returns the exact bytes the
@@ -1309,7 +1346,10 @@ func TestAgentDialAdvertisesItsKeyAndFenceVersion(t *testing.T) {
 		// header to d.key, which is the key DeriveSessionKeys reads
 		// (terminal_sessions.go). A divergence introduced on the SEAL side --
 		// sealing with something other than d.key while the dial keeps
-		// advertising it -- is not covered here and passes the whole suite.
+		// advertising it -- is not visible here; that is what
+		// TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith below covers, by
+		// deriving the browser's side from the advertised header rather than
+		// from d.key (nicodes/ormos-be#423).
 		if got, want := h.Get(relay.PublicKeyHeader), encodePublicKey(d.key); got != want {
 			t.Errorf("the dial advertised %s = %q, want the key this agent seals with, %q: the relay stores what it is told, so a wrong or absent key means browsers seal to a key the agent cannot open and terminals stop opening with no error anywhere",
 				relay.PublicKeyHeader, got, want)
@@ -1320,5 +1360,167 @@ func TestAgentDialAdvertisesItsKeyAndFenceVersion(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the relay never received a dial")
+	}
+}
+
+// The severe case of the class, and the only one that breaks a single
+// self-consistent build rather than a mixed-version pair: the key the dial
+// ADVERTISES and the key handleTerminal SEALS with are two separate reads of
+// d.key, and nothing tied them together. Sealing with a freshly generated key
+// per handshake while connectAndServe kept advertising d.key left the entire
+// agent suite green (nicodes/ormos-be#423). The relay stores whatever key it is
+// told and browsers seal to that, so the consequence is every terminal on every
+// system failing immediately on a rejected AEAD open of frames that arrived
+// looking perfectly well-formed — with no error saying why.
+//
+// So both halves run against one system and the seal does the asserting. The
+// dial is real; its header value is decoded the way the relay decodes it; and
+// the browser's side of the handshake derives from THAT value and from nothing
+// else. Diverge the two keys and the derived directions diverge with them, so
+// the first frame the agent sends cannot be opened.
+//
+// What this covers:
+//
+//   - the advertised key is the key DeriveSessionKeys receives, exercised in
+//     both directions of one live sealed stream: the reset frame attach queues
+//     is opened here (agent -> browser), and a sealed keystroke reaches the PTY
+//     and comes back echoed (browser -> agent).
+//   - that the advertised value decodes as padded standard base64 of a
+//     SealKeySize key. That is a consequence rather than the subject; the
+//     alphabet itself is pinned to a literal by
+//     TestEncodePublicKeyIsPaddedStandardBase64 in keys_test.go.
+//
+// What it does NOT cover:
+//
+//   - anything on the relay's side. The relay is a different binary in a
+//     different repository; that it stores this value and hands it to the
+//     browser unchanged cannot be seen from here.
+//   - the out-of-band fingerprint (relay.Fingerprint, printed on startup and
+//     shown in the dashboard). It is derived from the same key at a different
+//     call site, and a divergence there is a comparison a user fails rather
+//     than a terminal that cannot open.
+//   - a browser that keeps sealing to a PREVIOUSLY advertised key. This drives
+//     one dial and one handshake against one key; key rotation across a
+//     reconnect is the republish this test's dial performs, not a case it
+//     asserts about.
+func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
+	withTempConfigDir(t)
+	headers := make(chan http.Header, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case headers <- r.Header.Clone():
+		default:
+		}
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		ws.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer srv.Close()
+
+	d := newSystem(systemConfig{
+		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
+		PairingToken: "test-pairing-token",
+		Shell:        "/bin/sh",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// The tunnel dying immediately is expected: the dial published the key, and
+	// the terminal below is served over a pipe rather than over that tunnel.
+	_, _ = d.connectAndServe(ctx)
+
+	var advertised []byte
+	select {
+	case h := <-headers:
+		value := h.Get(relay.PublicKeyHeader)
+		var err error
+		advertised, err = base64.StdEncoding.DecodeString(value)
+		if err != nil {
+			t.Fatalf("the advertised %s = %q is not padded standard base64: %v — the relay decodes it with that alphabet, so it would store no key at all",
+				relay.PublicKeyHeader, value, err)
+		}
+		if len(advertised) != relay.SealKeySize {
+			t.Fatalf("the advertised %s decoded to %d bytes, want %d", relay.PublicKeyHeader, len(advertised), relay.SealKeySize)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the relay never received a dial")
+	}
+
+	agent, client := net.Pipe()
+	defer client.Close()
+	go d.serveStream(agent)
+	// Snapshot under the lock, close outside it: terminalSession.close takes
+	// owner.terminalMu itself to unregister, so closing while holding it
+	// deadlocks the cleanup against the session's own PTY reader.
+	t.Cleanup(func() {
+		d.terminalMu.Lock()
+		open := make([]*terminalSession, 0, len(d.terminals))
+		for _, s := range d.terminals {
+			open = append(open, s)
+		}
+		d.terminalMu.Unlock()
+		for _, s := range open {
+			s.close()
+		}
+	})
+	// One deadline over the whole exchange. A seal-side divergence shows up as a
+	// failed open, but a peer that cannot open what it reads may also simply stop
+	// talking, and this test must report that rather than hang.
+	if err := client.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "advertised-key", Cols: 80, Rows: 24})
+	if err := relay.WriteHeader(client, h); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := relay.GenerateAgentKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.WriteClientHello(client, clientKey.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	salt, err := relay.ReadServerHello(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The advertised bytes, deliberately -- not d.key, and not agentKey from a
+	// helper. This line is the whole test: a browser has nothing but what the
+	// relay was told, so deriving from anything else here would be asserting
+	// against the agent's private state instead of against its wire contract.
+	keys, err := relay.DeriveSessionKeys(clientKey, advertised, salt, h.SessionID)
+	if err != nil {
+		t.Fatalf("a browser could not derive against the advertised key: %v", err)
+	}
+	sealed, err := relay.NewSealedStream(client, client, keys.ClientToAgent, keys.AgentToClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// attach queues a screen reset and an activity frame before anything is
+	// typed, so the agent -> browser direction is testable without waiting on
+	// the shell. Opening it is the assertion; a WriteFrame that returns nil is
+	// not, because a write succeeds whether or not the peer holds the key.
+	if _, err := sealed.ReadFrame(); err != nil {
+		t.Fatalf("a browser sealing to the advertised %s could not open the agent's first frame: %v — the agent is sealing with a key other than the one it published, so every terminal fails on a rejected open with no error saying why",
+			relay.PublicKeyHeader, err)
+	}
+
+	// And the other direction, end to end through the PTY: sealed input the
+	// agent can actually open, echoed back as sealed output this side can open.
+	const marker = "ormos-seal-both-ways"
+	if err := sealed.WriteFrame(relay.EncodeData([]byte("echo " + marker + "\n"))); err != nil {
+		t.Fatalf("writing a sealed keystroke: %v", err)
+	}
+	var seen []byte
+	for !bytes.Contains(seen, []byte(marker)) {
+		frame, err := sealed.ReadFrame()
+		if err != nil {
+			t.Fatalf("a sealed keystroke never came back through the PTY (%v); read %q so far — the agent could not open what the browser sealed to the key it advertised",
+				err, seen)
+		}
+		seen = append(seen, frame.Data...)
 	}
 }
