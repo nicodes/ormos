@@ -19,7 +19,7 @@ import (
 // compiles cleanly on both sides while silently ending compatibility with
 // everything running the previous spelling.
 //
-// The failure is quiet in each case, which is why the names are worth a test
+// The failure is quiet in each case, which is why the names are worth recording
 // even though neither has any behaviour to exercise:
 //
 //   - PublicKeyHeader — the relay simply never calls SetSystemPubKey, browsers
@@ -29,19 +29,34 @@ import (
 //     renamed header does not fail, it makes every current agent look like a
 //     released legacy one and silently gives up the action fences (#400/#401).
 //
-// This is a golden-value pin, not a duplicate of the production constant. The
-// distinction matters because the adjacent TestValidTerminalSize argues the
-// opposite for MaxTerminalDim — and is right to. There, the property (does the
-// bound survive the uint16 that TIOCSWINSZ takes) is derivable from the
-// constant, so a literal comparison would be a tautology and exercising the
-// cast is the real check. Here there is nothing to derive: a header name is not
-// true or false, it is only the same as what the other side already deployed.
-// A literal is the only thing that can record that, the way
-// TestCurrentAgentAdvertisesOnlyV2 below records the advertised version.
+// This duplicates the production constants, which is the entire mechanism: the
+// test's copy is the record of what was deployed, and the constant is what the
+// next build will send. A header name derives from nothing — it is not true or
+// false, only the same or not the same as what the other side already shipped —
+// so there is no independent oracle to exercise instead, and writing the literal
+// down is the only check available. Contrast MaxTerminalDim, where
+// TestValidTerminalSize can round-trip the bound through the uint16 that
+// TIOCSWINSZ takes and let the reason do the asserting; nothing equivalent
+// exists for a string that means "what the relay is listening for".
+//
+// What this pin does NOT cover, so it is not mistaken for more:
+//
+//   - Whether the agent still SENDS either header. Deleting an entry from
+//     connectAndServe's HTTPHeader map is invisible here and produces exactly
+//     the two failures listed above. That is covered separately, by
+//     TestAgentDialAdvertisesItsKeyAndFenceVersion in internal/system.
+//   - A rename on the relay's side. This binds the constant, not the relay's
+//     code; if the hosted relay ever hardcoded its own literal instead of
+//     importing this one, the pin would be blind to the divergence and could
+//     not fail.
+//   - Case. HTTP header names are case-insensitive on the wire and a reader
+//     using http.Header.Get canonicalises, so a case-only respelling would stay
+//     compatible yet fail this test. Stricter than the contract, in the safe
+//     direction.
 //
 // So: changing a spelling here is meant to be a deliberate act that fails this
-// test and sends you to the compatibility window in the README, not something
-// a rename tool does on the way past.
+// test and sends you to the rollout ordering in the README's protocol
+// compatibility section, not something a rename tool does on the way past.
 func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
 	for _, tc := range []struct{ name, got, want string }{
 		{"PublicKeyHeader", PublicKeyHeader, "X-Ormos-Public-Key"},
@@ -50,7 +65,7 @@ func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
 		if tc.got != tc.want {
 			t.Errorf("%s = %q, want the deployed wire spelling %q. "+
 				"Renaming a handshake header breaks compatibility with the released agent "+
-				"and the deployed relay; see the protocol compatibility window in README.md.",
+				"and the deployed relay; see the rollout ordering under Protocol compatibility in README.md.",
 				tc.name, tc.got, tc.want)
 		}
 	}
