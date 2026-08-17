@@ -3,6 +3,7 @@ package relay
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,236 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 	if StreamFenceVersion != StreamFenceVersionV2 {
 		t.Fatalf("advertised stream-fence version = %q, want v2 %q", StreamFenceVersion, StreamFenceVersionV2)
 	}
+}
+
+// The wire values of four groups of protocol string, pinned to their literals:
+// the stream-fence versions, the StreamKinds, the ActionAck statuses, and the
+// terminal seal's HKDF label. Not every string in this package — see the list of
+// what is NOT pinned, below, which is the boundary this test does not cross.
+//
+// TestCurrentAgentAdvertisesOnlyV2 above pins the fence version's alias
+// RELATIONSHIP (StreamFenceVersion == StreamFenceVersionV2) and the empty-string
+// legacy sentinel; neither it nor anything else recorded what "2" actually is,
+// so respelling it "v2" kept the whole module green (nicodes/ormos-be#421).
+//
+// The argument is the one TestTunnelHeaderNamesArePinnedToTheirWireSpellings
+// makes for the header names, and it applies unchanged: a value here derives
+// from nothing, so it is not true or false, only the same or not the same as
+// what the other side already shipped. Writing the literal down is the only
+// check available.
+//
+// Three of these fail worse than a plain mismatch:
+//
+//   - sealInfo (seal.go), and it is the worst of the four groups by some
+//     distance. It is not sent anywhere: it is the HKDF label that
+//     scheduleInfo feeds into hkdf.Key, so both ends of a terminal seal derive
+//     their keys from this exact byte string — the agent here, and the browser's
+//     seal.ts named in seal.go. Change it on one side and every
+//     SealedStream.ReadFrame fails its AEAD open on records that arrived looking
+//     perfectly well-formed: no terminal works at all, on any system, with no
+//     error naming the cause. It is the failure #423 was written about, reached
+//     from a third direction.
+//
+//     It is pinned because the value ENDS IN A VERSION and its own comment says
+//     to bump that version when the schedule changes, which is exactly right and
+//     exactly the invitation. A bump is a coordinated two-sided deployment, not a
+//     tidy-up, and nothing said so where the bumper would see it.
+//
+//     Scoped honestly, because the first version of this comment was not: a bump
+//     is NOT unguarded everywhere. The backend repository holds cross-language
+//     seal vectors, committed as data and asserted from both the Go and the
+//     TypeScript side, and a changed label changes the derived keys and breaks
+//     them — measured, on nicodes/ormos-be#433. So the claim this pin can make is
+//     about THIS repository only. It earns its place anyway, and for a specific
+//     reason: the agent is installed straight from here with `go install
+//     github.com/nicodes/ormos@latest` and releases on its own schedule, with no
+//     vectors of its own, so without this row an agent release could ship a bumped
+//     label with its own CI entirely green and only be contradicted later, when
+//     somebody bumped the module on the backend side. This is what makes the agent
+//     repository self-sufficient about its own seal label.
+//
+//   - a fence version. The negotiation treats an UNRECOGNISED value differently
+//     from absence, and absence is the reserved legacy sentinel, so a respelt
+//     value is neither the current protocol nor the documented fallback.
+//
+//   - a StreamKind. serveStream switches on it, and for an unrecognised kind no
+//     handler runs and NO AUDIT ENTRY IS RECORDED, so the request leaves no trace
+//     in the record the agent keeps of what the relay asked it to do. It is not
+//     silent at the console — internal/system/streams.go logs `unknown stream
+//     kind`, and run.go echoes the log ring to stderr on every non-TTY start — so
+//     a headless agent does say something. What it does not do is act, or
+//     remember. What the relay makes of the closed stream it gets back is in
+//     another repository and is not asserted here.
+//
+// StreamFenceVersionV1 is here even though this agent only ever advertises v2,
+// because a deployed relay still reads it to decide what an older agent can be
+// asked to do.
+//
+// What this does NOT cover:
+//
+//   - the relay's side. This binds the constants; if the hosted relay hardcoded
+//     its own literals rather than importing these, the pin is blind to the
+//     divergence and cannot fail.
+//   - whether the agent still SENDS any of them. That is a different gap, and
+//     for the two handshake headers it is covered by
+//     TestAgentDialAdvertisesItsKeyAndFenceVersion in internal/system.
+//   - the rest of this package's wire strings, which are a real and open gap
+//     rather than a decision that they do not matter: contract.go's
+//     DeviceStatusPending/Expired/Approved and its 27 DTO JSON tags, the
+//     Resize and activityFrame tags one screen below StreamHeader, and the
+//     numeric termTag values. All of them are tracked on
+//     nicodes/ormos-be#433. Nothing above guards any of them, and a reader who
+//     needs one of them guarded must add it rather than assume this table did.
+func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
+	for _, tc := range []struct{ name, got, want string }{
+		{"StreamFenceVersionV1", StreamFenceVersionV1, "1"},
+		{"StreamFenceVersionV2", StreamFenceVersionV2, "2"},
+		{"KindTerminal", string(KindTerminal), "terminal"},
+		{"KindProxy", string(KindProxy), "proxy"},
+		{"KindListPorts", string(KindListPorts), "listports"},
+		{"KindShutdown", string(KindShutdown), "shutdown"},
+		{"KindEvent", string(KindEvent), "event"},
+		{"ActionAckSuccess", string(ActionAckSuccess), "success"},
+		{"ActionAckRefused", string(ActionAckRefused), "refused"},
+		{"ActionAckExpired", string(ActionAckExpired), "expired"},
+		{"sealInfo", sealInfo, "ormos terminal seal v2"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want the deployed wire value %q. "+
+				"Respelling one of these ends compatibility with whatever is already deployed on the "+
+				"other side -- the released agent, the hosted relay, or the browser's seal -- and this "+
+				"test may be the only thing in THIS repository that objects. What other repositories "+
+				"check is their own business and is not evidence here. See the rollout ordering under "+
+				"Protocol compatibility in README.md.",
+				tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// The StreamHeader and ActionAck JSON tags, pinned against literal wire bytes.
+//
+// TestHeaderRoundTrip and TestShutdownActionAckRoundTripAndBinding marshal and
+// unmarshal through the SAME struct, so a renamed tag round-trips perfectly and
+// passes them both — while an agent and a relay built from different module
+// versions silently DROP the field. That is the general shape of this defect
+// class: the test that looks like it covers the wire format and structurally
+// cannot (nicodes/ormos-be#421).
+//
+// So neither direction is checked against the other. Both are checked against
+// one hand-written literal:
+//
+//   - decode. Every field of the recorded payload must land. A renamed tag
+//     leaves its field at the zero value, which the comparison catches.
+//   - encode. The exact bytes Marshal produces. This is what catches a
+//     CASE-only respelling, which the decode cannot see: encoding/json accepts
+//     a case-insensitive key match, so `"session_ID"` would still decode
+//     `session_id`. Both ends decode with encoding/json today, so a case change
+//     is in fact still compatible — the pin is stricter than the contract, in
+//     the safe direction, exactly as the header-name pin is about case.
+//
+// The literals are written by hand, not pasted from Marshal's output: a literal
+// generated by the code it checks records whatever that code currently does.
+//
+// The encode direction is exact-bytes, so adding a PLAIN field to either struct
+// fails it, and so does reordering the existing ones. That much is the intent
+// rather than a maintenance cost to design away: a new field on a struct both
+// binaries decode is precisely the change that should stop and read the rollout
+// ordering under Protocol compatibility in README.md.
+//
+// But adding a field tagged `,omitempty` does NOT fail it, and that is the way a
+// field is most likely to be added, since it is the house style on seven of
+// StreamHeader's eight. Marshal omits the new zero field, so the exact-bytes
+// comparison never sees it, and the decode comparison sees zero on both sides.
+// The reason is the same one the omitempty caveat further down gives; the two
+// belong together, because the unqualified version of this sentence is the one a
+// reader would have acted on.
+//
+// Every tag on both structs is covered, which is more than the five the issue
+// names — the payload has to be complete for the exact-bytes comparison to mean
+// anything, and once complete it costs nothing extra. Two values ride along:
+// `"kind":"terminal"` and `"status":"success"` are compared against KindTerminal
+// and ActionAckSuccess, so those two constants are pinned here as well as in
+// TestWireStringValuesArePinnedToTheirLiterals above.
+//
+// Cwd is the field whose loss is easiest to misdiagnose, so the reason is
+// recorded where the tag is pinned. terminalAllowed (internal/system/policy.go)
+// fails CLOSED: with allowedRoots configured an empty cwd is refused outright,
+// and with it unset the shell's default was permitted anyway. So a dropped
+// `cwd` is a correctness and availability bug — terminals stop opening, or open
+// somewhere other than the project the user picked, with no error saying why —
+// and NOT a confinement bypass.
+//
+// What this does NOT cover:
+//
+//   - the relay's side, for the same reason as every other pin here: it binds
+//     these struct tags, not the relay's code.
+//   - omitempty. Every field is populated, so what the wire looks like when a
+//     field is zero is not asserted, and dropping an `omitempty` would not fail
+//     this test.
+func TestStreamHeaderAndActionAckTagsArePinnedToALiteralPayload(t *testing.T) {
+	fence := strings.Repeat("a", 40)
+
+	t.Run("StreamHeader", func(t *testing.T) {
+		const wire = `{"kind":"terminal","port":8080,"cols":120,"rows":40,` +
+			`"cwd":"/code/app","session_id":"project:tab",` +
+			`"action_fence":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",` +
+			`"not_after_milli":1700000000123}`
+		want := StreamHeader{
+			Kind: KindTerminal, Port: 8080, Cols: 120, Rows: 40,
+			Cwd: "/code/app", SessionID: "project:tab",
+			ActionFence: fence, NotAfterMilli: 1_700_000_000_123,
+		}
+
+		var got StreamHeader
+		if err := json.Unmarshal([]byte(wire), &got); err != nil {
+			t.Fatalf("decoding the recorded wire header: %v", err)
+		}
+		if got != want {
+			t.Errorf("the recorded wire header decoded to\n  %+v\nwant\n  %+v\n"+
+				"a field left at its zero value is a renamed tag: the relay and the agent are "+
+				"separate binaries from separate commits, so the field is silently dropped "+
+				"rather than refused — a lost cwd opens the terminal somewhere else or not at "+
+				"all, a lost session_id defeats the ticket's one-tab binding, and a lost "+
+				"action_fence or not_after_milli unbounds the action the stream carries.",
+				got, want)
+		}
+
+		encoded, err := json.Marshal(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(encoded) != wire {
+			t.Errorf("StreamHeader marshalled to\n  %s\nwant the recorded wire payload\n  %s",
+				encoded, wire)
+		}
+	})
+
+	t.Run("ActionAck", func(t *testing.T) {
+		const wire = `{"action_fence":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",` +
+			`"not_after_milli":1700000000123,"status":"success"}`
+		want := ActionAck{ActionFence: fence, NotAfterMilli: 1_700_000_000_123, Status: ActionAckSuccess}
+
+		var got ActionAck
+		if err := json.Unmarshal([]byte(wire), &got); err != nil {
+			t.Fatalf("decoding the recorded wire ack: %v", err)
+		}
+		if got != want {
+			t.Errorf("the recorded wire ack decoded to\n  %+v\nwant\n  %+v\n"+
+				"the ack echoes the fence and deadline to bind the terminal result to the exact "+
+				"shutdown that asked for it, so a renamed tag turns that binding into two zero "+
+				"values that match nothing.",
+				got, want)
+		}
+
+		encoded, err := json.Marshal(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(encoded) != wire {
+			t.Errorf("ActionAck marshalled to\n  %s\nwant the recorded wire payload\n  %s",
+				encoded, wire)
+		}
+	})
 }
 
 func TestValidateStreamFence(t *testing.T) {
@@ -166,6 +397,11 @@ func TestShutdownActionAckRoundTripAndBinding(t *testing.T) {
 	}
 }
 
+// This covers the framing — the newline terminator, and that bytes buffered
+// past it survive for the caller — and NOT the wire format. It marshals and
+// unmarshals through the same struct, so every tag could be renamed together and
+// it would still pass. The tags are pinned by
+// TestStreamHeaderAndActionAckTagsArePinnedToALiteralPayload instead.
 func TestHeaderRoundTrip(t *testing.T) {
 	var buf bytes.Buffer
 	want := StreamHeader{Kind: KindTerminal, Cols: 120, Rows: 40, Cwd: "/code/app", SessionID: "project:tab"}

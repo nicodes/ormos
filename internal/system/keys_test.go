@@ -3,9 +3,13 @@
 package system
 
 import (
+	"crypto/ecdh"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/nicodes/ormos/relay"
 )
 
 // The agent's key was written but never loaded: loadOrCreateKey existed,
@@ -43,6 +47,52 @@ func TestNewSystemLoadsTheTerminalKey(t *testing.T) {
 	// the handshake makes.
 	if got := encodePublicKey(d.key); got == "" {
 		t.Error("encodePublicKey produced nothing")
+	}
+}
+
+// encodePublicKey's output is the whole of what the relay gets to learn about
+// this agent's sealing key, and nothing in this module decodes it: the only
+// consumer is the hosted relay, in another repository and another binary, so
+// there is not even a same-commit compile holding the two spellings together.
+// Switching to base64.RawURLEncoding left this entire suite green, because
+// production and every test called the same function (nicodes/ormos-be#421).
+//
+// Two literals rather than one, so a failure says which half moved:
+//
+//   - the public key of a fixed private key, in hex. That records crypto/ecdh's
+//     X25519 derivation, which is not what this test is for; it is here so a
+//     base64 failure cannot be misread as a key-derivation failure or the other
+//     way round.
+//   - its encoding. This is the pin — the alphabet and the padding, which is
+//     what the relay's decoder has to agree with.
+//
+// The base64 literal was produced from the hex above by a non-Go encoder
+// (Python's base64.b64encode), so it is not a recording of the expression it
+// checks. This key's encoding contains a '/', so an alphabet change fails it
+// independently of the padding.
+//
+// What this does NOT cover: the relay's decoder, in another repository; and any
+// other rendering of the same key — relay.Fingerprint is base32 and belongs to
+// the out-of-band comparison rather than to the handshake.
+func TestEncodePublicKeyIsPaddedStandardBase64(t *testing.T) {
+	var raw [relay.SealKeySize]byte
+	for i := range raw {
+		raw[i] = byte(i + 1)
+	}
+	key, err := ecdh.X25519().NewPrivateKey(raw[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantPub = "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c"
+	if got := hex.EncodeToString(key.PublicKey().Bytes()); got != wantPub {
+		t.Fatalf("X25519 public key of the fixed test private key = %s, want %s -- "+
+			"the derivation moved, so the encoding assertion below would be measuring the wrong bytes", got, wantPub)
+	}
+	const want = "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw="
+	if got := encodePublicKey(key); got != want {
+		t.Errorf("encodePublicKey = %q, want the padded standard-base64 spelling %q that the relay decodes. "+
+			"An alphabet or padding change fails at the relay's decoder rather than here: it stores no key, "+
+			"browsers keep sealing to a stale one, and terminals stop opening with no error anywhere.", got, want)
 	}
 }
 
