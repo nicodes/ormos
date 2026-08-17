@@ -1256,3 +1256,69 @@ func closedLoopbackPort(t *testing.T) int {
 	l.Close()
 	return port
 }
+
+// The literal pin in relay/protocol_test.go records what the handshake header
+// names ARE. It cannot see whether the agent still sends them, and that was the
+// larger half of the risk: until this test, deleting either entry from
+// connectAndServe's HTTPHeader map left the whole suite green, and the
+// consequence is exactly the silent failure the pin's own comment describes —
+// the relay never calls SetSystemPubKey so browsers keep sealing to a stale key,
+// or the fence version goes missing and absence is the reserved v0.1.5 sentinel,
+// so every current agent reads as released-legacy and quietly gives up its
+// action fences. This test is what closes that, so it is worth keeping rather
+// than consolidating away.
+//
+// So the dial is driven for real and the request read on the other side. Header
+// lookup is canonicalised here, deliberately: HTTP header names are
+// case-insensitive on the wire, so this asserts the header ARRIVES while the
+// literal pin asserts what it is spelled.
+func TestAgentDialAdvertisesItsKeyAndFenceVersion(t *testing.T) {
+	withTempConfigDir(t)
+	headers := make(chan http.Header, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case headers <- r.Header.Clone():
+		default:
+		}
+		ws, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		// Nothing is served: the dial itself is the subject.
+		ws.Close(websocket.StatusNormalClosure, "")
+	}))
+	defer srv.Close()
+
+	d := newSystem(systemConfig{
+		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
+		PairingToken: "test-pairing-token",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// The tunnel dying immediately is expected and not what is under test.
+	_, _ = d.connectAndServe(ctx)
+
+	select {
+	case h := <-headers:
+		// The VALUE, not merely presence: "browsers keep sealing to a stale
+		// key" is the outcome an advertised-but-wrong key produces, so an
+		// assertion that only checked for non-empty would name a failure it
+		// could not see.
+		//
+		// One direction only, to be exact about it: this pins the advertised
+		// header to d.key, which is the key DeriveSessionKeys reads
+		// (terminal_sessions.go). A divergence introduced on the SEAL side --
+		// sealing with something other than d.key while the dial keeps
+		// advertising it -- is not covered here and passes the whole suite.
+		if got, want := h.Get(relay.PublicKeyHeader), encodePublicKey(d.key); got != want {
+			t.Errorf("the dial advertised %s = %q, want the key this agent seals with, %q: the relay stores what it is told, so a wrong or absent key means browsers seal to a key the agent cannot open and terminals stop opening with no error anywhere",
+				relay.PublicKeyHeader, got, want)
+		}
+		if got := h.Get(relay.StreamFenceVersionHeader); got != relay.StreamFenceVersion {
+			t.Errorf("the dial carried %s = %q, want %q: absence is the reserved v0.1.5 sentinel, so a missing header does not fail — it downgrades this agent to legacy and gives up the action fences",
+				relay.StreamFenceVersionHeader, got, relay.StreamFenceVersion)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the relay never received a dial")
+	}
+}
