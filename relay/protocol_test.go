@@ -81,12 +81,15 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 	}
 }
 
-// The wire VALUES of every protocol string in this package, pinned to their
-// literals. TestCurrentAgentAdvertisesOnlyV2 above pins the fence version's
-// alias RELATIONSHIP (StreamFenceVersion == StreamFenceVersionV2) and the
-// empty-string legacy sentinel; neither it nor anything else recorded what "2"
-// actually is, so respelling it "v2" kept the whole module green
-// (nicodes/ormos-be#421).
+// The wire values of four groups of protocol string, pinned to their literals:
+// the stream-fence versions, the StreamKinds, the ActionAck statuses, and the
+// terminal seal's HKDF label. Not every string in this package — see the list of
+// what is NOT pinned, below, which is the boundary this test does not cross.
+//
+// TestCurrentAgentAdvertisesOnlyV2 above pins the fence version's alias
+// RELATIONSHIP (StreamFenceVersion == StreamFenceVersionV2) and the empty-string
+// legacy sentinel; neither it nor anything else recorded what "2" actually is,
+// so respelling it "v2" kept the whole module green (nicodes/ormos-be#421).
 //
 // The argument is the one TestTunnelHeaderNamesArePinnedToTheirWireSpellings
 // makes for the header names, and it applies unchanged: a value here derives
@@ -94,15 +97,35 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 // what the other side already shipped. Writing the literal down is the only
 // check available.
 //
-// Two of these fail worse than a plain mismatch:
+// Three of these fail worse than a plain mismatch:
+//
+//   - sealInfo (seal.go), and it is the worst of the four groups by some
+//     distance. It is not sent anywhere: it is the HKDF label that
+//     scheduleInfo feeds into hkdf.Key, so both ends of a terminal seal derive
+//     their keys from this exact byte string — the agent here, and the browser's
+//     seal.ts named in seal.go. Change it on one side and every
+//     SealedStream.ReadFrame fails its AEAD open on records that arrived looking
+//     perfectly well-formed: no terminal works at all, on any system, with no
+//     error naming the cause. It is the failure #423 was written about, reached
+//     from a third direction.
+//
+//     It is pinned because the value ENDS IN A VERSION and its own comment says
+//     to bump that version when the schedule changes, which is exactly right and
+//     exactly the invitation. A bump is a coordinated two-sided deployment, not a
+//     tidy-up, and nothing said so where the bumper would see it.
 //
 //   - a fence version. The negotiation treats an UNRECOGNISED value differently
 //     from absence, and absence is the reserved legacy sentinel, so a respelt
 //     value is neither the current protocol nor the documented fallback.
-//   - a StreamKind. serveStream switches on it and its default is to do nothing
-//     at all, so a respelt kind makes every stream of that kind a silent no-op:
-//     terminals that never open, ports that never proxy, a shutdown request the
-//     relay waits out.
+//
+//   - a StreamKind. serveStream switches on it, and for an unrecognised kind no
+//     handler runs and NO AUDIT ENTRY IS RECORDED, so the request leaves no trace
+//     in the record the agent keeps of what the relay asked it to do. It is not
+//     silent at the console — internal/system/streams.go logs `unknown stream
+//     kind`, and run.go echoes the log ring to stderr on every non-TTY start — so
+//     a headless agent does say something. What it does not do is act, or
+//     remember. What the relay makes of the closed stream it gets back is in
+//     another repository and is not asserted here.
 //
 // StreamFenceVersionV1 is here even though this agent only ever advertises v2,
 // because a deployed relay still reads it to decide what an older agent can be
@@ -116,6 +139,13 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 //   - whether the agent still SENDS any of them. That is a different gap, and
 //     for the two handshake headers it is covered by
 //     TestAgentDialAdvertisesItsKeyAndFenceVersion in internal/system.
+//   - the rest of this package's wire strings, which are a real and open gap
+//     rather than a decision that they do not matter: contract.go's
+//     DeviceStatusPending/Expired/Approved and its 27 DTO JSON tags, the
+//     Resize and activityFrame tags one screen below StreamHeader, and the
+//     numeric termTag values. All of them are tracked on
+//     nicodes/ormos-be#433. Nothing above guards any of them, and a reader who
+//     needs one of them guarded must add it rather than assume this table did.
 func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
 	for _, tc := range []struct{ name, got, want string }{
 		{"StreamFenceVersionV1", StreamFenceVersionV1, "1"},
@@ -128,12 +158,14 @@ func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
 		{"ActionAckSuccess", string(ActionAckSuccess), "success"},
 		{"ActionAckRefused", string(ActionAckRefused), "refused"},
 		{"ActionAckExpired", string(ActionAckExpired), "expired"},
+		{"sealInfo", sealInfo, "ormos terminal seal v2"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %q, want the deployed wire value %q. "+
-				"Respelling a protocol value breaks compatibility with the released agent "+
-				"and the deployed relay without failing anywhere; see the rollout ordering "+
-				"under Protocol compatibility in README.md.",
+				"Respelling one of these ends compatibility with whatever is already deployed on the "+
+				"other side -- the released agent, the hosted relay, or the browser's seal -- and "+
+				"nothing else fails when it does; see the rollout ordering under Protocol "+
+				"compatibility in README.md.",
 				tc.name, tc.got, tc.want)
 		}
 	}
@@ -163,10 +195,19 @@ func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
 // The literals are written by hand, not pasted from Marshal's output: a literal
 // generated by the code it checks records whatever that code currently does.
 //
-// The encode direction is exact-bytes, so ADDING a field to either struct fails
-// it. That is the intent, not a maintenance cost to design away: a new field on
-// a struct both binaries decode is precisely the change that should stop and
-// read the rollout ordering under Protocol compatibility in README.md.
+// The encode direction is exact-bytes, so adding a PLAIN field to either struct
+// fails it, and so does reordering the existing ones. That much is the intent
+// rather than a maintenance cost to design away: a new field on a struct both
+// binaries decode is precisely the change that should stop and read the rollout
+// ordering under Protocol compatibility in README.md.
+//
+// But adding a field tagged `,omitempty` does NOT fail it, and that is the way a
+// field is most likely to be added, since it is the house style on seven of
+// StreamHeader's eight. Marshal omits the new zero field, so the exact-bytes
+// comparison never sees it, and the decode comparison sees zero on both sides.
+// The reason is the same one the omitempty caveat further down gives; the two
+// belong together, because the unqualified version of this sentence is the one a
+// reader would have acted on.
 //
 // Every tag on both structs is covered, which is more than the five the issue
 // names — the payload has to be complete for the exact-bytes comparison to mean

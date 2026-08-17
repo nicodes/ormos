@@ -62,6 +62,14 @@ const (
 	// agreement. Bump the version whenever the schedule changes: v2 binds both
 	// public keys and a per-connection server salt (scheduleInfo), so a client
 	// derives a key against the exact agent it thinks it is talking to.
+	//
+	// A bump is a two-sided deployment, not a version tidy-up. This exact byte
+	// string is the HKDF label on BOTH ends, so an agent and a browser that
+	// disagree about it derive different keys and every ReadFrame fails its AEAD
+	// open on records that arrived looking well-formed — no terminal works, and
+	// nothing says why. Change it here and in seal.ts together, in the rollout
+	// order under Protocol compatibility in README.md. The literal is pinned by
+	// TestWireStringValuesArePinnedToTheirLiterals, which is what will fail first.
 	sealInfo = "ormos terminal seal v2"
 	// maxReusedRecord bounds the record buffer SealedStream.ReadFrame keeps
 	// between calls. Terminal input is keystrokes; anything larger is a paste,
