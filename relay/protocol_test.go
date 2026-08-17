@@ -8,6 +8,69 @@ import (
 	"time"
 )
 
+// The tunnel handshake header NAMES, pinned to their wire spellings.
+//
+// Both constants are single-sourced in this package and imported by the agent
+// (internal/system/system.go sets both when it dials) and by the hosted relay,
+// so a rename cannot make the two halves of one build disagree. What it can do
+// is make this build disagree with the OTHER version already deployed: the
+// relay in production and the agents on `@latest` are separate binaries built
+// from separate commits, and a shared-module bump that carries a renamed header
+// compiles cleanly on both sides while silently ending compatibility with
+// everything running the previous spelling.
+//
+// The failure is quiet in each case, which is why the names are worth recording
+// even though neither has any behaviour to exercise:
+//
+//   - PublicKeyHeader — the relay simply never calls SetSystemPubKey, browsers
+//     keep sealing to a stale key, and terminals stop opening with no error
+//     anywhere.
+//   - StreamFenceVersionHeader — absence is the reserved v0.1.5 sentinel, so a
+//     renamed header does not fail, it makes every current agent look like a
+//     released legacy one and silently gives up the action fences (#400/#401).
+//
+// This duplicates the production constants, which is the entire mechanism: the
+// test's copy is the record of what was deployed, and the constant is what the
+// next build will send. A header name derives from nothing — it is not true or
+// false, only the same or not the same as what the other side already shipped —
+// so there is no independent oracle to exercise instead, and writing the literal
+// down is the only check available. Contrast MaxTerminalDim, where
+// TestValidTerminalSize can round-trip the bound through the uint16 that
+// TIOCSWINSZ takes and let the reason do the asserting; nothing equivalent
+// exists for a string that means "what the relay is listening for".
+//
+// What this pin does NOT cover, so it is not mistaken for more:
+//
+//   - Whether the agent still SENDS either header. Deleting an entry from
+//     connectAndServe's HTTPHeader map is invisible here and produces exactly
+//     the two failures listed above. That is covered separately, by
+//     TestAgentDialAdvertisesItsKeyAndFenceVersion in internal/system.
+//   - A rename on the relay's side. This binds the constant, not the relay's
+//     code; if the hosted relay ever hardcoded its own literal instead of
+//     importing this one, the pin would be blind to the divergence and could
+//     not fail.
+//   - Case. HTTP header names are case-insensitive on the wire and a reader
+//     using http.Header.Get canonicalises, so a case-only respelling would stay
+//     compatible yet fail this test. Stricter than the contract, in the safe
+//     direction.
+//
+// So: changing a spelling here is meant to be a deliberate act that fails this
+// test and sends you to the rollout ordering in the README's protocol
+// compatibility section, not something a rename tool does on the way past.
+func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
+	for _, tc := range []struct{ name, got, want string }{
+		{"PublicKeyHeader", PublicKeyHeader, "X-Ormos-Public-Key"},
+		{"StreamFenceVersionHeader", StreamFenceVersionHeader, "X-Ormos-Stream-Fence-Version"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want the deployed wire spelling %q. "+
+				"Renaming a handshake header breaks compatibility with the released agent "+
+				"and the deployed relay; see the rollout ordering under Protocol compatibility in README.md.",
+				tc.name, tc.got, tc.want)
+		}
+	}
+}
+
 func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 	if StreamFenceVersionLegacyV0 != "" {
 		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
