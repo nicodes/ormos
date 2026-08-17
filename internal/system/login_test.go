@@ -427,11 +427,12 @@ func TestHeadlessCodeDisplayShowsCodeAndURL(t *testing.T) {
 // TestPairingScreenStripsEscapesFromTheRelay and
 // TestPairingScreenStripsC1AndFormatCharacters, so the two outputs are held to
 // one standard rather than each to its own.
-// codeInstruction is the line headlessCodeDisplay prints between the URL and
-// the code, so it is the boundary between the two slots.
-const codeInstruction = "and enter code"
-
 func TestHeadlessCodeDisplaySanitisesTheRelaysStrings(t *testing.T) {
+	// The line headlessCodeDisplay prints between the URL and the code, so it
+	// is the boundary between the two slots. Local, because this is the only
+	// place it is used.
+	const codeInstruction = "and enter code"
+
 	for name, tc := range map[string]struct {
 		code, url string
 		forbidden []string
@@ -482,6 +483,12 @@ func TestHeadlessCodeDisplaySanitisesTheRelaysStrings(t *testing.T) {
 				// tell the operator's "open this" from their "type this".
 				// Shown as a URL to type and a code to open, pairing simply
 				// cannot complete.
+				//
+				// Each is required on its OWN indented line, not merely
+				// somewhere in its half. The code's half runs to the end of the
+				// output, so "in its half" would also be satisfied by a payload
+				// buried in the trailing "expires in" sentence, under a code
+				// line reading something else entirely.
 				open, code, found := strings.Cut(out, codeInstruction)
 				if !found {
 					t.Fatalf("restarted=%v: the output no longer contains %q, so the slots cannot be told apart:\n%s", restarted, codeInstruction, out)
@@ -490,8 +497,8 @@ func TestHeadlessCodeDisplaySanitisesTheRelaysStrings(t *testing.T) {
 					{"URL", open, tc.urlSurvives},
 					{"code", code, tc.codeSurvives},
 				} {
-					if !strings.Contains(slot.in, slot.want) {
-						t.Errorf("restarted=%v: the %s did not survive as inert text in its own slot (want %q):\n%s", restarted, slot.what, slot.want, out)
+					if !strings.Contains(slot.in, "\n  "+slot.want+"\n") {
+						t.Errorf("restarted=%v: the %s did not survive as inert text on its own line in its own slot (want %q):\n%s", restarted, slot.what, slot.want, out)
 					}
 				}
 			}
