@@ -1303,8 +1303,13 @@ func TestAgentDialAdvertisesItsKeyAndFenceVersion(t *testing.T) {
 		// The VALUE, not merely presence: "browsers keep sealing to a stale
 		// key" is the outcome an advertised-but-wrong key produces, so an
 		// assertion that only checked for non-empty would name a failure it
-		// could not see. d.key is what DeriveSessionKeys seals with, so this
-		// pins the two to each other.
+		// could not see.
+		//
+		// One direction only, to be exact about it: this pins the advertised
+		// header to d.key, which is the key DeriveSessionKeys reads
+		// (terminal_sessions.go). A divergence introduced on the SEAL side --
+		// sealing with something other than d.key while the dial keeps
+		// advertising it -- is not covered here and passes the whole suite.
 		if got, want := h.Get(relay.PublicKeyHeader), encodePublicKey(d.key); got != want {
 			t.Errorf("the dial advertised %s = %q, want the key this agent seals with, %q: the relay stores what it is told, so a wrong or absent key means browsers seal to a key the agent cannot open and terminals stop opening with no error anywhere",
 				relay.PublicKeyHeader, got, want)
