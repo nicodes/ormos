@@ -413,6 +413,64 @@ func TestHeadlessCodeDisplayShowsCodeAndURL(t *testing.T) {
 	}
 }
 
+// The headless path had been the one place a relay string reached an output
+// unsanitised. Inert where it is printed today — no TTY, so a pipe or a journal
+// — but the agent's rule is that sanitising happens at the boundary, not
+// wherever the bytes are currently believed to end up. Read back with
+// `journalctl` on a terminal, an escape acts.
+//
+// The payloads are the pairing screen's, from
+// TestPairingScreenStripsEscapesFromTheRelay and
+// TestPairingScreenStripsC1AndFormatCharacters, so the two outputs are held to
+// one standard rather than each to its own.
+func TestHeadlessCodeDisplaySanitisesTheRelaysStrings(t *testing.T) {
+	for name, tc := range map[string]struct {
+		code, url string
+		forbidden []string
+		survives  string
+	}{
+		// C0: a title-set, an erase-display and a BEL. Unlike the pairing
+		// screen this path writes no OSC 8 hyperlink of its own, so a bare ESC
+		// has no legitimate reason to appear either.
+		"C0 escapes": {
+			code:      "AB\x1b]0;OWNED\a\x1b[2JCD",
+			url:       "https://app.example.test/pair\x1b]0;PWN\a",
+			forbidden: []string{"\x1b", "\a"},
+			survives:  "AB]0;OWNED[2JCD",
+		},
+		// What stripCtl would have left behind: C1 controls (U+009B is CSI) and
+		// Cf format characters (U+202E rewrites reading order).
+		"C1 and format characters": {
+			code:      "AB\u202eCD\u009bEF",
+			url:       "https://app.example.test/pair\u009bEND\u202e",
+			forbidden: []string{"\u202e", "\u009b"},
+			survives:  "ABCDEF",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Both framings, because each writes the relay's strings: a first
+			// code and a re-issued one.
+			for _, restarted := range []bool{false, true} {
+				var b strings.Builder
+				headlessCodeDisplay(&b)(relay.DeviceStartResponse{
+					UserCode: tc.code, VerificationURL: tc.url, ExpiresIn: 600,
+				}, restarted)
+				out := b.String()
+				for _, seq := range tc.forbidden {
+					if strings.Contains(out, seq) {
+						t.Errorf("restarted=%v: a relay-supplied %q reached the headless output:\n%q", restarted, seq, out)
+					}
+				}
+				// Sanitising must not have eaten the code itself — otherwise
+				// this passes by printing nothing, and the operator has no code.
+				if !strings.Contains(out, tc.survives) {
+					t.Errorf("restarted=%v: the code did not survive as inert text (want %q):\n%s", restarted, tc.survives, out)
+				}
+			}
+		})
+	}
+}
+
 // The pairing screen shows the code and URL prominently once a code arrives,
 // swaps in a re-issued code, and quits with a cancellation on ctrl-C.
 func TestLoginModelRendersCode(t *testing.T) {
