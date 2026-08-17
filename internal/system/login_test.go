@@ -419,15 +419,18 @@ func TestHeadlessCodeDisplayShowsCodeAndURL(t *testing.T) {
 // wherever the bytes are currently believed to end up. Read back with
 // `journalctl` on a terminal, an escape acts.
 //
-// It is not the last unsanitised relay string in the agent: the error path to
-// stderr and the headless log echo both remain, and one of those reaches a live
-// terminal. Tracked in nicodes/ormos-be#420 — named here so this test is not
-// read as closing more than it does.
+// It is not the last unsanitised relay string in the agent. Tracked in
+// nicodes/ormos-be#420 — named here so this test is not read as closing more
+// than it does, without restating there what that issue exists to hold.
 //
 // The payloads are the pairing screen's, from
 // TestPairingScreenStripsEscapesFromTheRelay and
 // TestPairingScreenStripsC1AndFormatCharacters, so the two outputs are held to
 // one standard rather than each to its own.
+// codeInstruction is the line headlessCodeDisplay prints between the URL and
+// the code, so it is the boundary between the two slots.
+const codeInstruction = "and enter code"
+
 func TestHeadlessCodeDisplaySanitisesTheRelaysStrings(t *testing.T) {
 	for name, tc := range map[string]struct {
 		code, url string
@@ -472,13 +475,23 @@ func TestHeadlessCodeDisplaySanitisesTheRelaysStrings(t *testing.T) {
 					}
 				}
 				// Sanitising must not have eaten what the operator needs —
-				// otherwise this passes by printing nothing.
-				for what, want := range map[string]string{
-					"code": tc.codeSurvives,
-					"URL":  tc.urlSurvives,
+				// otherwise this passes by printing nothing. Checked per SLOT,
+				// not merely present somewhere in the output: the two %s verbs
+				// are adjacent in one format string, so transposing them is a
+				// live edit hazard, and a Contains over the whole output cannot
+				// tell the operator's "open this" from their "type this".
+				// Shown as a URL to type and a code to open, pairing simply
+				// cannot complete.
+				open, code, found := strings.Cut(out, codeInstruction)
+				if !found {
+					t.Fatalf("restarted=%v: the output no longer contains %q, so the slots cannot be told apart:\n%s", restarted, codeInstruction, out)
+				}
+				for _, slot := range []struct{ what, in, want string }{
+					{"URL", open, tc.urlSurvives},
+					{"code", code, tc.codeSurvives},
 				} {
-					if !strings.Contains(out, want) {
-						t.Errorf("restarted=%v: the %s did not survive as inert text (want %q):\n%s", restarted, what, want, out)
+					if !strings.Contains(slot.in, slot.want) {
+						t.Errorf("restarted=%v: the %s did not survive as inert text in its own slot (want %q):\n%s", restarted, slot.what, slot.want, out)
 					}
 				}
 			}
