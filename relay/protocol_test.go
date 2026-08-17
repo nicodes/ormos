@@ -8,6 +8,54 @@ import (
 	"time"
 )
 
+// The tunnel handshake header NAMES, pinned to their wire spellings.
+//
+// Both constants are single-sourced in this package and imported by the agent
+// (internal/system/system.go sets both when it dials) and by the hosted relay,
+// so a rename cannot make the two halves of one build disagree. What it can do
+// is make this build disagree with the OTHER version already deployed: the
+// relay in production and the agents on `@latest` are separate binaries built
+// from separate commits, and a shared-module bump that carries a renamed header
+// compiles cleanly on both sides while silently ending compatibility with
+// everything running the previous spelling.
+//
+// The failure is quiet in each case, which is why the names are worth a test
+// even though neither has any behaviour to exercise:
+//
+//   - PublicKeyHeader — the relay simply never calls SetSystemPubKey, browsers
+//     keep sealing to a stale key, and terminals stop opening with no error
+//     anywhere.
+//   - StreamFenceVersionHeader — absence is the reserved v0.1.5 sentinel, so a
+//     renamed header does not fail, it makes every current agent look like a
+//     released legacy one and silently gives up the action fences (#400/#401).
+//
+// This is a golden-value pin, not a duplicate of the production constant. The
+// distinction matters because the adjacent TestValidTerminalSize argues the
+// opposite for MaxTerminalDim — and is right to. There, the property (does the
+// bound survive the uint16 that TIOCSWINSZ takes) is derivable from the
+// constant, so a literal comparison would be a tautology and exercising the
+// cast is the real check. Here there is nothing to derive: a header name is not
+// true or false, it is only the same as what the other side already deployed.
+// A literal is the only thing that can record that, the way
+// TestCurrentAgentAdvertisesOnlyV2 below records the advertised version.
+//
+// So: changing a spelling here is meant to be a deliberate act that fails this
+// test and sends you to the compatibility window in the README, not something
+// a rename tool does on the way past.
+func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
+	for _, tc := range []struct{ name, got, want string }{
+		{"PublicKeyHeader", PublicKeyHeader, "X-Ormos-Public-Key"},
+		{"StreamFenceVersionHeader", StreamFenceVersionHeader, "X-Ormos-Stream-Fence-Version"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want the deployed wire spelling %q. "+
+				"Renaming a handshake header breaks compatibility with the released agent "+
+				"and the deployed relay; see the protocol compatibility window in README.md.",
+				tc.name, tc.got, tc.want)
+		}
+	}
+}
+
 func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 	if StreamFenceVersionLegacyV0 != "" {
 		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
