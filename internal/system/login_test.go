@@ -497,7 +497,30 @@ func TestHeadlessCodeDisplaySanitisesTheRelaysStrings(t *testing.T) {
 					{"URL", open, tc.urlSurvives},
 					{"code", code, tc.codeSurvives},
 				} {
-					if !strings.Contains(slot.in, "\n  "+slot.want+"\n") {
+					// An empty expectation would make the check below vacuous:
+					// a blank indented line is exactly what the format string
+					// prints when sanitize eats a payload whole, so "" would
+					// assert nothing while reading as a pass. Since sanitize
+					// DELETES rather than escapes, a payload that vanishes is a
+					// real degradation someone may want to document here, and
+					// they must not document it with a dead assertion.
+					if slot.want == "" {
+						t.Fatalf("%s case has an empty want: this assertion cannot tell survival from deletion, so it would pass vacuously", slot.what)
+					}
+					// Compared per line with the indent trimmed, rather than
+					// against a literal "\n  " prefix. The two-space indent is
+					// login.go's formatting, not a property this test is about,
+					// and hardcoding it here made a purely cosmetic indent
+					// change fail eight assertions with a message blaming
+					// sanitising.
+					onOwnLine := false
+					for _, line := range strings.Split(slot.in, "\n") {
+						if strings.TrimSpace(line) == slot.want {
+							onOwnLine = true
+							break
+						}
+					}
+					if !onOwnLine {
 						t.Errorf("restarted=%v: the %s did not survive as inert text on its own line in its own slot (want %q):\n%s", restarted, slot.what, slot.want, out)
 					}
 				}
