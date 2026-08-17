@@ -251,6 +251,16 @@ func postRelayJSON(ctx context.Context, url string, body, out any) error {
 // headlessCodeDisplay prints the pairing code plainly to stdout — the mode
 // used under a service manager or without a terminal, where there is no
 // pairing screen.
+//
+// Both relay-supplied fields go through sanitize, the same way the pairing
+// screen's do, even though nothing here is attackable today: headless means no
+// TTY, so the bytes land in a pipe or a journal where an escape sequence is
+// inert. The exception is closed rather than justified because its safety comes
+// from where the output happens to go, not from the output itself — and
+// `journalctl` on a terminal is that assumption ending. sanitize, not stripCtl:
+// stripCtl leaves the C1 controls and the Cf format characters, and U+202E can
+// rewrite the reading order of the one string whose whole purpose is telling the
+// operator which code to trust.
 func headlessCodeDisplay(w io.Writer) func(relay.DeviceStartResponse, bool) {
 	return func(s relay.DeviceStartResponse, restarted bool) {
 		if restarted {
@@ -266,7 +276,7 @@ and enter code
   %s
 
 The code expires in %d seconds. Waiting for approval — ctrl-C to cancel.
-`, s.VerificationURL, s.UserCode, s.ExpiresIn)
+`, sanitize(s.VerificationURL), sanitize(s.UserCode), s.ExpiresIn)
 	}
 }
 

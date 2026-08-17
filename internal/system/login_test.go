@@ -413,6 +413,122 @@ func TestHeadlessCodeDisplayShowsCodeAndURL(t *testing.T) {
 	}
 }
 
+// The headless path was the one place the PAIRING CODE reached an output
+// unsanitised. Inert where it is printed today — no TTY, so a pipe or a journal
+// — but the agent's rule is that sanitising happens at the boundary, not
+// wherever the bytes are currently believed to end up. Read back with
+// `journalctl` on a terminal, an escape acts.
+//
+// It is not the last unsanitised relay string in the agent. Tracked in
+// nicodes/ormos-be#420 — named here so this test is not read as closing more
+// than it does, without restating there what that issue exists to hold.
+//
+// The payloads are the pairing screen's, from
+// TestPairingScreenStripsEscapesFromTheRelay and
+// TestPairingScreenStripsC1AndFormatCharacters, so the two outputs are held to
+// one standard rather than each to its own.
+func TestHeadlessCodeDisplaySanitisesTheRelaysStrings(t *testing.T) {
+	// The line headlessCodeDisplay prints between the URL and the code, so it
+	// is the boundary between the two slots. Local, because this is the only
+	// place it is used.
+	const codeInstruction = "and enter code"
+
+	for name, tc := range map[string]struct {
+		code, url string
+		forbidden []string
+		// Both fields are checked: an implementation that sanitised the code
+		// and dropped the URL entirely would otherwise pass, and the operator
+		// needs both to pair.
+		codeSurvives, urlSurvives string
+	}{
+		// C0: a title-set, an erase-display and a BEL. Unlike the pairing
+		// screen this path writes no OSC 8 hyperlink of its own, so a bare ESC
+		// has no legitimate reason to appear either.
+		"C0 escapes": {
+			code:         "AB\x1b]0;OWNED\a\x1b[2JCD",
+			url:          "https://app.example.test/pair\x1b]0;PWN\a",
+			forbidden:    []string{"\x1b", "\a"},
+			codeSurvives: "AB]0;OWNED[2JCD",
+			urlSurvives:  "https://app.example.test/pair]0;PWN",
+		},
+		// What stripCtl would have left behind: C1 controls (U+009B is CSI) and
+		// Cf format characters (U+202E rewrites reading order).
+		"C1 and format characters": {
+			code:         "AB\u202eCD\u009bEF",
+			url:          "https://app.example.test/pair\u009bEND\u202e",
+			forbidden:    []string{"\u202e", "\u009b"},
+			codeSurvives: "ABCDEF",
+			urlSurvives:  "https://app.example.test/pairEND",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Both framings, because each writes the relay's strings: a first
+			// code and a re-issued one.
+			for _, restarted := range []bool{false, true} {
+				var b strings.Builder
+				headlessCodeDisplay(&b)(relay.DeviceStartResponse{
+					UserCode: tc.code, VerificationURL: tc.url, ExpiresIn: 600,
+				}, restarted)
+				out := b.String()
+				for _, seq := range tc.forbidden {
+					if strings.Contains(out, seq) {
+						t.Errorf("restarted=%v: a relay-supplied %q reached the headless output:\n%q", restarted, seq, out)
+					}
+				}
+				// Sanitising must not have eaten what the operator needs —
+				// otherwise this passes by printing nothing. Checked per SLOT,
+				// not merely present somewhere in the output: the two %s verbs
+				// are adjacent in one format string, so transposing them is a
+				// live edit hazard, and a Contains over the whole output cannot
+				// tell the operator's "open this" from their "type this".
+				// Shown as a URL to type and a code to open, pairing simply
+				// cannot complete.
+				//
+				// Each is required on its OWN indented line, not merely
+				// somewhere in its half. The code's half runs to the end of the
+				// output, so "in its half" would also be satisfied by a payload
+				// buried in the trailing "expires in" sentence, under a code
+				// line reading something else entirely.
+				open, code, found := strings.Cut(out, codeInstruction)
+				if !found {
+					t.Fatalf("restarted=%v: the output no longer contains %q, so the slots cannot be told apart:\n%s", restarted, codeInstruction, out)
+				}
+				for _, slot := range []struct{ what, in, want string }{
+					{"URL", open, tc.urlSurvives},
+					{"code", code, tc.codeSurvives},
+				} {
+					// An empty expectation would make the check below vacuous:
+					// a blank indented line is exactly what the format string
+					// prints when sanitize eats a payload whole, so "" would
+					// assert nothing while reading as a pass. Since sanitize
+					// DELETES rather than escapes, a payload that vanishes is a
+					// real degradation someone may want to document here, and
+					// they must not document it with a dead assertion.
+					if slot.want == "" {
+						t.Fatalf("%s case has an empty want: this assertion cannot tell survival from deletion, so it would pass vacuously", slot.what)
+					}
+					// Compared per line with the indent trimmed, rather than
+					// against a literal "\n  " prefix. The two-space indent is
+					// login.go's formatting, not a property this test is about,
+					// and hardcoding it here made a purely cosmetic indent
+					// change fail eight assertions with a message blaming
+					// sanitising.
+					onOwnLine := false
+					for _, line := range strings.Split(slot.in, "\n") {
+						if strings.TrimSpace(line) == slot.want {
+							onOwnLine = true
+							break
+						}
+					}
+					if !onOwnLine {
+						t.Errorf("restarted=%v: the %s did not survive as inert text on its own line in its own slot (want %q):\n%s", restarted, slot.what, slot.want, out)
+					}
+				}
+			}
+		})
+	}
+}
+
 // The pairing screen shows the code and URL prominently once a code arrives,
 // swaps in a re-issued code, and quits with a cancellation on ctrl-C.
 func TestLoginModelRendersCode(t *testing.T) {
