@@ -68,8 +68,19 @@ const (
 	// disagree about it derive different keys and every ReadFrame fails its AEAD
 	// open on records that arrived looking well-formed — no terminal works, and
 	// nothing says why. Change it here and in seal.ts together, in the rollout
-	// order under Protocol compatibility in README.md. The literal is pinned by
-	// TestWireStringValuesArePinnedToTheirLiterals, which is what will fail first.
+	// order under Protocol compatibility in README.md. Those are the only two
+	// places to edit: the app ships a vendored, minified copy of seal.ts, and the
+	// build regenerates it, so there is no third spelling to hunt down by hand.
+	//
+	// The literal is pinned by TestWireStringValuesArePinnedToTheirLiterals, which
+	// is what fails first in THIS repository. It is not the only guard that exists
+	// — the backend repository holds cross-language seal vectors that a changed
+	// label breaks — but it is the only one this repository has, and this
+	// repository is what `go install github.com/nicodes/ormos@latest` builds. The
+	// agent releases on its own schedule and carries no vectors, so without that
+	// pin a bump could ship from here with CI entirely green and be contradicted
+	// only later, from another repository. That is the reason the pin lives here
+	// rather than being left to the backend.
 	sealInfo = "ormos terminal seal v2"
 	// maxReusedRecord bounds the record buffer SealedStream.ReadFrame keeps
 	// between calls. Terminal input is keystrokes; anything larger is a paste,

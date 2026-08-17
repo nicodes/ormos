@@ -114,6 +114,19 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 //     exactly the invitation. A bump is a coordinated two-sided deployment, not a
 //     tidy-up, and nothing said so where the bumper would see it.
 //
+//     Scoped honestly, because the first version of this comment was not: a bump
+//     is NOT unguarded everywhere. The backend repository holds cross-language
+//     seal vectors, committed as data and asserted from both the Go and the
+//     TypeScript side, and a changed label changes the derived keys and breaks
+//     them — measured, on nicodes/ormos-be#433. So the claim this pin can make is
+//     about THIS repository only. It earns its place anyway, and for a specific
+//     reason: the agent is installed straight from here with `go install
+//     github.com/nicodes/ormos@latest` and releases on its own schedule, with no
+//     vectors of its own, so without this row an agent release could ship a bumped
+//     label with its own CI entirely green and only be contradicted later, when
+//     somebody bumped the module on the backend side. This is what makes the agent
+//     repository self-sufficient about its own seal label.
+//
 //   - a fence version. The negotiation treats an UNRECOGNISED value differently
 //     from absence, and absence is the reserved legacy sentinel, so a respelt
 //     value is neither the current protocol nor the documented fallback.
@@ -163,9 +176,10 @@ func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
 		if tc.got != tc.want {
 			t.Errorf("%s = %q, want the deployed wire value %q. "+
 				"Respelling one of these ends compatibility with whatever is already deployed on the "+
-				"other side -- the released agent, the hosted relay, or the browser's seal -- and "+
-				"nothing else fails when it does; see the rollout ordering under Protocol "+
-				"compatibility in README.md.",
+				"other side -- the released agent, the hosted relay, or the browser's seal -- and this "+
+				"test may be the only thing in THIS repository that objects. What other repositories "+
+				"check is their own business and is not evidence here. See the rollout ordering under "+
+				"Protocol compatibility in README.md.",
 				tc.name, tc.got, tc.want)
 		}
 	}
