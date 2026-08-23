@@ -104,11 +104,13 @@ func (b *cappedBuffer) String() string { return b.b.String() }
 func parseDarwinNetstat(r io.Reader, set map[int]struct{}) error {
 	scanner := bufio.NewScanner(r)
 	sawHeader := false
+	sawContent := false
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) == 0 {
 			continue
 		}
+		sawContent = true
 		if fields[0] == "Proto" {
 			sawHeader = len(fields) >= 5 && fields[1] == "Recv-Q" && fields[2] == "Send-Q"
 			continue
@@ -133,7 +135,7 @@ func parseDarwinNetstat(r io.Reader, set map[int]struct{}) error {
 	if err := scanner.Err(); err != nil {
 		return err
 	}
-	if !sawHeader {
+	if sawContent && !sawHeader {
 		return errors.New("missing documented socket table header")
 	}
 	return nil

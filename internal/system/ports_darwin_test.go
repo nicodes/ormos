@@ -36,6 +36,26 @@ func TestDiscoverDarwinPortsParsesLoopbackAndWildcard(t *testing.T) {
 	}
 }
 
+func TestDiscoverDarwinPortsKeepsOtherFamilyWhenOneIsEmpty(t *testing.T) {
+	run := func(_ context.Context, family string) (io.Reader, error) {
+		if family == "inet6" {
+			return strings.NewReader("\n"), nil
+		}
+		return strings.NewReader(`Active Internet connections (including servers)
+Proto Recv-Q Send-Q  Local Address          Foreign Address        (state)
+tcp4       0      0  127.0.0.1.4100         *.*                    LISTEN
+`), nil
+	}
+	got, err := discoverDarwinPorts(context.Background(), run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []int{4100}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("discoverDarwinPorts() = %v, want %v", got, want)
+	}
+}
+
 func TestDiscoverDarwinPortsFailuresAreExplicit(t *testing.T) {
 	tests := []struct {
 		name string
