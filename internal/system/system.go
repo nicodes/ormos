@@ -267,7 +267,7 @@ func (d *system) pollPorts(ctx context.Context) {
 		// snapshot instead of rescanning /proc every render tick).
 		listen, err := listeningPorts()
 		if err != nil {
-			d.logf("ports discovery failed: %v", err)
+			d.logf("ports discovery failed: %q", err)
 			d.mu.Lock()
 			listen = append([]int(nil), d.listening...)
 			d.mu.Unlock()
