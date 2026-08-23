@@ -83,8 +83,9 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 
 // The wire values of four groups of protocol string, pinned to their literals:
 // the stream-fence versions, the StreamKinds, the ActionAck statuses, and the
-// terminal seal's HKDF label. Not every string in this package — see the list of
-// what is NOT pinned, below, which is the boundary this test does not cross.
+// terminal seal's HKDF label. This test covers exactly those groups; device-flow
+// statuses are pinned in contract_test.go, and JSON tags and numeric terminal
+// tags are pinned against complete literal payloads in their dedicated tests.
 //
 // TestCurrentAgentAdvertisesOnlyV2 above pins the fence version's alias
 // RELATIONSHIP (StreamFenceVersion == StreamFenceVersionV2) and the empty-string
@@ -152,13 +153,11 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 //   - whether the agent still SENDS any of them. That is a different gap, and
 //     for the two handshake headers it is covered by
 //     TestAgentDialAdvertisesItsKeyAndFenceVersion in internal/system.
-//   - the rest of this package's wire strings, which are a real and open gap
-//     rather than a decision that they do not matter: contract.go's
-//     DeviceStatusPending/Expired/Approved and its 27 DTO JSON tags, the
-//     Resize and activityFrame tags one screen below StreamHeader, and the
-//     numeric termTag values. All of them are tracked on
-//     nicodes/ormos-be#433. Nothing above guards any of them, and a reader who
-//     needs one of them guarded must add it rather than assume this table did.
+//   - contract.go's DeviceStatus values and 27 DTO JSON tags, Resize and
+//     activityFrame JSON tags, and numeric termTag values. Nothing above guards
+//     them; TestDeviceStatusValuesArePinnedToTheirWireLiterals,
+//     TestControlPlaneDTOTagsArePinnedToLiteralPayloads, and
+//     TestTerminalFramesArePinnedToLiteralBytes guard them separately.
 func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
 	for _, tc := range []struct{ name, got, want string }{
 		{"StreamFenceVersionV1", StreamFenceVersionV1, "1"},
@@ -450,15 +449,24 @@ func TestTerminalFrameRoundTrip(t *testing.T) {
 	}
 }
 
-// The wire format must match the TypeScript encoder byte for byte, so pin it:
-// one tag byte, four big-endian length bytes, then the payload.
-func TestTerminalFrameLayout(t *testing.T) {
-	got := EncodeData(bytes.Repeat([]byte{7}, 258))
-	if got[0] != 0 {
-		t.Fatalf("data tag = %d, want 0", got[0])
-	}
-	if !bytes.Equal(got[1:5], []byte{0, 0, 1, 2}) {
-		t.Fatalf("length bytes = %v, want big-endian 258", got[1:5])
+// The terminal wire format must match the browser byte for byte. These
+// hand-written payloads pin all three numeric tags and the resize/activity JSON
+// keys without decoding through the same constants or structs being checked.
+func TestTerminalFramesArePinnedToLiteralBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  []byte
+		want []byte
+	}{
+		{"tagData and multi-byte length", EncodeData(bytes.Repeat([]byte{7}, 258)), append([]byte{0, 0, 0, 1, 2}, bytes.Repeat([]byte{7}, 258)...)},
+		{"tagResize and cols/rows", EncodeResize(120, 40), append([]byte{1, 0, 0, 0, 22}, []byte(`{"cols":120,"rows":40}`)...)},
+		{"tagActivity and active", EncodeActivity(true), append([]byte{2, 0, 0, 0, 15}, []byte(`{"active":true}`)...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !bytes.Equal(tc.got, tc.want) {
+				t.Errorf("terminal frame bytes = %v (%q), want literal wire bytes %v (%q)", tc.got, tc.got, tc.want, tc.want)
+			}
+		})
 	}
 }
 
