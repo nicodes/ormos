@@ -413,6 +413,114 @@ func TestHeadlessCodeDisplayShowsCodeAndURL(t *testing.T) {
 	}
 }
 
+// The error returned by the real device-start path is printed only after the
+// pairing TUI has restored the live terminal. Exercise that producer and the
+// exact writer used by runSystem, rather than testing sanitize in isolation.
+func TestLoginErrorOutputSanitisesRelayText(t *testing.T) {
+	for name, tc := range map[string]struct {
+		errorText string
+		detail    string
+		want      string
+	}{
+		"ESC and C0": {
+			errorText: "denied\x1b]0;OWNED\a",
+			detail:    "try again\x1b[2J",
+			want:      "denied]0;OWNED: try again[2J",
+		},
+		"C1 and bidi format": {
+			errorText: "denied\u009b",
+			detail:    "try\u202e again",
+			want:      "denied: try again",
+		},
+		"ordinary printable text": {
+			errorText: "access denied",
+			detail:    "pairing is disabled",
+			want:      "access denied: pairing is disabled",
+		},
+		"empty after sanitizing": {
+			errorText: "\x1b\u009b\u202e",
+			want:      "[relay supplied no printable text]",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": tc.errorText, "detail": tc.detail})
+			}))
+			defer srv.Close()
+
+			_, err := deviceStart(context.Background(), srv.URL, relay.DeviceStartRequest{})
+			if err == nil {
+				t.Fatal("deviceStart accepted the relay error response")
+			}
+			var out strings.Builder
+			writeLoginError(&out, err)
+			got := out.String()
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("printable text did not survive in the login error (want %q): %q", tc.want, got)
+			}
+			for _, forbidden := range []string{"\x1b", "\u009b", "\u202e", "\a"} {
+				if strings.Contains(got, forbidden) {
+					t.Errorf("relay-supplied %q reached the login error output: %q", forbidden, got)
+				}
+			}
+		})
+	}
+
+	// Known-good sibling: a local error contains no relay data and must retain
+	// its useful wording through the same output boundary.
+	var local strings.Builder
+	writeLoginError(&local, errors.New("local configuration failed"))
+	if got, want := local.String(), "error: local configuration failed\n"; got != want {
+		t.Errorf("local error changed: got %q, want %q", got, want)
+	}
+}
+
+// Validation must use the sanitized values that the operator will see. Raw
+// non-empty checks let all-control codes render as blank and leave the TUI on
+// its pre-code screen forever.
+func TestDeviceStartRejectsValuesEmptyAfterSanitising(t *testing.T) {
+	for name, response := range map[string]relay.DeviceStartResponse{
+		"code": {
+			UserCode: "\x1b\u009b\u202e", DeviceCode: "opaque", VerificationURL: "https://app.example.test/pair", ExpiresIn: 600, Interval: 1,
+		},
+		"URL": {
+			UserCode: "ABCD-1234", DeviceCode: "opaque", VerificationURL: "\x1b\u009b\u202e", ExpiresIn: 600, Interval: 1,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer srv.Close()
+
+			if _, err := deviceStart(context.Background(), srv.URL, relay.DeviceStartRequest{}); err == nil ||
+				!strings.Contains(err.Error(), "implausible device flow") {
+				t.Fatalf("deviceStart error = %v, want fixed unusable-flow error", err)
+			}
+		})
+	}
+
+	// Control comparison through the same endpoint: printable values survive
+	// unchanged, proving the rejection above is the post-sanitize branch rather
+	// than a server or decoding failure.
+	want := relay.DeviceStartResponse{
+		UserCode: "ABCD-1234", DeviceCode: "opaque", VerificationURL: "https://app.example.test/pair", ExpiresIn: 600, Interval: 1,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(want)
+	}))
+	defer srv.Close()
+	got, err := deviceStart(context.Background(), srv.URL, relay.DeviceStartRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserCode != want.UserCode || got.VerificationURL != want.VerificationURL {
+		t.Fatalf("printable display values changed: got %+v, want %+v", got, want)
+	}
+}
+
 // The headless path was the one place the PAIRING CODE reached an output
 // unsanitised. Inert where it is printed today — no TTY, so a pipe or a journal
 // — but the agent's rule is that sanitising happens at the boundary, not
