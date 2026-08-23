@@ -458,7 +458,7 @@ func TestTerminalFramesArePinnedToLiteralBytes(t *testing.T) {
 		got  []byte
 		want []byte
 	}{
-		{"tagData", EncodeData([]byte("hi")), []byte{0, 0, 0, 0, 2, 'h', 'i'}},
+		{"tagData and multi-byte length", EncodeData(bytes.Repeat([]byte{7}, 258)), append([]byte{0, 0, 0, 1, 2}, bytes.Repeat([]byte{7}, 258)...)},
 		{"tagResize and cols/rows", EncodeResize(120, 40), append([]byte{1, 0, 0, 0, 22}, []byte(`{"cols":120,"rows":40}`)...)},
 		{"tagActivity and active", EncodeActivity(true), append([]byte{2, 0, 0, 0, 15}, []byte(`{"active":true}`)...)},
 	} {
