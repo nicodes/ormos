@@ -866,6 +866,19 @@ func sanitize(s string) string {
 	}, s)
 }
 
+// sanitizeRelayOutput makes relay-derived text safe for a terminal-facing
+// output. Unlike sanitize, it never returns an empty string: callers use this
+// for errors and status text, where silence would hide what failed. Pairing
+// codes and URLs are instead rejected at deviceStart when they sanitize to
+// empty; substituting this diagnostic for either would look actionable but
+// could never complete a pairing.
+func sanitizeRelayOutput(s string) string {
+	if clean := sanitize(s); clean != "" {
+		return clean
+	}
+	return "[relay supplied no printable text]"
+}
+
 // clipLines caps every line in s at w columns, so a block's line count is also
 // its ROW count.
 //

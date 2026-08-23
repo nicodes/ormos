@@ -155,6 +155,12 @@ func deviceStart(ctx context.Context, httpBase string, req relay.DeviceStartRequ
 	if err := postRelayJSON(ctx, httpBase+"/device/start", req, &out); err != nil {
 		return out, fmt.Errorf("starting device flow: %w", err)
 	}
+	// These two values are painted for the operator. Sanitize at the relay
+	// boundary, then validate the values that will actually be displayed: a
+	// non-empty string made only of controls must not leave the headless output
+	// blank or keep the pairing TUI waiting forever for a visible code.
+	out.UserCode = sanitize(out.UserCode)
+	out.VerificationURL = sanitize(out.VerificationURL)
 	if out.UserCode == "" || out.DeviceCode == "" || out.VerificationURL == "" ||
 		out.ExpiresIn <= 0 || out.ExpiresIn > maxDeviceFlowSeconds {
 		return out, fmt.Errorf("relay returned an implausible device flow (missing code, URL or expiry)")
@@ -236,14 +242,14 @@ func postRelayJSON(ctx context.Context, url string, body, out any) error {
 		}
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
 			if e.Detail != "" {
-				return fmt.Errorf("%s: %s", e.Error, e.Detail)
+				return fmt.Errorf("%s: %s", sanitizeRelayOutput(e.Error), sanitizeRelayOutput(e.Detail))
 			}
-			return fmt.Errorf("%s", e.Error)
+			return fmt.Errorf("%s", sanitizeRelayOutput(e.Error))
 		}
 		if s := strings.TrimSpace(string(data)); s != "" {
-			return fmt.Errorf("relay returned %s: %s", resp.Status, s)
+			return fmt.Errorf("relay returned %s: %s", sanitizeRelayOutput(resp.Status), sanitizeRelayOutput(s))
 		}
-		return fmt.Errorf("relay returned %s", resp.Status)
+		return fmt.Errorf("relay returned %s", sanitizeRelayOutput(resp.Status))
 	}
 	return decodeRelayJSON(resp.Body, out)
 }
