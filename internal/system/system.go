@@ -39,6 +39,7 @@ type system struct {
 	ports      []PortStatus // configured ports across this system's projects
 	listening  []int        // host's currently-listening loopback ports (cached)
 	echoStderr bool
+	echoWriter io.Writer
 	cancel     context.CancelFunc // stops the whole agent (relay-requested shutdown)
 	events     chan struct{}      // relay→TUI "data changed" nudges (coalesced)
 	terminalMu sync.Mutex
@@ -89,6 +90,7 @@ func newSystem(cfg systemConfig) *system {
 		cfg: cfg, events: make(chan struct{}, 1),
 		terminals:        make(map[string]*terminalSession),
 		audit:            newAuditor(),
+		echoWriter:       os.Stderr,
 		shutdownAckSlots: make(chan struct{}, maxAsyncShutdownAckWrites),
 	}
 	p, err := loadPolicy()
@@ -152,7 +154,7 @@ func (d *system) logf(format string, args ...any) {
 	echo := d.echoStderr
 	d.mu.Unlock()
 	if echo {
-		fmt.Fprintln(os.Stderr, line)
+		fmt.Fprintln(d.echoWriter, line)
 	}
 }
 
@@ -274,7 +276,10 @@ func (d *system) pollPorts(ctx context.Context) {
 
 		infos, err := d.fetchConfiguredPorts(ctx)
 		if err != nil {
-			d.logf("ports poll failed: %v", err)
+			// fetchConfiguredPorts can include the relay's HTTP reason phrase.
+			// Sanitize this argument before logf's headless stderr echo; the TUI
+			// independently sanitizes the same ring when it renders it.
+			d.logf("ports poll failed: %s", sanitizeRelayOutput(err.Error()))
 			return
 		}
 		statuses := make([]PortStatus, 0, len(infos))
@@ -317,7 +322,7 @@ func (d *system) fetchConfiguredPorts(ctx context.Context) ([]relay.PortInfo, er
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("relay returned %s", resp.Status)
+		return nil, fmt.Errorf("relay returned %s", sanitizeRelayOutput(resp.Status))
 	}
 	var out struct {
 		Ports []relay.PortInfo `json:"ports"`

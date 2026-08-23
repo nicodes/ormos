@@ -46,6 +46,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -172,7 +173,7 @@ func runSystem() {
 				fmt.Fprintln(os.Stderr, "pairing cancelled")
 				os.Exit(130)
 			}
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			writeLoginError(os.Stderr, err)
 			os.Exit(1)
 		}
 		cfg.ClientID = li.ClientID
@@ -198,6 +199,13 @@ func runSystem() {
 		return
 	}
 	runTUI(ctx, d)
+}
+
+// writeLoginError runs after the pairing TUI has restored the live terminal.
+// The wrapped error may contain a relay JSON error, detail, response body, or
+// HTTP reason phrase, so it must be sanitized at this final output boundary.
+func writeLoginError(w io.Writer, err error) {
+	fmt.Fprintf(w, "error: %s\n", sanitizeRelayOutput(err.Error()))
 }
 
 func isTTY() bool {
