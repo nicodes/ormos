@@ -36,9 +36,10 @@ asserts that on every other platform Go supports the agent is not selected at
 all. A release is gated on the
 macOS tests too, since the Darwin archives are what people download.
 
-Live port status is a Linux-only feature for now: the agent finds listening
-ports by reading `/proc/net/tcp`, so on macOS the dashboard shows configured
-ports without marking which are up.
+On Linux and macOS, live port status reports TCP listeners bound to a loopback
+or wildcard address. Linux reads `/proc/net/tcp*`; macOS uses the base-system
+`netstat`. Before the agent discloses that listing to the relay, it applies the
+same local port policy that governs proxy connections.
 
 ## Run or install
 
