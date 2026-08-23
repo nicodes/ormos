@@ -265,15 +265,21 @@ func (d *system) pollPorts(ctx context.Context) {
 
 		// Scan the host's listening ports once and cache them (the TUI reads this
 		// snapshot instead of rescanning /proc every render tick).
-		listen := listeningPorts()
+		listen, err := listeningPorts()
+		if err != nil {
+			d.logf("ports discovery failed: %v", err)
+			d.mu.Lock()
+			listen = append([]int(nil), d.listening...)
+			d.mu.Unlock()
+		} else {
+			d.mu.Lock()
+			d.listening = listen
+			d.mu.Unlock()
+		}
 		live := make(map[int]bool, len(listen))
 		for _, p := range listen {
 			live[p] = true
 		}
-		d.mu.Lock()
-		d.listening = listen
-		d.mu.Unlock()
-
 		infos, err := d.fetchConfiguredPorts(ctx)
 		if err != nil {
 			// fetchConfiguredPorts can include the relay's HTTP reason phrase.

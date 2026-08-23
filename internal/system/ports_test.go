@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -47,14 +46,6 @@ func containsPort(ports []int, port int) bool {
 // The listing tells the relay which services this machine runs, so a port the
 // machine would refuse to dial must not show up in it either.
 func TestListPortsFilteredThroughPolicy(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		// listeningPorts reads /proc/net/tcp*, so off Linux it reports nothing
-		// and every assertion below would pass by finding an empty list. A
-		// vacuous green is worse than a skip: it would claim this is checked on
-		// macOS when the feature it checks does not run there at all. The gap
-		// itself is filed separately.
-		t.Skip("listeningPorts parses /proc/net/tcp*; there is nothing to filter off Linux")
-	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Skipf("cannot open a loopback listener: %v", err)
