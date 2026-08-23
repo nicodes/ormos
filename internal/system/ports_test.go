@@ -51,7 +51,7 @@ func TestListPortsFilteredThroughPolicy(t *testing.T) {
 		t.Skipf("cannot open a loopback listener: %v", err)
 	}
 	defer ln.Close()
-	port := ln.Addr().(*net.TCPAddr).Port + 1
+	port := ln.Addr().(*net.TCPAddr).Port
 
 	if got := listPorts(t, ""); !containsPort(got, port) {
 		t.Fatalf("with no policy the listing should contain the test listener :%d (got %v)", port, got)
