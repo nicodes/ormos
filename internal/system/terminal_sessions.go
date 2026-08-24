@@ -89,10 +89,7 @@ const (
 	terminalInputQueue      = terminalSendQueue
 	terminalInputBytes      = terminalSendBytes
 	terminalInputPollWindow = 25 * time.Millisecond
-	// PIPE_BUF is 4096 on Linux and 512 on Darwin. Keeping a write within the
-	// portable 512-byte floor lets the locked POLLOUT recheck establish that the
-	// subsequent write will not wait for a sibling master writer.
-	terminalInputChunk = 512
+	terminalInputQuantum    = 4 << 10
 )
 
 var (
@@ -209,15 +206,32 @@ type terminalSession struct {
 	cmd   *exec.Cmd
 	pgid  int // the shell's process group id (it leads it: pty.Start sets Setsid)
 
-	mu        sync.Mutex
-	inputMu   sync.Mutex
-	conns     map[terminalConn]struct{}
-	replay    replayRing
-	active    bool
-	closed    bool
-	expires   *time.Timer
-	done      chan struct{}
-	closeOnce sync.Once
+	mu           sync.Mutex
+	inputMu      sync.Mutex
+	input        chan *terminalInput
+	inputBytes   int
+	inputCalls   int
+	inputClosed  bool
+	inputOnce    sync.Once
+	inputStarted chan struct{}
+	inputStopped chan struct{}
+	conns        map[terminalConn]struct{}
+	replay       replayRing
+	active       bool
+	closed       bool
+	expires      *time.Timer
+	done         chan struct{}
+	closeOnce    sync.Once
+}
+
+// terminalInput is one accepted browser or local request. The scheduler writes
+// at most terminalInputQuantum bytes before returning an unfinished request to
+// the tail, so FIFO admission cannot let a large local paste monopolise a
+// slowly-draining PTY ahead of browser keystrokes.
+type terminalInput struct {
+	p     []byte
+	off   int
+	local *localTerminalConn
 }
 
 // terminalConn is the common outbound half of a browser or local attachment.
@@ -418,18 +432,12 @@ func (c *TerminalClient) Write(p []byte) error {
 		c.conn.beforeInputCopy()
 	}
 	copy := c.conn.copyInput(p)
-	select {
-	case <-c.conn.dead:
-		c.conn.inputCalls.Add(-1)
-		c.conn.inputBytes.Add(-int64(len(copy)))
-		return ErrTerminalClientClosed
-	case c.conn.input <- copy:
-		return nil
-	default:
+	if !c.session.submitInput(&terminalInput{p: copy, local: c.conn}) {
 		c.conn.inputCalls.Add(-1)
 		c.conn.inputBytes.Add(-int64(len(copy)))
 		return ErrTerminalInputBackpressure
 	}
+	return nil
 }
 
 // Resize updates the shared PTY's dimensions.
@@ -442,7 +450,7 @@ func (c *TerminalClient) Resize(cols, rows int) error {
 		return fmt.Errorf("terminal attachment is closed")
 	default:
 	}
-	return pty.Setsize(c.session.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	return setPTYSize(c.session.ptmx, cols, rows)
 }
 
 // Detach releases this local attachment without ending its shared shell.
@@ -465,7 +473,6 @@ func (d *system) AttachTerminal(projectRoot, sessionID string, cols, rows int) (
 		conn.kill()
 		return nil, err
 	}
-	go conn.inputLoop(s)
 	go func() {
 		<-conn.dead
 		s.detach(conn)
@@ -484,15 +491,12 @@ type localTerminalConn struct {
 	dead    chan struct{}
 	killOne sync.Once
 
-	input      chan []byte
 	inputCalls atomic.Int64
 	inputBytes atomic.Int64
 	inputMu    sync.Mutex // serialises local Write acceptance order
-	inputDone  chan struct{}
 	copyInput  func([]byte) []byte
 	// Test seams; nil in production.
-	beforeInputCopy    func()
-	beforeInputRecheck func()
+	beforeInputCopy func()
 }
 
 func newLocalTerminalConn() *localTerminalConn {
@@ -502,8 +506,6 @@ func newLocalTerminalConn() *localTerminalConn {
 		// before returning without creating a second, unaccounted output backlog.
 		output:    make(chan []byte, 1),
 		dead:      make(chan struct{}),
-		input:     make(chan []byte, terminalInputQueue),
-		inputDone: make(chan struct{}),
 		copyInput: func(p []byte) []byte { return append([]byte(nil), p...) },
 	}
 	go c.writeLoop()
@@ -579,111 +581,6 @@ func (c *localTerminalConn) kill() {
 	c.inputMu.Lock()
 	c.killOne.Do(func() { close(c.dead) })
 	c.inputMu.Unlock()
-}
-
-// inputLoop is one worker per attachment, never one per Write. It waits for
-// POLLOUT before entering the session's shared input critical section, so a
-// full local PTY cannot pin inputMu and starve a browser. poll is available on
-// both supported Unix targets; its short timeout makes waiting detach-aware
-// without claiming that an already-entered kernel Write can be cancelled.
-func (c *localTerminalConn) inputLoop(s *terminalSession) {
-	defer func() {
-		for {
-			select {
-			case p := <-c.input:
-				c.inputCalls.Add(-1)
-				c.inputBytes.Add(-int64(len(p)))
-			default:
-				close(c.inputDone)
-				return
-			}
-		}
-	}()
-	for {
-		select {
-		case <-c.dead:
-			return
-		case p := <-c.input:
-			if !c.writeInput(s, p) {
-				c.inputCalls.Add(-1)
-				c.inputBytes.Add(-int64(len(p)))
-				return
-			}
-			c.inputCalls.Add(-1)
-			c.inputBytes.Add(-int64(len(p)))
-		}
-	}
-}
-
-func (c *localTerminalConn) writeInput(s *terminalSession, p []byte) bool {
-	for len(p) > 0 {
-		if !c.waitWritable(s.ptmx) {
-			return false
-		}
-		select {
-		case <-c.dead:
-			return false
-		default:
-		}
-		s.inputMu.Lock()
-		select {
-		case <-c.dead:
-			s.inputMu.Unlock()
-			return false
-		default:
-		}
-		if c.beforeInputRecheck != nil {
-			c.beforeInputRecheck()
-		}
-		if !c.pollWritable(s.ptmx, terminalInputPollWindow) {
-			s.inputMu.Unlock()
-			continue
-		}
-		n := min(len(p), terminalInputChunk)
-		written, err := s.ptmx.Write(p[:n])
-		s.inputMu.Unlock()
-		if err != nil || written == 0 {
-			c.kill()
-			return false
-		}
-		p = p[written:]
-	}
-	return true
-}
-
-func (c *localTerminalConn) waitWritable(f *os.File) bool {
-	for {
-		select {
-		case <-c.dead:
-			return false
-		default:
-		}
-		if c.pollWritable(f, terminalInputPollWindow) {
-			return true
-		}
-	}
-}
-
-// pollWritable performs exactly one bounded readiness check. It is called once
-// before inputMu and again while holding it; the latter closes the interval in
-// which a browser's normal master write could otherwise consume readiness.
-func (c *localTerminalConn) pollWritable(f *os.File, timeout time.Duration) bool {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		c.kill()
-		return false
-	}
-	ready := false
-	err = rc.Control(func(fd uintptr) {
-		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
-		n, pollErr := unix.Poll(pfd, int(timeout/time.Millisecond))
-		ready = pollErr == nil && n > 0 && pfd[0].Revents&unix.POLLOUT != 0
-	})
-	if err != nil {
-		c.kill()
-		return false
-	}
-	return ready
 }
 
 func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
@@ -826,6 +723,18 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 	if err != nil {
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
+	// pty.Start's master is not uniformly pollable: creack/pty opens it through
+	// os.OpenFile on Linux but wraps a blocking descriptor with os.NewFile on
+	// Darwin, and its startup ioctls call File.Fd. Duplicate it, make the new
+	// descriptor nonblocking before os.NewFile sees it, and retain only that
+	// runtime-pollable wrapper. No later operation calls File.Fd.
+	ptmx, err = normalizePTY(ptmx)
+	if err != nil {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, fmt.Errorf("normalise pty master: %w", err)
+	}
 	// pty.Start runs the shell with Setsid, so it leads a new session and its
 	// process group id equals its pid. Capture the pgid now — close needs it
 	// to signal the whole group, and by the time close runs the shell may
@@ -839,13 +748,19 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 	}
 	// Unconditional: the header's dimensions were validated at the top of this
 	// function, so there is no reachable case where they are zero.
-	_ = pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(h.Cols), Rows: uint16(h.Rows)})
-	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
+	if err := setPTYSize(ptmx, h.Cols, h.Rows); err != nil {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, fmt.Errorf("set pty size: %w", err)
+	}
+	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
 	d.terminals[h.SessionID] = s
 	d.addSession(1)
 	d.logf("terminal session started (%s)", d.cfg.Shell)
 	go s.readPTY()
 	go s.pollActivity()
+	s.startInput()
 	return s, nil
 }
 
@@ -891,18 +806,15 @@ func (s *terminalSession) attach(conn *sealedConn) {
 		}
 		switch {
 		case frame.Data != nil:
-			s.inputMu.Lock()
-			if _, err := s.ptmx.Write(frame.Data); err != nil {
-				s.inputMu.Unlock()
+			if !s.submitInput(&terminalInput{p: frame.Data}) {
 				s.detach(conn)
 				return
 			}
-			s.inputMu.Unlock()
 		case frame.Resize != nil:
 			if !relay.ValidTerminalSize(frame.Resize.Cols, frame.Resize.Rows) {
 				continue
 			}
-			_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(frame.Resize.Cols), Rows: uint16(frame.Resize.Rows)})
+			_ = setPTYSize(s.ptmx, frame.Resize.Cols, frame.Resize.Rows)
 		}
 	}
 	s.detach(conn)
@@ -935,7 +847,7 @@ func (s *terminalSession) attachConnSize(conn terminalConn, size *pty.Winsize) e
 		return fmt.Errorf("session already has %d connections", maxTerminalConns)
 	}
 	if size != nil {
-		if err := pty.Setsize(s.ptmx, size); err != nil {
+		if err := setPTYSize(s.ptmx, int(size.Cols), int(size.Rows)); err != nil {
 			s.mu.Unlock()
 			return fmt.Errorf("set terminal size: %w", err)
 		}
@@ -983,6 +895,142 @@ func (s *terminalSession) detach(conn terminalConn) {
 	}
 }
 
+// submitInput is nonblocking. Browser readers detach on a full session queue;
+// local callers roll back their per-client admission and return backpressure.
+func (s *terminalSession) submitInput(in *terminalInput) bool {
+	s.startInput()
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+	if s.inputClosed || s.inputCalls >= terminalInputQueue || s.inputBytes+len(in.p) > terminalInputBytes {
+		return false
+	}
+	select {
+	case s.input <- in:
+		s.inputCalls++
+		s.inputBytes += len(in.p)
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *terminalSession) startInput() {
+	s.inputOnce.Do(func() {
+		if s.input == nil {
+			s.input = make(chan *terminalInput, terminalInputQueue)
+		}
+		s.inputStarted = make(chan struct{})
+		s.inputStopped = make(chan struct{})
+		go s.inputLoop()
+	})
+}
+
+func (s *terminalSession) releaseInput(in *terminalInput) {
+	n := len(in.p)
+	s.inputMu.Lock()
+	s.inputCalls--
+	s.inputBytes -= n
+	s.inputMu.Unlock()
+	if in.local != nil {
+		in.local.inputCalls.Add(-1)
+		in.local.inputBytes.Add(-int64(n))
+	}
+}
+
+func (s *terminalSession) inputLoop() {
+	close(s.inputStarted)
+	defer close(s.inputStopped)
+	for {
+		select {
+		case <-s.done:
+			s.drainInput()
+			return
+		case in := <-s.input:
+			if in.local != nil {
+				select {
+				case <-in.local.dead:
+					s.releaseInput(in)
+					continue
+				default:
+				}
+			}
+			complete, err := s.writeInputQuantum(in)
+			if err != nil {
+				s.releaseInput(in)
+				s.stopInput()
+				s.drainInput()
+				go s.close()
+				return
+			}
+			if complete {
+				s.releaseInput(in)
+				continue
+			}
+			if in.off == len(in.p) {
+				s.releaseInput(in)
+				continue
+			}
+			select {
+			case <-s.done:
+				s.releaseInput(in)
+			case s.input <- in:
+				// Keep accounting: the request remains admitted at the queue tail.
+				// terminalInputQueue counts the active request, so at most 255
+				// others can be queued while this one is out of the channel. The
+				// active request therefore always owns this requeue slot.
+			}
+		}
+	}
+}
+
+func (s *terminalSession) drainInput() {
+	for {
+		select {
+		case in := <-s.input:
+			s.releaseInput(in)
+		default:
+			return
+		}
+	}
+}
+
+// writeInputQuantum is the sole PTY write path. It uses the permanently
+// nonblocking descriptor directly, then waits no longer than 25ms for POLLOUT.
+func (s *terminalSession) writeInputQuantum(in *terminalInput) (complete bool, err error) {
+	limit := min(len(in.p), in.off+terminalInputQuantum)
+	deadline := time.Now().Add(terminalInputPollWindow)
+	for in.off < limit {
+		select {
+		case <-s.done:
+			return true, nil
+		default:
+		}
+		if in.local != nil {
+			select {
+			case <-in.local.dead:
+				return true, nil
+			default:
+			}
+		}
+		written, err := ptyWrite(s.ptmx, in.p[in.off:limit])
+		if written > 0 {
+			in.off += written
+			continue
+		}
+		if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+			return true, fmt.Errorf("write pty: %w", err)
+		}
+		ready, err := ptyWritable(s.ptmx, deadline)
+		if err != nil {
+			return true, err
+		}
+		if !ready {
+			return false, nil
+		}
+	}
+	return in.off == len(in.p), nil
+}
+
 func (s *terminalSession) readPTY() {
 	r, err := newPTYReader(s.ptmx)
 	if err != nil {
@@ -1001,6 +1049,129 @@ func (s *terminalSession) readPTY() {
 			return
 		}
 	}
+}
+
+func setPTYNonblock(f *os.File) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) { opErr = unix.SetNonblock(int(fd), true) }); err != nil {
+		return err
+	}
+	return opErr
+}
+
+func setPTYSize(f *os.File, cols, rows int) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) {
+		opErr = unix.IoctlSetWinsize(int(fd), unix.TIOCSWINSZ, &unix.Winsize{Col: uint16(cols), Row: uint16(rows)})
+	}); err != nil {
+		return err
+	}
+	return opErr
+}
+
+// normalizePTY returns a separately owned wrapper whose descriptor was already
+// O_NONBLOCK when os.NewFile registered it with Go's poller. Wrapping the same
+// descriptor would create two owners; duplicating first makes closing the
+// creack/pty wrapper safe and keeps RawConn.Read deadline-capable on both Linux
+// and Darwin.
+func normalizePTY(f *os.File) (*os.File, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return f, err
+	}
+	dup := -1
+	var opErr error
+	if err := rc.Control(func(fd uintptr) {
+		dup, opErr = unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 0)
+		if opErr == nil {
+			opErr = unix.SetNonblock(dup, true)
+		}
+	}); err != nil {
+		return f, err
+	}
+	if opErr != nil {
+		if dup >= 0 {
+			_ = unix.Close(dup)
+		}
+		return f, opErr
+	}
+	normalized := os.NewFile(uintptr(dup), f.Name())
+	if normalized == nil {
+		_ = unix.Close(dup)
+		return f, fmt.Errorf("wrap duplicated pty descriptor")
+	}
+	if err := normalized.SetReadDeadline(time.Time{}); err != nil {
+		_ = normalized.Close()
+		return f, fmt.Errorf("register pty with runtime poller: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = normalized.Close()
+		return f, err
+	}
+	return normalized, nil
+}
+
+func ptyWrite(f *os.File, p []byte) (n int, err error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) {
+		for {
+			n, opErr = unix.Write(int(fd), p)
+			if opErr != unix.EINTR {
+				return
+			}
+		}
+	}); err != nil {
+		return 0, err
+	}
+	return n, opErr
+}
+
+func ptyWritable(f *os.File, deadline time.Time) (bool, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return false, err
+	}
+	ready := false
+	var opErr error
+	err = rc.Control(func(fd uintptr) {
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+		for {
+			left := time.Until(deadline)
+			if left <= 0 {
+				return
+			}
+			n, pollErr := unix.Poll(pfd, int((left+time.Millisecond-1)/time.Millisecond))
+			if pollErr == unix.EINTR {
+				continue
+			}
+			if pollErr != nil {
+				opErr = pollErr
+				return
+			}
+			if n > 0 && pfd[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+				opErr = fmt.Errorf("pty poll terminal revents %#x", pfd[0].Revents)
+				return
+			}
+			ready = n > 0 && pfd[0].Revents&unix.POLLOUT != 0
+			return
+		}
+	})
+	if err != nil {
+		return false, err
+	}
+	return ready, opErr
 }
 
 // ptyReader reads coalesced chunks from a PTY master.
@@ -1046,7 +1217,7 @@ func newPTYReader(f *os.File) (*ptyReader, error) {
 // leaves without waiting a nanosecond, and bulk output gets the full window
 // whatever the host is doing.
 func (p *ptyReader) read(buf []byte) (n, reads int, err error) {
-	n, err = p.f.Read(buf)
+	n, err = p.readOnce(buf)
 	reads = 1
 	if err != nil || n < terminalCoalesceMinChunk || p.blind {
 		return n, reads, err
@@ -1056,7 +1227,7 @@ func (p *ptyReader) read(buf []byte) (n, reads int, err error) {
 		if !p.readable(deadline) {
 			return n, reads, nil
 		}
-		m, rerr := p.f.Read(buf[n:])
+		m, rerr := p.readOnce(buf[n:])
 		reads++
 		n += m
 		if rerr != nil {
@@ -1064,6 +1235,23 @@ func (p *ptyReader) read(buf []byte) (n, reads int, err error) {
 		}
 	}
 	return n, reads, nil
+}
+
+func (p *ptyReader) readOnce(buf []byte) (n int, err error) {
+	var opErr error
+	err = p.rc.Read(func(fd uintptr) bool {
+		for {
+			n, opErr = unix.Read(int(fd), buf)
+			if opErr != unix.EINTR {
+				break
+			}
+		}
+		return opErr != unix.EAGAIN && opErr != unix.EWOULDBLOCK
+	})
+	if err != nil {
+		return n, err
+	}
+	return n, opErr
 }
 
 // readable reports whether the master has bytes ready, waiting no later than
@@ -1205,13 +1393,25 @@ func (s *terminalSession) pollActivity() {
 		case <-s.done:
 			return
 		case <-ticker.C:
-			fg, err := unix.IoctlGetInt(int(s.ptmx.Fd()), unix.TIOCGPGRP)
+			fg, err := ptyForegroundPgrp(s.ptmx)
 			if err != nil {
 				return
 			}
 			s.setActivity(fg > 0 && fg != s.cmd.Process.Pid)
 		}
 	}
+}
+
+func ptyForegroundPgrp(f *os.File) (fg int, err error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) { fg, opErr = unix.IoctlGetInt(int(fd), unix.TIOCGPGRP) }); err != nil {
+		return 0, err
+	}
+	return fg, opErr
 }
 
 func (s *terminalSession) setActivity(active bool) {
@@ -1245,6 +1445,9 @@ func (s *terminalSession) setActivity(active bool) {
 // closed anything that matters.
 func (s *terminalSession) killProcessGroup() {
 	if s.cmd == nil || s.cmd.Process == nil {
+		if s.ptmx != nil {
+			_ = s.ptmx.Close()
+		}
 		return
 	}
 	if s.pgid > 0 {
@@ -1279,6 +1482,7 @@ func (s *terminalSession) killProcessGroup() {
 
 func (s *terminalSession) close() {
 	s.closeOnce.Do(func() {
+		s.stopInput()
 		s.mu.Lock()
 		s.closed = true
 		conns := s.conns
@@ -1295,14 +1499,27 @@ func (s *terminalSession) close() {
 			conn.kill()
 		}
 		s.killProcessGroup()
-		close(s.done)
 
-		s.owner.terminalMu.Lock()
-		if s.owner.terminals[s.id] == s {
-			delete(s.owner.terminals, s.id)
+		if s.owner != nil {
+			s.owner.terminalMu.Lock()
+			if s.owner.terminals[s.id] == s {
+				delete(s.owner.terminals, s.id)
+			}
+			s.owner.terminalMu.Unlock()
+			s.owner.addSession(-1)
+			s.owner.logf("terminal session ended")
 		}
-		s.owner.terminalMu.Unlock()
-		s.owner.addSession(-1)
-		s.owner.logf("terminal session ended")
 	})
+}
+
+// stopInput is the admission/worker half of close. Closing done before process
+// teardown makes queued and currently polled requests release within one 25ms
+// poll window, independently of the process-group grace period.
+func (s *terminalSession) stopInput() {
+	s.inputMu.Lock()
+	if !s.inputClosed {
+		s.inputClosed = true
+		close(s.done)
+	}
+	s.inputMu.Unlock()
 }
