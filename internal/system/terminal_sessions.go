@@ -82,19 +82,26 @@ const (
 	// terminalLocalActionTO gives an in-process attachment the same bounded
 	// action window that a relay request obtains from its accepted fence.
 	terminalLocalActionTO = 10 * time.Second
-	// terminalInputQueue bounds both queued local calls and their copied bytes.
-	// It is intentionally the same byte budget as outbound terminal traffic:
-	// four local attachments cannot turn pasted input into unbounded agent memory.
+	// terminalInputQueue bounds accepted local Write calls, including the one the
+	// input worker is currently processing. terminalInputBytes bounds the copied
+	// bytes belonging to those calls, including that in-flight call. Caller-owned
+	// input is never counted or retained when admission rejects it.
 	terminalInputQueue      = terminalSendQueue
 	terminalInputBytes      = terminalSendBytes
 	terminalInputPollWindow = 25 * time.Millisecond
-	terminalInputChunk      = 4 << 10
+	// PIPE_BUF is 4096 on Linux and 512 on Darwin. Keeping a write within the
+	// portable 512-byte floor lets the locked POLLOUT recheck establish that the
+	// subsequent write will not wait for a sibling master writer.
+	terminalInputChunk = 512
 )
 
 var (
 	// ErrTerminalInputBackpressure means a local Write was not accepted. Callers
 	// may retry after consuming output or yielding; bytes are never dropped.
 	ErrTerminalInputBackpressure = errors.New("terminal input backpressure")
+	// ErrTerminalInputTooLarge means one input exceeds the fixed per-call limit
+	// and cannot become acceptable by retrying.
+	ErrTerminalInputTooLarge = errors.New("terminal input is too large")
 	// ErrTerminalClientClosed means this attachment has detached or its session
 	// ended. It never means the shared shell was killed by the attachment.
 	ErrTerminalClientClosed = errors.New("terminal attachment is closed")
@@ -379,17 +386,14 @@ func (c *TerminalClient) Output() <-chan []byte { return c.conn.output }
 func (c *TerminalClient) Done() <-chan struct{} { return c.conn.dead }
 
 // Write copies and queues input for the shared PTY without blocking on a
-// non-reading slave. Local writes keep their acceptance order. It returns
-// ErrTerminalInputBackpressure when the bounded queue cannot accept the bytes,
-// and ErrTerminalClientClosed after this attachment ends.
+// non-reading slave. Local writes keep their acceptance order. Each live local
+// attachment holds at most 256 accepted queued-or-in-flight calls and 1 MiB of
+// implementation-owned copied bytes; rejected calls retain no copy. Success
+// means admission completed before Detach; teardown may discard those accepted
+// bytes. It returns ErrTerminalInputBackpressure when retrying may work,
+// ErrTerminalInputTooLarge for a permanently oversized call, and
+// ErrTerminalClientClosed after this attachment ends.
 func (c *TerminalClient) Write(p []byte) error {
-	if len(p) > relay.MaxFrameSize || len(p) > terminalInputBytes {
-		return ErrTerminalInputBackpressure
-	}
-	if len(p) == 0 {
-		return nil
-	}
-	copy := append([]byte(nil), p...)
 	c.conn.inputMu.Lock()
 	defer c.conn.inputMu.Unlock()
 	select {
@@ -397,17 +401,32 @@ func (c *TerminalClient) Write(p []byte) error {
 		return ErrTerminalClientClosed
 	default:
 	}
-	if c.conn.inputBytes.Load()+int64(len(copy)) > terminalInputBytes {
+	if len(p) > min(relay.MaxFrameSize, terminalInputBytes) {
+		return ErrTerminalInputTooLarge
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	if c.conn.inputCalls.Load() >= terminalInputQueue || c.conn.inputBytes.Load()+int64(len(p)) > terminalInputBytes {
 		return ErrTerminalInputBackpressure
 	}
-	c.conn.inputBytes.Add(int64(len(copy)))
+	// Reserve before allocation. inputMu also makes admission and kill one
+	// transaction, so a successful Write cannot be admitted after Detach.
+	c.conn.inputCalls.Add(1)
+	c.conn.inputBytes.Add(int64(len(p)))
+	if c.conn.beforeInputCopy != nil {
+		c.conn.beforeInputCopy()
+	}
+	copy := c.conn.copyInput(p)
 	select {
 	case <-c.conn.dead:
+		c.conn.inputCalls.Add(-1)
 		c.conn.inputBytes.Add(-int64(len(copy)))
 		return ErrTerminalClientClosed
 	case c.conn.input <- copy:
 		return nil
 	default:
+		c.conn.inputCalls.Add(-1)
 		c.conn.inputBytes.Add(-int64(len(copy)))
 		return ErrTerminalInputBackpressure
 	}
@@ -466,9 +485,14 @@ type localTerminalConn struct {
 	killOne sync.Once
 
 	input      chan []byte
+	inputCalls atomic.Int64
 	inputBytes atomic.Int64
 	inputMu    sync.Mutex // serialises local Write acceptance order
 	inputDone  chan struct{}
+	copyInput  func([]byte) []byte
+	// Test seams; nil in production.
+	beforeInputCopy    func()
+	beforeInputRecheck func()
 }
 
 func newLocalTerminalConn() *localTerminalConn {
@@ -480,6 +504,7 @@ func newLocalTerminalConn() *localTerminalConn {
 		dead:      make(chan struct{}),
 		input:     make(chan []byte, terminalInputQueue),
 		inputDone: make(chan struct{}),
+		copyInput: func(p []byte) []byte { return append([]byte(nil), p...) },
 	}
 	go c.writeLoop()
 	return c
@@ -551,7 +576,9 @@ func (c *localTerminalConn) writeLoop() {
 }
 
 func (c *localTerminalConn) kill() {
+	c.inputMu.Lock()
 	c.killOne.Do(func() { close(c.dead) })
+	c.inputMu.Unlock()
 }
 
 // inputLoop is one worker per attachment, never one per Write. It waits for
@@ -564,6 +591,7 @@ func (c *localTerminalConn) inputLoop(s *terminalSession) {
 		for {
 			select {
 			case p := <-c.input:
+				c.inputCalls.Add(-1)
 				c.inputBytes.Add(-int64(len(p)))
 			default:
 				close(c.inputDone)
@@ -577,9 +605,11 @@ func (c *localTerminalConn) inputLoop(s *terminalSession) {
 			return
 		case p := <-c.input:
 			if !c.writeInput(s, p) {
+				c.inputCalls.Add(-1)
 				c.inputBytes.Add(-int64(len(p)))
 				return
 			}
+			c.inputCalls.Add(-1)
 			c.inputBytes.Add(-int64(len(p)))
 		}
 	}
@@ -595,7 +625,6 @@ func (c *localTerminalConn) writeInput(s *terminalSession, p []byte) bool {
 			return false
 		default:
 		}
-		n := min(len(p), terminalInputChunk)
 		s.inputMu.Lock()
 		select {
 		case <-c.dead:
@@ -603,6 +632,14 @@ func (c *localTerminalConn) writeInput(s *terminalSession, p []byte) bool {
 			return false
 		default:
 		}
+		if c.beforeInputRecheck != nil {
+			c.beforeInputRecheck()
+		}
+		if !c.pollWritable(s.ptmx, terminalInputPollWindow) {
+			s.inputMu.Unlock()
+			continue
+		}
+		n := min(len(p), terminalInputChunk)
 		written, err := s.ptmx.Write(p[:n])
 		s.inputMu.Unlock()
 		if err != nil || written == 0 {
@@ -615,31 +652,38 @@ func (c *localTerminalConn) writeInput(s *terminalSession, p []byte) bool {
 }
 
 func (c *localTerminalConn) waitWritable(f *os.File) bool {
-	rc, err := f.SyscallConn()
-	if err != nil {
-		c.kill()
-		return false
-	}
 	for {
 		select {
 		case <-c.dead:
 			return false
 		default:
 		}
-		ready := false
-		err := rc.Control(func(fd uintptr) {
-			pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
-			n, pollErr := unix.Poll(pfd, int(terminalInputPollWindow/time.Millisecond))
-			ready = pollErr == nil && n > 0 && pfd[0].Revents&unix.POLLOUT != 0
-		})
-		if err != nil {
-			c.kill()
-			return false
-		}
-		if ready {
+		if c.pollWritable(f, terminalInputPollWindow) {
 			return true
 		}
 	}
+}
+
+// pollWritable performs exactly one bounded readiness check. It is called once
+// before inputMu and again while holding it; the latter closes the interval in
+// which a browser's normal master write could otherwise consume readiness.
+func (c *localTerminalConn) pollWritable(f *os.File, timeout time.Duration) bool {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		c.kill()
+		return false
+	}
+	ready := false
+	err = rc.Control(func(fd uintptr) {
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+		n, pollErr := unix.Poll(pfd, int(timeout/time.Millisecond))
+		ready = pollErr == nil && n > 0 && pfd[0].Revents&unix.POLLOUT != 0
+	})
+	if err != nil {
+		c.kill()
+		return false
+	}
+	return ready
 }
 
 func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
