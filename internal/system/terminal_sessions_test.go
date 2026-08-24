@@ -982,6 +982,154 @@ func TestTerminalInputStartsExactlyOneWorkerAndCloseDrainsAccounting(t *testing.
 	}
 }
 
+func TestTerminalInputMaximalLocalLeavesBrowserReserve(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	local := newLocalTerminalConn()
+	client := &TerminalClient{session: s, conn: local}
+	if err := client.Write(make([]byte, terminalInputBytes)); err != nil {
+		t.Fatalf("admit exact maximal local input: %v", err)
+	}
+	waitSessionInput(t, s, 1, 0, time.Second)
+
+	dead := make(chan struct{})
+	admitted := make(chan bool, 1)
+	go func() { admitted <- s.submitBrowserInput([]byte("browser-marker"), dead) }()
+	select {
+	case ok := <-admitted:
+		if !ok {
+			t.Fatal("browser marker rejected behind maximal local input")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("browser marker waited for maximal local input to complete")
+	}
+	waitSessionInput(t, s, 2, 1, time.Second)
+	s.inputMu.Lock()
+	if s.localInputCalls != 1 || s.localInputBytes != terminalInputBytes || s.browserInputCalls != 1 || s.browserInputBytes != len("browser-marker") {
+		t.Fatalf("split accounting local=%d/%d browser=%d/%d", s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes)
+	}
+	s.inputMu.Unlock()
+
+	local.kill()
+	s.close()
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain maximal local plus browser reserve")
+	}
+	waitInputAccounting(t, s, local, 0, 0, time.Second)
+}
+
+func TestBrowserInputFullCapacityWaitsThenResumes(t *testing.T) {
+	inputRead, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	s.startInput()
+	for i := range terminalBrowserInputQueue {
+		if !s.submitInput(&terminalInput{p: bytes.Repeat([]byte{byte(i)}, terminalInputQuantum)}) {
+			t.Fatalf("admit browser call %d of exact %d-call reserve", i+1, terminalBrowserInputQueue)
+		}
+	}
+	waitSessionInput(t, s, terminalBrowserInputQueue, terminalBrowserInputQueue-1, time.Second)
+	dead := make(chan struct{})
+	admitted := make(chan bool, 1)
+	go func() { admitted <- s.submitBrowserInput([]byte("next"), dead) }()
+	waitInputCapacityWaiter(t, s)
+	select {
+	case got := <-admitted:
+		t.Fatalf("browser submission completed at full capacity: %v", got)
+	default:
+	}
+	select {
+	case <-dead:
+		t.Fatal("capacity pressure disconnected the browser")
+	default:
+	}
+
+	buf := make([]byte, terminalInputQuantum)
+	if _, err := inputRead.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ok := <-admitted:
+		if !ok {
+			t.Fatal("waiting browser did not resume after accounting release")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting browser did not observe accounting release")
+	}
+	waitSessionInput(t, s, terminalBrowserInputQueue, terminalBrowserInputQueue-1, time.Second)
+	s.close()
+}
+
+func TestBrowserInputCapacityWaitCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel func(*terminalSession, chan struct{})
+	}{
+		{name: "connection", cancel: func(_ *terminalSession, dead chan struct{}) { close(dead) }},
+		{name: "session", cancel: func(s *terminalSession, _ chan struct{}) { s.stopInput() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, inputWrite := fullNonblockingPipe(t)
+			s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+			s.startInput()
+			for i := range terminalBrowserInputQueue {
+				if !s.submitInput(&terminalInput{p: bytes.Repeat([]byte{byte(i)}, terminalInputQuantum)}) {
+					t.Fatalf("fill browser reserve at call %d", i+1)
+				}
+			}
+			waitSessionInput(t, s, terminalBrowserInputQueue, terminalBrowserInputQueue-1, time.Second)
+			dead := make(chan struct{})
+			result := make(chan bool, 1)
+			go func() { result <- s.submitBrowserInput([]byte("blocked"), dead) }()
+			waitInputCapacityWaiter(t, s)
+			tc.cancel(s, dead)
+			select {
+			case ok := <-result:
+				if ok {
+					t.Fatal("cancelled browser submission was admitted")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cancellation did not unblock browser submission")
+			}
+			s.close()
+			select {
+			case <-s.inputStopped:
+			case <-time.After(time.Second):
+				t.Fatal("scheduler did not stop and drain after cancellation")
+			}
+			s.inputMu.Lock()
+			calls, inputBytes := s.inputCalls, s.inputBytes
+			s.inputMu.Unlock()
+			if calls != 0 || inputBytes != 0 {
+				t.Fatalf("accounting after cancellation and close = %d/%d, want 0/0", calls, inputBytes)
+			}
+		})
+	}
+}
+
+func TestTerminalInputExactSchedulerBounds(t *testing.T) {
+	if terminalSchedulerQueue != 320 || terminalSchedulerBytes != 1280<<10 {
+		t.Fatalf("scheduler bounds = %d calls/%d bytes, want 320 calls/1.25 MiB", terminalSchedulerQueue, terminalSchedulerBytes)
+	}
+	if terminalInputQueue != 256 || terminalInputBytes != 1<<20 || terminalBrowserInputQueue != 64 || terminalBrowserInputBytes != 256<<10 {
+		t.Fatalf("component bounds local=%d/%d browser=%d/%d", terminalInputQueue, terminalInputBytes, terminalBrowserInputQueue, terminalBrowserInputBytes)
+	}
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, done: make(chan struct{})}
+	if !s.submitInput(&terminalInput{p: make([]byte, terminalBrowserInputBytes)}) {
+		t.Fatal("exact browser byte reserve was not reachable")
+	}
+	if got := cap(s.input); got != terminalSchedulerQueue {
+		t.Fatalf("initialized scheduler channel capacity = %d, want %d", got, terminalSchedulerQueue)
+	}
+	waitSessionInput(t, s, 1, 0, time.Second)
+	if s.submitInput(&terminalInput{p: []byte{1}}) {
+		t.Fatal("browser byte reserve accepted one byte beyond its exact bound")
+	}
+	s.close()
+}
+
 func TestTerminalInputCallBoundLeavesActiveRequestARequeueSlot(t *testing.T) {
 	_, inputWrite := fullNonblockingPipe(t)
 	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
@@ -1083,7 +1231,7 @@ func TestTerminalInputHasOneRawPTYWriterAndOneScheduler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(source, []byte("s.submitInput(&terminalInput{p: frame.Data})")) {
+	if !bytes.Contains(source, []byte("s.submitBrowserInput(frame.Data, conn.dead)")) {
 		t.Fatal("browser attach does not submit through the terminal input scheduler")
 	}
 }
@@ -1121,6 +1269,23 @@ func waitSessionInput(t *testing.T, s *terminalSession, calls, queued int, timeo
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("session input calls/queued = %d/%d, want %d/%d", gotCalls, len(s.input), calls, queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitInputCapacityWaiter(t *testing.T, s *terminalSession) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		s.inputMu.Lock()
+		waiting := s.inputCapacity != nil
+		s.inputMu.Unlock()
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("browser submission did not enter capacity wait")
 		}
 		time.Sleep(time.Millisecond)
 	}

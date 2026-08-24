@@ -86,10 +86,18 @@ const (
 	// input worker is currently processing. terminalInputBytes bounds the copied
 	// bytes belonging to those calls, including that in-flight call. Caller-owned
 	// input is never counted or retained when admission rejects it.
-	terminalInputQueue      = terminalSendQueue
-	terminalInputBytes      = terminalSendBytes
-	terminalInputPollWindow = 25 * time.Millisecond
-	terminalInputQuantum    = 4 << 10
+	terminalInputQueue = terminalSendQueue
+	terminalInputBytes = terminalSendBytes
+	// Browser input has its own reserve beyond the entire local-input budget.
+	// Thus a maximal accepted local workload (256 calls/1 MiB) still leaves 64
+	// calls/256 KiB for browser keystrokes in the same scheduler. Browser frames
+	// larger than the byte reserve are admitted in bounded chunks.
+	terminalBrowserInputQueue = 64
+	terminalBrowserInputBytes = 256 << 10
+	terminalSchedulerQueue    = terminalInputQueue + terminalBrowserInputQueue
+	terminalSchedulerBytes    = terminalInputBytes + terminalBrowserInputBytes
+	terminalInputPollWindow   = 25 * time.Millisecond
+	terminalInputQuantum      = 4 << 10
 )
 
 var (
@@ -206,22 +214,27 @@ type terminalSession struct {
 	cmd   *exec.Cmd
 	pgid  int // the shell's process group id (it leads it: pty.Start sets Setsid)
 
-	mu           sync.Mutex
-	inputMu      sync.Mutex
-	input        chan *terminalInput
-	inputBytes   int
-	inputCalls   int
-	inputClosed  bool
-	inputOnce    sync.Once
-	inputStarted chan struct{}
-	inputStopped chan struct{}
-	conns        map[terminalConn]struct{}
-	replay       replayRing
-	active       bool
-	closed       bool
-	expires      *time.Timer
-	done         chan struct{}
-	closeOnce    sync.Once
+	mu                sync.Mutex
+	inputMu           sync.Mutex
+	input             chan *terminalInput
+	inputBytes        int
+	inputCalls        int
+	localInputBytes   int
+	localInputCalls   int
+	browserInputBytes int
+	browserInputCalls int
+	inputClosed       bool
+	inputCapacity     chan struct{} // closed and replaced under inputMu on accounting release
+	inputOnce         sync.Once
+	inputStarted      chan struct{}
+	inputStopped      chan struct{}
+	conns             map[terminalConn]struct{}
+	replay            replayRing
+	active            bool
+	closed            bool
+	expires           *time.Timer
+	done              chan struct{}
+	closeOnce         sync.Once
 }
 
 // terminalInput is one accepted browser or local request. The scheduler writes
@@ -754,7 +767,7 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		_, _ = cmd.Process.Wait()
 		return nil, fmt.Errorf("set pty size: %w", err)
 	}
-	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
 	d.terminals[h.SessionID] = s
 	d.addSession(1)
 	d.logf("terminal session started (%s)", d.cfg.Shell)
@@ -806,7 +819,7 @@ func (s *terminalSession) attach(conn *sealedConn) {
 		}
 		switch {
 		case frame.Data != nil:
-			if !s.submitInput(&terminalInput{p: frame.Data}) {
+			if !s.submitBrowserInput(frame.Data, conn.dead) {
 				s.detach(conn)
 				return
 			}
@@ -895,29 +908,92 @@ func (s *terminalSession) detach(conn terminalConn) {
 	}
 }
 
-// submitInput is nonblocking. Browser readers detach on a full session queue;
-// local callers roll back their per-client admission and return backpressure.
+// submitInput is the common nonblocking admission primitive. Local callers use
+// it directly so Write remains immediate. Browser readers use
+// submitBrowserInput, which waits for this same scheduler's bounded reserve.
 func (s *terminalSession) submitInput(in *terminalInput) bool {
 	s.startInput()
 	s.inputMu.Lock()
 	defer s.inputMu.Unlock()
-	if s.inputClosed || s.inputCalls >= terminalInputQueue || s.inputBytes+len(in.p) > terminalInputBytes {
+	return s.submitInputLocked(in)
+}
+
+func (s *terminalSession) submitInputLocked(in *terminalInput) bool {
+	if s.inputClosed || s.inputCalls >= terminalSchedulerQueue || s.inputBytes+len(in.p) > terminalSchedulerBytes {
+		return false
+	}
+	if in.local != nil {
+		if s.localInputCalls >= terminalInputQueue || s.localInputBytes+len(in.p) > terminalInputBytes {
+			return false
+		}
+	} else if s.browserInputCalls >= terminalBrowserInputQueue || s.browserInputBytes+len(in.p) > terminalBrowserInputBytes {
 		return false
 	}
 	select {
 	case s.input <- in:
 		s.inputCalls++
 		s.inputBytes += len(in.p)
+		if in.local != nil {
+			s.localInputCalls++
+			s.localInputBytes += len(in.p)
+		} else {
+			s.browserInputCalls++
+			s.browserInputBytes += len(in.p)
+		}
 		return true
 	default:
 		return false
 	}
 }
 
+// submitBrowserInput backpressures one browser reader without disconnecting it.
+// The generation channel is captured while inputMu protects the failed
+// admission, so a release cannot be missed between checking capacity and
+// waiting. A connection retains only its already-decoded frame while parked.
+func (s *terminalSession) submitBrowserInput(p []byte, dead <-chan struct{}) bool {
+	for len(p) > 0 {
+		n := min(len(p), terminalBrowserInputBytes)
+		in := &terminalInput{p: p[:n]}
+		for {
+			select {
+			case <-s.done:
+				return false
+			case <-dead:
+				return false
+			default:
+			}
+			s.startInput()
+			s.inputMu.Lock()
+			if s.submitInputLocked(in) {
+				s.inputMu.Unlock()
+				break
+			}
+			if s.inputClosed {
+				s.inputMu.Unlock()
+				return false
+			}
+			if s.inputCapacity == nil {
+				s.inputCapacity = make(chan struct{})
+			}
+			capacity := s.inputCapacity
+			s.inputMu.Unlock()
+			select {
+			case <-capacity:
+			case <-s.done:
+				return false
+			case <-dead:
+				return false
+			}
+		}
+		p = p[n:]
+	}
+	return true
+}
+
 func (s *terminalSession) startInput() {
 	s.inputOnce.Do(func() {
 		if s.input == nil {
-			s.input = make(chan *terminalInput, terminalInputQueue)
+			s.input = make(chan *terminalInput, terminalSchedulerQueue)
 		}
 		s.inputStarted = make(chan struct{})
 		s.inputStopped = make(chan struct{})
@@ -930,10 +1006,25 @@ func (s *terminalSession) releaseInput(in *terminalInput) {
 	s.inputMu.Lock()
 	s.inputCalls--
 	s.inputBytes -= n
+	if in.local != nil {
+		s.localInputCalls--
+		s.localInputBytes -= n
+	} else {
+		s.browserInputCalls--
+		s.browserInputBytes -= n
+	}
+	s.notifyInputCapacityLocked()
 	s.inputMu.Unlock()
 	if in.local != nil {
 		in.local.inputCalls.Add(-1)
 		in.local.inputBytes.Add(-int64(n))
+	}
+}
+
+func (s *terminalSession) notifyInputCapacityLocked() {
+	if s.inputCapacity != nil {
+		close(s.inputCapacity)
+		s.inputCapacity = nil
 	}
 }
 
@@ -975,7 +1066,7 @@ func (s *terminalSession) inputLoop() {
 				s.releaseInput(in)
 			case s.input <- in:
 				// Keep accounting: the request remains admitted at the queue tail.
-				// terminalInputQueue counts the active request, so at most 255
+				// terminalSchedulerQueue counts the active request, so at most 319
 				// others can be queued while this one is out of the channel. The
 				// active request therefore always owns this requeue slot.
 			}
@@ -1520,6 +1611,7 @@ func (s *terminalSession) stopInput() {
 	if !s.inputClosed {
 		s.inputClosed = true
 		close(s.done)
+		s.notifyInputCapacityLocked()
 	}
 	s.inputMu.Unlock()
 }

@@ -80,7 +80,10 @@ func TestRealPTYInputFairnessAt4096ByteQuantum(t *testing.T) {
 	local := &TerminalClient{session: s, conn: localConn}
 	localBegin := []byte("[[local-begin-29ac]]")
 	localTail := []byte("[[local-tail-e841]]")
-	localInput := append(append(append([]byte(nil), localBegin...), bytes.Repeat([]byte{'L'}, 64<<10)...), localTail...)
+	localInput := append(append(append([]byte(nil), localBegin...), bytes.Repeat([]byte{'L'}, terminalInputBytes-len(localBegin)-len(localTail))...), localTail...)
+	if len(localInput) != terminalInputBytes {
+		t.Fatalf("local fixture = %d bytes, want exact %d-byte bound", len(localInput), terminalInputBytes)
+	}
 	if err := local.Write(localInput); err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +202,7 @@ func fillPTYToEAGAIN(t *testing.T, ptmx *os.File) int {
 }
 
 func newInputTestSession(ptmx *os.File) *terminalSession {
-	s := &terminalSession{ptmx: ptmx, conns: make(map[terminalConn]struct{}), input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+	s := &terminalSession{ptmx: ptmx, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
 	s.startInput()
 	return s
 }
