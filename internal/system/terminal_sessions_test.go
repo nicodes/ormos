@@ -850,6 +850,164 @@ func TestLocalTerminalWriteReservesAggregateBeforeCopyAcrossClients(t *testing.T
 	secondConn.kill()
 }
 
+func TestReservedLocalPublicationRollsBackWhenSessionCloses(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	local := newLocalTerminalConn()
+	if err := s.attachConn(local); err != nil {
+		t.Fatal(err)
+	}
+	client := &TerminalClient{session: s, conn: local}
+	reserved := make(chan struct{})
+	release := make(chan struct{})
+	local.beforeInputCopy = func() {
+		close(reserved)
+		<-release
+	}
+	writeResult := make(chan error, 1)
+	go func() { writeResult <- client.Write(make([]byte, terminalInputBytes)) }()
+	<-reserved
+
+	browserBlock := make([]byte, terminalInputQuantum)
+	for i := range terminalBrowserInputQueue {
+		if !s.submitInput(&terminalInput{p: browserBlock}) {
+			t.Fatalf("fill browser reserve at call %d", i+1)
+		}
+	}
+	s.inputMu.Lock()
+	got := [6]int{s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes}
+	s.inputMu.Unlock()
+	want := [6]int{1 + terminalBrowserInputQueue, terminalSchedulerBytes, 1, terminalInputBytes, terminalBrowserInputQueue, terminalBrowserInputBytes}
+	if got != want {
+		t.Fatalf("reserved pre-publication ledgers = %v, want %v", got, want)
+	}
+
+	browserResult := make(chan bool, 1)
+	browserDead := make(chan struct{})
+	go func() { browserResult <- s.submitBrowserInput([]byte("waiting-browser"), browserDead) }()
+	waitInputCapacityWaiter(t, s)
+	closeResult := make(chan struct{})
+	go func() {
+		s.close()
+		close(closeResult)
+	}()
+	select {
+	case ok := <-browserResult:
+		if ok {
+			t.Fatal("browser waiter was admitted during close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session close did not wake browser capacity waiter")
+	}
+	select {
+	case <-closeResult:
+		t.Fatal("session close passed a reserved Write holding local inputMu")
+	default:
+	}
+
+	close(release)
+	if err := <-writeResult; !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("reserved publication after close = %v, want ErrTerminalInputBackpressure", err)
+	}
+	select {
+	case <-closeResult:
+	case <-time.After(time.Second):
+		t.Fatal("session close deadlocked after reserved Write released local inputMu")
+	}
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("input worker did not stop after reserved publication rollback")
+	}
+	s.inputMu.Lock()
+	final := [6]int{s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes}
+	s.inputMu.Unlock()
+	if final != [6]int{} {
+		t.Fatalf("session ledgers after close = %v, want all zero", final)
+	}
+	if calls, inputBytes := local.inputCalls.Load(), local.inputBytes.Load(); calls != 0 || inputBytes != 0 {
+		t.Fatalf("local ledgers after close = %d/%d, want 0/0", calls, inputBytes)
+	}
+}
+
+func TestReservedLocalInputOwnsFutureSchedulerChannelSlot(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, done: make(chan struct{})}
+	primary := newLocalTerminalConn()
+	overflow := newLocalTerminalConn()
+	if err := s.attachConn(primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.attachConn(overflow); err != nil {
+		t.Fatal(err)
+	}
+	primaryClient := &TerminalClient{session: s, conn: primary}
+	overflowClient := &TerminalClient{session: s, conn: overflow}
+	block := make([]byte, terminalInputQuantum)
+	for i := range terminalInputQueue - 1 {
+		if err := primaryClient.Write(block); err != nil {
+			t.Fatalf("publish local call %d of %d: %v", i+1, terminalInputQueue-1, err)
+		}
+	}
+	for i := range terminalBrowserInputQueue {
+		if !s.submitInput(&terminalInput{p: block}) {
+			t.Fatalf("publish browser call %d of %d", i+1, terminalBrowserInputQueue)
+		}
+	}
+	if got := cap(s.input); got != terminalSchedulerQueue {
+		t.Fatalf("production scheduler channel capacity = %d, want %d future-slot invariant", got, terminalSchedulerQueue)
+	}
+	reserved := make(chan struct{})
+	release := make(chan struct{})
+	primary.beforeInputCopy = func() {
+		close(reserved)
+		<-release
+	}
+	lastResult := make(chan error, 1)
+	go func() { lastResult <- primaryClient.Write(block) }()
+	<-reserved
+	s.inputMu.Lock()
+	got := [5]int{s.inputCalls, s.localInputCalls, s.browserInputCalls, s.localInputBytes, s.browserInputBytes}
+	s.inputMu.Unlock()
+	want := [5]int{terminalSchedulerQueue, terminalInputQueue, terminalBrowserInputQueue, terminalInputBytes, terminalBrowserInputBytes}
+	if got != want {
+		t.Fatalf("320th reserved ledgers = %v, want %v", got, want)
+	}
+	var overflowCopies atomic.Int64
+	overflow.copyInput = func(p []byte) []byte {
+		overflowCopies.Add(1)
+		return append([]byte(nil), p...)
+	}
+	if err := overflowClient.Write([]byte("321st")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("321st local Write = %v, want ErrTerminalInputBackpressure", err)
+	}
+	if copies := overflowCopies.Load(); copies != 0 {
+		t.Fatalf("321st rejected Write made %d copies", copies)
+	}
+	close(release)
+	if err := <-lastResult; err != nil {
+		t.Fatalf("320th Write did not publish into its reserved slot: %v", err)
+	}
+	s.close()
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain exact 320-call scheduler bound")
+	}
+	s.inputMu.Lock()
+	final := [6]int{s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes}
+	s.inputMu.Unlock()
+	if final != [6]int{} {
+		t.Fatalf("session ledgers after exact-bound close = %v, want all zero", final)
+	}
+	if calls, inputBytes := primary.inputCalls.Load(), primary.inputBytes.Load(); calls != 0 || inputBytes != 0 {
+		t.Fatalf("primary ledgers after close = %d/%d, want 0/0", calls, inputBytes)
+	}
+	if calls, inputBytes := overflow.inputCalls.Load(), overflow.inputBytes.Load(); calls != 0 || inputBytes != 0 {
+		t.Fatalf("overflow ledgers after close = %d/%d, want 0/0", calls, inputBytes)
+	}
+}
+
 func TestLocalTerminalWriteRejectsOversizedInputWithoutCopy(t *testing.T) {
 	conn := newLocalTerminalConn()
 	client := &TerminalClient{conn: conn}
