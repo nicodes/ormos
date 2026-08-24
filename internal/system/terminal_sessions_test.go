@@ -794,6 +794,62 @@ func TestLocalTerminalWriteReservesCallsAndBytesBeforeCopy(t *testing.T) {
 	waitInputAccounting(t, s, conn, 0, 0, time.Second)
 }
 
+func TestLocalTerminalWriteReservesAggregateBeforeCopyAcrossClients(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	firstConn := newLocalTerminalConn()
+	secondConn := newLocalTerminalConn()
+	if err := s.attachConn(firstConn); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.attachConn(secondConn); err != nil {
+		t.Fatal(err)
+	}
+	first := &TerminalClient{session: s, conn: firstConn}
+	second := &TerminalClient{session: s, conn: secondConn}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstConn.beforeInputCopy = func() {
+		close(entered)
+		<-release
+	}
+	var secondCopies atomic.Int64
+	secondConn.copyInput = func(p []byte) []byte {
+		secondCopies.Add(1)
+		return append([]byte(nil), p...)
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- first.Write(make([]byte, terminalInputBytes)) }()
+	<-entered
+	s.inputMu.Lock()
+	if s.inputCalls != 1 || s.inputBytes != terminalInputBytes || s.localInputCalls != 1 || s.localInputBytes != terminalInputBytes {
+		t.Fatalf("aggregate reservation before copy total=%d/%d local=%d/%d", s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes)
+	}
+	s.inputMu.Unlock()
+	if err := second.Write([]byte("overflow")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("second client aggregate overflow = %v, want ErrTerminalInputBackpressure", err)
+	}
+	if got := secondCopies.Load(); got != 0 {
+		t.Fatalf("aggregate-rejected second client made %d copies", got)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first reserved Write: %v", err)
+	}
+	s.close()
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain aggregate reservation")
+	}
+	waitInputAccounting(t, s, firstConn, 0, 0, time.Second)
+	if secondConn.inputCalls.Load() != 0 || secondConn.inputBytes.Load() != 0 {
+		t.Fatalf("rejected second ledger = %d/%d, want 0/0", secondConn.inputCalls.Load(), secondConn.inputBytes.Load())
+	}
+	firstConn.kill()
+	secondConn.kill()
+}
+
 func TestLocalTerminalWriteRejectsOversizedInputWithoutCopy(t *testing.T) {
 	conn := newLocalTerminalConn()
 	client := &TerminalClient{conn: conn}
@@ -1128,6 +1184,156 @@ func TestTerminalInputExactSchedulerBounds(t *testing.T) {
 		t.Fatal("browser byte reserve accepted one byte beyond its exact bound")
 	}
 	s.close()
+}
+
+func TestTerminalInputExactCombinedCallBoundAndCloseDrain(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	local := newLocalTerminalConn()
+	client := &TerminalClient{session: s, conn: local}
+	block := make([]byte, terminalInputQuantum)
+	for i := range terminalInputQueue {
+		if err := client.Write(block); err != nil {
+			t.Fatalf("admit local call %d of %d: %v", i+1, terminalInputQueue, err)
+		}
+	}
+	for i := range terminalBrowserInputQueue {
+		if !s.submitInput(&terminalInput{p: block}) {
+			t.Fatalf("admit browser call %d of %d", i+1, terminalBrowserInputQueue)
+		}
+	}
+	waitSessionInput(t, s, terminalSchedulerQueue, terminalSchedulerQueue-1, time.Second)
+	s.inputMu.Lock()
+	got := [6]int{s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes}
+	s.inputMu.Unlock()
+	want := [6]int{terminalSchedulerQueue, terminalSchedulerBytes, terminalInputQueue, terminalInputBytes, terminalBrowserInputQueue, terminalBrowserInputBytes}
+	if got != want {
+		t.Fatalf("combined ledgers = %v, want %v", got, want)
+	}
+	if err := client.Write([]byte("local-overflow")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("local call beyond combined bound = %v, want backpressure", err)
+	}
+	dead := make(chan struct{})
+	browserResult := make(chan bool, 1)
+	go func() { browserResult <- s.submitBrowserInput([]byte("browser-overflow"), dead) }()
+	waitInputCapacityWaiter(t, s)
+	select {
+	case result := <-browserResult:
+		t.Fatalf("browser call did not wait at combined bound: %v", result)
+	default:
+	}
+	s.close()
+	select {
+	case result := <-browserResult:
+		if result {
+			t.Fatal("browser call was admitted during close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not unblock browser at combined bound")
+	}
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain combined bound")
+	}
+	waitInputAccounting(t, s, local, 0, 0, time.Second)
+	local.kill()
+}
+
+func TestBrowserLargeFrameUsesOrderedBoundedSchedulerChunks(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	if err := unix.SetNonblock(int(inputWrite.Fd()), true); err != nil {
+		t.Fatal(err)
+	}
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	first := bytes.Repeat([]byte{'A'}, terminalBrowserInputBytes)
+	tail := []byte("[[ordered-second-browser-chunk]]")
+	frame := append(append([]byte(nil), first...), tail...)
+	dead := make(chan struct{})
+	result := make(chan bool, 1)
+	go func() { result <- s.submitBrowserInput(frame, dead) }()
+	waitInputCapacityWaiter(t, s)
+	s.inputMu.Lock()
+	if s.browserInputCalls != 1 || s.browserInputBytes != terminalBrowserInputBytes {
+		t.Fatalf("between chunks browser ledger = %d/%d, want 1/%d", s.browserInputCalls, s.browserInputBytes, terminalBrowserInputBytes)
+	}
+	s.inputMu.Unlock()
+	got := make([]byte, len(frame))
+	readDone := make(chan error, 1)
+	go func() { _, err := io.ReadFull(inputRead, got); readDone <- err }()
+	select {
+	case ok := <-result:
+		if !ok {
+			t.Fatal("large browser frame submission failed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("large browser frame did not admit its second chunk")
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("large browser frame did not reach writer")
+	}
+	if !bytes.Equal(got, frame) {
+		t.Fatal("large browser frame chunks were not written in order")
+	}
+	waitSessionInput(t, s, 0, 0, time.Second)
+	s.close()
+}
+
+func TestBrowserLargeFrameChunkWaitCancellationDrainsAccounting(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel func(*terminalSession, chan struct{})
+	}{
+		{name: "connection", cancel: func(_ *terminalSession, dead chan struct{}) { close(dead) }},
+		{name: "session", cancel: func(s *terminalSession, _ chan struct{}) { s.stopInput() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inputRead, inputWrite, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+			if err := unix.SetNonblock(int(inputWrite.Fd()), true); err != nil {
+				t.Fatal(err)
+			}
+			s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+			frame := make([]byte, terminalBrowserInputBytes+1)
+			dead := make(chan struct{})
+			result := make(chan bool, 1)
+			go func() { result <- s.submitBrowserInput(frame, dead) }()
+			waitInputCapacityWaiter(t, s)
+			tc.cancel(s, dead)
+			select {
+			case ok := <-result:
+				if ok {
+					t.Fatal("cancelled between-chunk submission succeeded")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("between-chunk cancellation did not unblock submission")
+			}
+			s.close()
+			select {
+			case <-s.inputStopped:
+			case <-time.After(time.Second):
+				t.Fatal("scheduler did not stop after chunk cancellation")
+			}
+			s.inputMu.Lock()
+			ledgers := [4]int{s.inputCalls, s.inputBytes, s.browserInputCalls, s.browserInputBytes}
+			s.inputMu.Unlock()
+			if ledgers != [4]int{} {
+				t.Fatalf("chunk cancellation leaked ledgers: %v", ledgers)
+			}
+		})
+	}
 }
 
 func TestTerminalInputCallBoundLeavesActiveRequestARequeueSlot(t *testing.T) {

@@ -242,9 +242,10 @@ type terminalSession struct {
 // the tail, so FIFO admission cannot let a large local paste monopolise a
 // slowly-draining PTY ahead of browser keystrokes.
 type terminalInput struct {
-	p     []byte
-	off   int
-	local *localTerminalConn
+	p             []byte
+	off           int
+	local         *localTerminalConn
+	reservedBytes int // original local Write length; zero for browser/test submissions
 }
 
 // terminalConn is the common outbound half of a browser or local attachment.
@@ -434,20 +435,18 @@ func (c *TerminalClient) Write(p []byte) error {
 	if len(p) == 0 {
 		return nil
 	}
-	if c.conn.inputCalls.Load() >= terminalInputQueue || c.conn.inputBytes.Load()+int64(len(p)) > terminalInputBytes {
+	// Local inputMu -> session inputMu is the only nested input lock order.
+	// releaseInput never takes local inputMu. This makes per-attachment and
+	// session-local admission one reserve-before-allocation transaction while
+	// retaining the existing ordering with kill/Detach.
+	if !c.session.reserveLocalInput(c.conn, len(p)) {
 		return ErrTerminalInputBackpressure
 	}
-	// Reserve before allocation. inputMu also makes admission and kill one
-	// transaction, so a successful Write cannot be admitted after Detach.
-	c.conn.inputCalls.Add(1)
-	c.conn.inputBytes.Add(int64(len(p)))
 	if c.conn.beforeInputCopy != nil {
 		c.conn.beforeInputCopy()
 	}
 	copy := c.conn.copyInput(p)
-	if !c.session.submitInput(&terminalInput{p: copy, local: c.conn}) {
-		c.conn.inputCalls.Add(-1)
-		c.conn.inputBytes.Add(-int64(len(copy)))
+	if !c.session.enqueueReservedLocalInput(&terminalInput{p: copy, local: c.conn, reservedBytes: len(p)}) {
 		return ErrTerminalInputBackpressure
 	}
 	return nil
@@ -918,6 +917,50 @@ func (s *terminalSession) submitInput(in *terminalInput) bool {
 	return s.submitInputLocked(in)
 }
 
+// reserveLocalInput is called with local.inputMu held. Accounting the request
+// before its copy also reserves its scheduler capacity: the production channel
+// has terminalSchedulerQueue slots and inputCalls includes active, queued, and
+// not-yet-enqueued reserved calls, so later admissions cannot consume this
+// request's future slot.
+func (s *terminalSession) reserveLocalInput(local *localTerminalConn, n int) bool {
+	s.startInput()
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+	if s.inputClosed ||
+		local.inputCalls.Load() >= terminalInputQueue || local.inputBytes.Load()+int64(n) > terminalInputBytes ||
+		s.localInputCalls >= terminalInputQueue || s.localInputBytes+n > terminalInputBytes ||
+		s.inputCalls >= terminalSchedulerQueue || s.inputBytes+n > terminalSchedulerBytes {
+		return false
+	}
+	s.inputCalls++
+	s.inputBytes += n
+	s.localInputCalls++
+	s.localInputBytes += n
+	local.inputCalls.Add(1)
+	local.inputBytes.Add(int64(n))
+	return true
+}
+
+// enqueueReservedLocalInput publishes a request whose accounting and channel
+// slot were reserved before its copy. Session close is the ordinary failure
+// path; the default is a defensive check for an incorrectly sized channel.
+func (s *terminalSession) enqueueReservedLocalInput(in *terminalInput) bool {
+	s.inputMu.Lock()
+	if !s.inputClosed {
+		select {
+		case s.input <- in:
+			s.inputMu.Unlock()
+			return true
+		default:
+		}
+	}
+	s.releaseInputLocked(in)
+	s.inputMu.Unlock()
+	in.local.inputCalls.Add(-1)
+	in.local.inputBytes.Add(-int64(in.accountedBytes()))
+	return false
+}
+
 func (s *terminalSession) submitInputLocked(in *terminalInput) bool {
 	if s.inputClosed || s.inputCalls >= terminalSchedulerQueue || s.inputBytes+len(in.p) > terminalSchedulerBytes {
 		return false
@@ -1002,8 +1045,17 @@ func (s *terminalSession) startInput() {
 }
 
 func (s *terminalSession) releaseInput(in *terminalInput) {
-	n := len(in.p)
 	s.inputMu.Lock()
+	s.releaseInputLocked(in)
+	s.inputMu.Unlock()
+	if in.local != nil {
+		in.local.inputCalls.Add(-1)
+		in.local.inputBytes.Add(-int64(in.accountedBytes()))
+	}
+}
+
+func (s *terminalSession) releaseInputLocked(in *terminalInput) {
+	n := in.accountedBytes()
 	s.inputCalls--
 	s.inputBytes -= n
 	if in.local != nil {
@@ -1014,11 +1066,13 @@ func (s *terminalSession) releaseInput(in *terminalInput) {
 		s.browserInputBytes -= n
 	}
 	s.notifyInputCapacityLocked()
-	s.inputMu.Unlock()
-	if in.local != nil {
-		in.local.inputCalls.Add(-1)
-		in.local.inputBytes.Add(-int64(n))
+}
+
+func (in *terminalInput) accountedBytes() int {
+	if in.reservedBytes != 0 {
+		return in.reservedBytes
 	}
+	return len(in.p)
 }
 
 func (s *terminalSession) notifyInputCapacityLocked() {
