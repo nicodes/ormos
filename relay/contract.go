@@ -36,6 +36,16 @@ type ProjectInfo struct {
 	Ports   []PortEntry `json:"ports"`
 }
 
+// TerminalSessionInfo identifies a terminal session and the project it belongs
+// to. It is shared by the agent and relay control plane so their JSON field
+// spelling cannot drift.
+type TerminalSessionInfo struct {
+	ID          string `json:"id"`
+	ProjectID   string `json:"project_id"`
+	ProjectName string `json:"project_name"`
+	SessionID   string `json:"session_id"`
+}
+
 // PortEntry is one exposed port with its record id.
 type PortEntry struct {
 	ID    string `json:"id"`

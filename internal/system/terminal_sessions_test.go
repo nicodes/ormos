@@ -4,7 +4,11 @@ package system
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
 	"os"
@@ -12,6 +16,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -423,6 +429,1363 @@ func TestTerminalSessionBroadcastsToMultipleClients(t *testing.T) {
 		if got := <-results; got != "shared output" {
 			t.Fatalf("broadcast output = %q", got)
 		}
+	}
+}
+
+// Local attachments deliberately use the same session fan-out as their sealed
+// browser siblings. This is the control comparison: both receive one output
+// from one session, rather than a local attach starting a second shell.
+func TestLocalTerminalClientSharesBrowserSession(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	root := t.TempDir()
+	local, err := d.AttachTerminal(root, "local-shared", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { local.session.close() })
+	if got := string(<-local.Output()); got != terminalResyncPrefix {
+		t.Fatalf("local initial replay = %q, want reset", got)
+	}
+
+	browser, browserClient := sealedPair(t, "local-shared")
+	go local.session.attach(browser)
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatalf("read browser initial replay: %v", err)
+	}
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatalf("read browser initial activity: %v", err)
+	}
+
+	local.session.output([]byte("shared with both"))
+	if got := string(<-local.Output()); got != "shared with both" {
+		t.Fatalf("local output = %q", got)
+	}
+	frame, err := browserClient.ReadFrame()
+	if err != nil {
+		t.Fatalf("read browser output: %v", err)
+	}
+	if got := string(frame.Data); got != "shared with both" {
+		t.Fatalf("browser output = %q", got)
+	}
+
+	if err := local.Write([]byte("local input\n")); err != nil {
+		t.Fatalf("local input: %v", err)
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case output := <-local.Output():
+			if strings.Contains(string(output), "local input") {
+				goto resized
+			}
+		case <-deadline:
+			t.Fatal("local input did not reach the shared PTY")
+		}
+	}
+
+resized:
+	if err := browserClient.WriteFrame(relay.EncodeData([]byte("browser input\n"))); err != nil {
+		t.Fatalf("browser input: %v", err)
+	}
+	deadline = time.After(5 * time.Second)
+	for {
+		select {
+		case output := <-local.Output():
+			if strings.Contains(string(output), "browser input") {
+				goto resizedByBrowser
+			}
+		case <-deadline:
+			t.Fatal("browser input did not reach the same PTY as local input")
+		}
+	}
+
+resizedByBrowser:
+	if err := local.Resize(100, 40); err != nil {
+		t.Fatalf("local resize: %v", err)
+	}
+	rows, cols, err := pty.Getsize(local.session.ptmx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cols != 100 || rows != 40 {
+		t.Fatalf("PTY size = %dx%d, want 100x40", cols, rows)
+	}
+
+	local.Detach()
+	waitConns(t, local.session, 1) // browser remains; detach did not kill the shell.
+	if d.terminals["local-shared"] != local.session {
+		t.Fatal("local detach removed a shell still attached in the browser")
+	}
+}
+
+func TestLocalTerminalCreationUsesTerminalSessionLimit(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	root := t.TempDir()
+	clients := make([]*TerminalClient, 0, maxTerminalSessions)
+	for i := range maxTerminalSessions {
+		client, err := d.AttachTerminal(root, fmt.Sprintf("local-session-%d", i), 80, 24)
+		if err != nil {
+			t.Fatalf("local session %d: %v", i, err)
+		}
+		<-client.Output()
+		clients = append(clients, client)
+	}
+	t.Cleanup(func() {
+		for _, client := range clients {
+			client.session.close()
+		}
+	})
+	if _, err := d.AttachTerminal(root, "local-session-over-limit", 80, 24); err == nil || !strings.Contains(err.Error(), "session limit") {
+		t.Fatalf("local session limit error = %v", err)
+	}
+
+	// Browser headers enter the same terminal authority. Calling it directly is
+	// the control for the already-sealed browser path: sealing happens before
+	// terminal(), but neither can bypass its shared session limit.
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, Cwd: root, SessionID: "browser-session-over-limit", Cols: 80, Rows: 24})
+	if _, err := d.terminal(header, acceptedFenceDeadline(t, header)); err == nil || !strings.Contains(err.Error(), "session limit") {
+		t.Fatalf("browser terminal authority limit error = %v", err)
+	}
+}
+
+func TestLocalTerminalClientReplayDetachAndConnectionLimit(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	root := t.TempDir()
+	first, err := d.AttachTerminal(root, "local-limit", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { first.session.close() })
+	<-first.Output() // initial reset
+	first.session.output([]byte("replayed"))
+	if got := string(<-first.Output()); got != "replayed" {
+		t.Fatalf("first output = %q", got)
+	}
+	first.Detach()
+	waitConns(t, first.session, 0)
+	first.session.mu.Lock()
+	armed := first.session.expires != nil
+	first.session.mu.Unlock()
+	if !armed {
+		t.Fatal("last local detach did not arm terminal TTL")
+	}
+
+	reattached, err := d.AttachTerminal(root, "local-limit", 100, 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reattached.session != first.session {
+		t.Fatal("local reattach created a duplicate shell")
+	}
+	rows, cols, err := pty.Getsize(reattached.session.ptmx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cols != 100 || rows != 40 {
+		t.Fatalf("reattached PTY size = %dx%d, want 100x40", cols, rows)
+	}
+	if got, want := string(<-reattached.Output()), terminalResyncPrefix+"replayed"; got != want {
+		t.Fatalf("local replay = %q, want %q", got, want)
+	}
+	clients := []*TerminalClient{reattached}
+	for len(clients) < maxTerminalConns {
+		client, err := d.AttachTerminal(root, "local-limit", 80, 24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-client.Output()
+		clients = append(clients, client)
+	}
+	if _, err := d.AttachTerminal(root, "local-limit", 80, 24); err == nil || !strings.Contains(err.Error(), "connections") {
+		t.Fatalf("connection over limit error = %v, want connection-limit refusal", err)
+	}
+	for _, client := range clients {
+		client.Detach()
+	}
+}
+
+// A local TUI must never be held hostage by a PTY whose slave has stopped
+// reading. The browser sibling remains the control: once the local attachment
+// is gone, a browser can still write to this one PTY.
+func TestLocalTerminalDetachReleasesInputAndDoesNotStarveBrowser(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	fd := int(inputWrite.Fd())
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatal(err)
+	}
+	filled := 0
+	fill := make([]byte, terminalInputQuantum)
+	for {
+		n, err := unix.Write(fd, fill)
+		filled += n
+		if err == unix.EAGAIN {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &terminalSession{id: "local-input", ptmx: inputWrite, conns: make(map[terminalConn]struct{}), input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+	s.startInput()
+	localConn := newLocalTerminalConn()
+	if err := s.attachConn(localConn); err != nil {
+		t.Fatal(err)
+	}
+	local := &TerminalClient{session: s, conn: localConn}
+
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- local.Write(make([]byte, terminalSendBytes)) }()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("local Write returned %v before detach", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local Write blocked while PTY slave was not reading")
+	}
+
+	local.Detach()
+	select {
+	case <-local.Done():
+	case <-time.After(time.Second):
+		t.Fatal("local detach did not close Done")
+	}
+	waitInputAccounting(t, s, localConn, 0, 0, time.Second)
+	readFD := int(inputRead.Fd())
+	if err := unix.SetNonblock(readFD, true); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, err := unix.Read(readFD, make([]byte, filled))
+		if err == unix.EAGAIN {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	browser, browserClient := sealedPair(t, "local-input")
+	go s.attach(browser)
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatalf("read browser replay: %v", err)
+	}
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatalf("read browser activity: %v", err)
+	}
+	if err := browserClient.WriteFrame(relay.EncodeData([]byte("browser input"))); err != nil {
+		t.Fatalf("write browser input: %v", err)
+	}
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, len("browser input"))
+		_, err := io.ReadFull(inputRead, buf)
+		if err != nil {
+			got <- nil
+			return
+		}
+		got <- buf
+	}()
+	select {
+	case data := <-got:
+		if string(data) != "browser input" {
+			t.Fatalf("browser input after local detach = %q", data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("browser input was starved after local detach")
+	}
+	browser.kill()
+}
+
+func TestLocalTerminalWriteBoundsInputByBytes(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	s := &terminalSession{id: "local-input-bound", ptmx: inputWrite, conns: make(map[terminalConn]struct{}), input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+	s.startInput()
+	conn := newLocalTerminalConn()
+	if err := s.attachConn(conn); err != nil {
+		t.Fatal(err)
+	}
+	client := &TerminalClient{session: s, conn: conn}
+	if err := client.Write(make([]byte, terminalInputBytes)); err != nil {
+		t.Fatalf("fill bounded local input queue: %v", err)
+	}
+	if err := client.Write([]byte("x")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("input beyond byte budget error = %v, want ErrTerminalInputBackpressure", err)
+	}
+	client.Detach()
+	waitInputAccounting(t, s, conn, 0, 0, time.Second)
+}
+
+func TestLocalTerminalWriteReservesCallsAndBytesBeforeCopy(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	fd := int(inputWrite.Fd())
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, err := unix.Write(fd, make([]byte, 4<<10))
+		if err == unix.EAGAIN {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+	s.startInput()
+	conn := newLocalTerminalConn()
+	client := &TerminalClient{session: s, conn: conn}
+	var copied atomic.Int64
+	conn.copyInput = func(p []byte) []byte {
+		copied.Add(1)
+		return append([]byte(nil), p...)
+	}
+	if err := client.Write([]byte("x")); err != nil {
+		t.Fatalf("initial in-flight input: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(s.input) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("input worker did not take the in-flight call")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	var accepted atomic.Int64
+	accepted.Add(1) // the worker holds this first call in the exact bound.
+	var group sync.WaitGroup
+	for range 2 * terminalInputQueue {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			if client.Write([]byte("x")) == nil {
+				accepted.Add(1)
+			}
+		}()
+	}
+	group.Wait()
+	if got := accepted.Load(); got != terminalInputQueue {
+		t.Fatalf("accepted local input calls = %d, want exact bound %d", got, terminalInputQueue)
+	}
+	if got := copied.Load(); got != accepted.Load() {
+		t.Fatalf("implementation copies = %d, accepted calls = %d; rejected calls allocated", got, accepted.Load())
+	}
+	if got := conn.inputCalls.Load(); got != terminalInputQueue {
+		t.Fatalf("reserved local input calls = %d, want %d", got, terminalInputQueue)
+	}
+	if got := conn.inputBytes.Load(); got != terminalInputQueue {
+		t.Fatalf("reserved local input bytes = %d, want %d", got, terminalInputQueue)
+	}
+	conn.kill()
+	waitInputAccounting(t, s, conn, 0, 0, time.Second)
+}
+
+func TestLocalTerminalWriteReservesAggregateBeforeCopyAcrossClients(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	firstConn := newLocalTerminalConn()
+	secondConn := newLocalTerminalConn()
+	if err := s.attachConn(firstConn); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.attachConn(secondConn); err != nil {
+		t.Fatal(err)
+	}
+	first := &TerminalClient{session: s, conn: firstConn}
+	second := &TerminalClient{session: s, conn: secondConn}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstConn.beforeInputCopy = func() {
+		close(entered)
+		<-release
+	}
+	var secondCopies atomic.Int64
+	secondConn.copyInput = func(p []byte) []byte {
+		secondCopies.Add(1)
+		return append([]byte(nil), p...)
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- first.Write(make([]byte, terminalInputBytes)) }()
+	<-entered
+	s.inputMu.Lock()
+	if s.inputCalls != 1 || s.inputBytes != terminalInputBytes || s.localInputCalls != 1 || s.localInputBytes != terminalInputBytes {
+		t.Fatalf("aggregate reservation before copy total=%d/%d local=%d/%d", s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes)
+	}
+	s.inputMu.Unlock()
+	if err := second.Write([]byte("overflow")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("second client aggregate overflow = %v, want ErrTerminalInputBackpressure", err)
+	}
+	if got := secondCopies.Load(); got != 0 {
+		t.Fatalf("aggregate-rejected second client made %d copies", got)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first reserved Write: %v", err)
+	}
+	s.close()
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain aggregate reservation")
+	}
+	waitInputAccounting(t, s, firstConn, 0, 0, time.Second)
+	if secondConn.inputCalls.Load() != 0 || secondConn.inputBytes.Load() != 0 {
+		t.Fatalf("rejected second ledger = %d/%d, want 0/0", secondConn.inputCalls.Load(), secondConn.inputBytes.Load())
+	}
+	firstConn.kill()
+	secondConn.kill()
+}
+
+func TestReservedLocalPublicationRollsBackWhenSessionCloses(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	local := newLocalTerminalConn()
+	if err := s.attachConn(local); err != nil {
+		t.Fatal(err)
+	}
+	client := &TerminalClient{session: s, conn: local}
+	reserved := make(chan struct{})
+	release := make(chan struct{})
+	local.beforeInputCopy = func() {
+		close(reserved)
+		<-release
+	}
+	writeResult := make(chan error, 1)
+	go func() { writeResult <- client.Write(make([]byte, terminalInputBytes)) }()
+	<-reserved
+
+	browserBlock := make([]byte, terminalInputQuantum)
+	for i := range terminalBrowserInputQueue {
+		if !s.submitInput(&terminalInput{p: browserBlock}) {
+			t.Fatalf("fill browser reserve at call %d", i+1)
+		}
+	}
+	s.inputMu.Lock()
+	got := [6]int{s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes}
+	s.inputMu.Unlock()
+	want := [6]int{1 + terminalBrowserInputQueue, terminalSchedulerBytes, 1, terminalInputBytes, terminalBrowserInputQueue, terminalBrowserInputBytes}
+	if got != want {
+		t.Fatalf("reserved pre-publication ledgers = %v, want %v", got, want)
+	}
+
+	browserResult := make(chan bool, 1)
+	browserDead := make(chan struct{})
+	go func() { browserResult <- s.submitBrowserInput([]byte("waiting-browser"), browserDead) }()
+	waitInputCapacityWaiter(t, s)
+	closeResult := make(chan struct{})
+	go func() {
+		s.close()
+		close(closeResult)
+	}()
+	select {
+	case ok := <-browserResult:
+		if ok {
+			t.Fatal("browser waiter was admitted during close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("session close did not wake browser capacity waiter")
+	}
+	select {
+	case <-closeResult:
+		t.Fatal("session close passed a reserved Write holding local inputMu")
+	default:
+	}
+
+	close(release)
+	if err := <-writeResult; !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("reserved publication after close = %v, want ErrTerminalInputBackpressure", err)
+	}
+	select {
+	case <-closeResult:
+	case <-time.After(time.Second):
+		t.Fatal("session close deadlocked after reserved Write released local inputMu")
+	}
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("input worker did not stop after reserved publication rollback")
+	}
+	s.inputMu.Lock()
+	final := [6]int{s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes}
+	s.inputMu.Unlock()
+	if final != [6]int{} {
+		t.Fatalf("session ledgers after close = %v, want all zero", final)
+	}
+	if calls, inputBytes := local.inputCalls.Load(), local.inputBytes.Load(); calls != 0 || inputBytes != 0 {
+		t.Fatalf("local ledgers after close = %d/%d, want 0/0", calls, inputBytes)
+	}
+}
+
+func TestReservedLocalInputOwnsFutureSchedulerChannelSlot(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, done: make(chan struct{})}
+	primary := newLocalTerminalConn()
+	overflow := newLocalTerminalConn()
+	if err := s.attachConn(primary); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.attachConn(overflow); err != nil {
+		t.Fatal(err)
+	}
+	primaryClient := &TerminalClient{session: s, conn: primary}
+	overflowClient := &TerminalClient{session: s, conn: overflow}
+	block := make([]byte, terminalInputQuantum)
+	for i := range terminalInputQueue - 1 {
+		if err := primaryClient.Write(block); err != nil {
+			t.Fatalf("publish local call %d of %d: %v", i+1, terminalInputQueue-1, err)
+		}
+	}
+	for i := range terminalBrowserInputQueue {
+		if !s.submitInput(&terminalInput{p: block}) {
+			t.Fatalf("publish browser call %d of %d", i+1, terminalBrowserInputQueue)
+		}
+	}
+	if got := cap(s.input); got != terminalSchedulerQueue {
+		t.Fatalf("production scheduler channel capacity = %d, want %d future-slot invariant", got, terminalSchedulerQueue)
+	}
+	reserved := make(chan struct{})
+	release := make(chan struct{})
+	primary.beforeInputCopy = func() {
+		close(reserved)
+		<-release
+	}
+	lastResult := make(chan error, 1)
+	go func() { lastResult <- primaryClient.Write(block) }()
+	<-reserved
+	s.inputMu.Lock()
+	got := [5]int{s.inputCalls, s.localInputCalls, s.browserInputCalls, s.localInputBytes, s.browserInputBytes}
+	s.inputMu.Unlock()
+	want := [5]int{terminalSchedulerQueue, terminalInputQueue, terminalBrowserInputQueue, terminalInputBytes, terminalBrowserInputBytes}
+	if got != want {
+		t.Fatalf("320th reserved ledgers = %v, want %v", got, want)
+	}
+	var overflowCopies atomic.Int64
+	overflow.copyInput = func(p []byte) []byte {
+		overflowCopies.Add(1)
+		return append([]byte(nil), p...)
+	}
+	if err := overflowClient.Write([]byte("321st")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("321st local Write = %v, want ErrTerminalInputBackpressure", err)
+	}
+	if copies := overflowCopies.Load(); copies != 0 {
+		t.Fatalf("321st rejected Write made %d copies", copies)
+	}
+	close(release)
+	if err := <-lastResult; err != nil {
+		t.Fatalf("320th Write did not publish into its reserved slot: %v", err)
+	}
+	s.close()
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain exact 320-call scheduler bound")
+	}
+	s.inputMu.Lock()
+	final := [6]int{s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes}
+	s.inputMu.Unlock()
+	if final != [6]int{} {
+		t.Fatalf("session ledgers after exact-bound close = %v, want all zero", final)
+	}
+	if calls, inputBytes := primary.inputCalls.Load(), primary.inputBytes.Load(); calls != 0 || inputBytes != 0 {
+		t.Fatalf("primary ledgers after close = %d/%d, want 0/0", calls, inputBytes)
+	}
+	if calls, inputBytes := overflow.inputCalls.Load(), overflow.inputBytes.Load(); calls != 0 || inputBytes != 0 {
+		t.Fatalf("overflow ledgers after close = %d/%d, want 0/0", calls, inputBytes)
+	}
+}
+
+func TestLocalTerminalWriteRejectsOversizedInputWithoutCopy(t *testing.T) {
+	conn := newLocalTerminalConn()
+	client := &TerminalClient{conn: conn}
+	var copied atomic.Int64
+	conn.copyInput = func(p []byte) []byte {
+		copied.Add(1)
+		return append([]byte(nil), p...)
+	}
+	err := client.Write(make([]byte, min(relay.MaxFrameSize, terminalInputBytes)+1))
+	if !errors.Is(err, ErrTerminalInputTooLarge) {
+		t.Fatalf("oversized local input error = %v, want ErrTerminalInputTooLarge", err)
+	}
+	if errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatal("oversized input matched retryable ErrTerminalInputBackpressure")
+	}
+	if got := copied.Load(); got != 0 {
+		t.Fatalf("oversized input made %d implementation copies", got)
+	}
+	conn.kill()
+}
+
+func TestLocalTerminalWriteAdmissionIsOrderedWithDetach(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	conn := newLocalTerminalConn()
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+	s.startInput()
+	client := &TerminalClient{session: s, conn: conn}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	conn.beforeInputCopy = func() {
+		close(entered)
+		<-release
+	}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- client.Write([]byte("accepted before detach")) }()
+	<-entered // reservation and the inputMu ownership are now established.
+	detached := make(chan struct{})
+	go func() { conn.kill(); close(detached) }()
+	select {
+	case <-detached:
+		t.Fatal("detach passed a Write already holding admission")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if err := <-writeDone; err != nil {
+		t.Fatalf("Write admitted before detach = %v", err)
+	}
+	<-detached
+	if err := client.Write([]byte("after detach")); !errors.Is(err, ErrTerminalClientClosed) {
+		t.Fatalf("Write after detach = %v, want ErrTerminalClientClosed", err)
+	}
+}
+
+func TestPTYMasterRemainsNonblockingAcrossTerminalIOCTLS(t *testing.T) {
+	ptmx, tty := ptyPair(t)
+	var err error
+	ptmx, err = normalizePTY(ptmx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ptmx.Close() })
+	assertPTYNonblocking(t, ptmx, "normalization")
+	if err := setPTYSize(ptmx, 100, 40); err != nil {
+		t.Fatal(err)
+	}
+	assertPTYNonblocking(t, ptmx, "resize ioctl")
+	_, _ = ptyForegroundPgrp(ptmx)
+	assertPTYNonblocking(t, ptmx, "activity ioctl")
+	r, err := newPTYReader(ptmx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ptmx.SetReadDeadline(time.Now().Add(25 * time.Millisecond)); err != nil {
+		t.Fatalf("normalized PTY does not support read deadlines: %v", err)
+	}
+	_, err = r.readOnce(make([]byte, 1))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("idle RawConn.Read error = %v, want os.ErrDeadlineExceeded (not ErrNoDeadline)", err)
+	}
+	_ = ptmx.SetReadDeadline(time.Time{})
+	_ = tty
+}
+
+func TestCreatedPTYRemainsNonblockingAcrossLocalAndBrowserResize(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	local, err := d.AttachTerminal(t.TempDir(), "nonblock-resize", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { local.session.close() })
+	<-local.Output()
+	assertPTYNonblocking(t, local.session.ptmx, "terminal creation and initial local resize")
+	if err := local.Resize(100, 40); err != nil {
+		t.Fatal(err)
+	}
+	assertPTYNonblocking(t, local.session.ptmx, "local Resize")
+
+	browser, browserClient := sealedPair(t, "nonblock-resize")
+	go local.session.attach(browser)
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if err := browserClient.WriteFrame(relay.EncodeResize(120, 50)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		rows, cols, err := rawPTYSize(local.session.ptmx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rows == 50 && cols == 120 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("browser resize left PTY at %dx%d", cols, rows)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	assertPTYNonblocking(t, local.session.ptmx, "browser Resize")
+	_, _ = ptyForegroundPgrp(local.session.ptmx)
+	assertPTYNonblocking(t, local.session.ptmx, "activity ioctl")
+	browser.kill()
+}
+
+func TestTerminalInputStartsExactlyOneWorkerAndCloseDrainsAccounting(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		currentBrowser bool
+	}{{name: "current-local-queued-browser"}, {name: "current-browser-queued-local", currentBrowser: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, inputWrite := fullNonblockingPipe(t)
+			s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+			local := newLocalTerminalConn()
+			client := &TerminalClient{session: s, conn: local}
+			s.startInput()
+			<-s.inputStarted
+			for range 32 {
+				s.startInput()
+			}
+			select {
+			case <-s.inputStopped:
+				t.Fatal("the sole input worker exited before close")
+			default:
+			}
+			if tc.currentBrowser {
+				if !s.submitInput(&terminalInput{p: []byte("browser-current")}) {
+					t.Fatal("admit current browser input")
+				}
+				waitSessionInput(t, s, 1, 0, time.Second)
+				if err := client.Write([]byte("local-queued")); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := client.Write([]byte("local-current")); err != nil {
+					t.Fatal(err)
+				}
+				waitSessionInput(t, s, 1, 0, time.Second)
+				if !s.submitInput(&terminalInput{p: []byte("browser-queued")}) {
+					t.Fatal("admit queued browser input")
+				}
+			}
+			// Keep a real backlog behind both kinds. This makes shutdown prove
+			// draining rather than winning a select between done and one item.
+			for i := range 32 {
+				if !s.submitInput(&terminalInput{p: []byte{byte(i)}}) {
+					t.Fatalf("admit queued browser request %d", i)
+				}
+			}
+			waitSessionInput(t, s, 34, 33, time.Second)
+			go s.close()
+			select {
+			case <-s.inputStopped:
+			case <-time.After(time.Second):
+				t.Fatal("session close did not stop the input worker")
+			}
+			waitInputAccounting(t, s, local, 0, 0, time.Second)
+			s.close()
+			waitInputAccounting(t, s, local, 0, 0, time.Second)
+			local.kill()
+		})
+	}
+}
+
+func TestTerminalInputMaximalLocalLeavesBrowserReserve(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	local := newLocalTerminalConn()
+	client := &TerminalClient{session: s, conn: local}
+	if err := client.Write(make([]byte, terminalInputBytes)); err != nil {
+		t.Fatalf("admit exact maximal local input: %v", err)
+	}
+	waitSessionInput(t, s, 1, 0, time.Second)
+
+	dead := make(chan struct{})
+	admitted := make(chan bool, 1)
+	go func() { admitted <- s.submitBrowserInput([]byte("browser-marker"), dead) }()
+	select {
+	case ok := <-admitted:
+		if !ok {
+			t.Fatal("browser marker rejected behind maximal local input")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("browser marker waited for maximal local input to complete")
+	}
+	waitSessionInput(t, s, 2, 1, time.Second)
+	s.inputMu.Lock()
+	if s.localInputCalls != 1 || s.localInputBytes != terminalInputBytes || s.browserInputCalls != 1 || s.browserInputBytes != len("browser-marker") {
+		t.Fatalf("split accounting local=%d/%d browser=%d/%d", s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes)
+	}
+	s.inputMu.Unlock()
+
+	local.kill()
+	s.close()
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain maximal local plus browser reserve")
+	}
+	waitInputAccounting(t, s, local, 0, 0, time.Second)
+}
+
+func TestBrowserInputFullCapacityWaitsThenResumes(t *testing.T) {
+	inputRead, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	s.startInput()
+	for i := range terminalBrowserInputQueue {
+		if !s.submitInput(&terminalInput{p: bytes.Repeat([]byte{byte(i)}, terminalInputQuantum)}) {
+			t.Fatalf("admit browser call %d of exact %d-call reserve", i+1, terminalBrowserInputQueue)
+		}
+	}
+	waitSessionInput(t, s, terminalBrowserInputQueue, terminalBrowserInputQueue-1, time.Second)
+	dead := make(chan struct{})
+	admitted := make(chan bool, 1)
+	go func() { admitted <- s.submitBrowserInput([]byte("next"), dead) }()
+	waitInputCapacityWaiter(t, s)
+	select {
+	case got := <-admitted:
+		t.Fatalf("browser submission completed at full capacity: %v", got)
+	default:
+	}
+	select {
+	case <-dead:
+		t.Fatal("capacity pressure disconnected the browser")
+	default:
+	}
+
+	buf := make([]byte, terminalInputQuantum)
+	if _, err := inputRead.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ok := <-admitted:
+		if !ok {
+			t.Fatal("waiting browser did not resume after accounting release")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting browser did not observe accounting release")
+	}
+	waitSessionInput(t, s, terminalBrowserInputQueue, terminalBrowserInputQueue-1, time.Second)
+	s.close()
+}
+
+func TestBrowserInputCapacityWaitCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel func(*terminalSession, chan struct{})
+	}{
+		{name: "connection", cancel: func(_ *terminalSession, dead chan struct{}) { close(dead) }},
+		{name: "session", cancel: func(s *terminalSession, _ chan struct{}) { s.stopInput() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, inputWrite := fullNonblockingPipe(t)
+			s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+			s.startInput()
+			for i := range terminalBrowserInputQueue {
+				if !s.submitInput(&terminalInput{p: bytes.Repeat([]byte{byte(i)}, terminalInputQuantum)}) {
+					t.Fatalf("fill browser reserve at call %d", i+1)
+				}
+			}
+			waitSessionInput(t, s, terminalBrowserInputQueue, terminalBrowserInputQueue-1, time.Second)
+			dead := make(chan struct{})
+			result := make(chan bool, 1)
+			go func() { result <- s.submitBrowserInput([]byte("blocked"), dead) }()
+			waitInputCapacityWaiter(t, s)
+			tc.cancel(s, dead)
+			select {
+			case ok := <-result:
+				if ok {
+					t.Fatal("cancelled browser submission was admitted")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cancellation did not unblock browser submission")
+			}
+			s.close()
+			select {
+			case <-s.inputStopped:
+			case <-time.After(time.Second):
+				t.Fatal("scheduler did not stop and drain after cancellation")
+			}
+			s.inputMu.Lock()
+			calls, inputBytes := s.inputCalls, s.inputBytes
+			s.inputMu.Unlock()
+			if calls != 0 || inputBytes != 0 {
+				t.Fatalf("accounting after cancellation and close = %d/%d, want 0/0", calls, inputBytes)
+			}
+		})
+	}
+}
+
+func TestTerminalInputExactSchedulerBounds(t *testing.T) {
+	if terminalSchedulerQueue != 320 || terminalSchedulerBytes != 1280<<10 {
+		t.Fatalf("scheduler bounds = %d calls/%d bytes, want 320 calls/1.25 MiB", terminalSchedulerQueue, terminalSchedulerBytes)
+	}
+	if terminalInputQueue != 256 || terminalInputBytes != 1<<20 || terminalBrowserInputQueue != 64 || terminalBrowserInputBytes != 256<<10 {
+		t.Fatalf("component bounds local=%d/%d browser=%d/%d", terminalInputQueue, terminalInputBytes, terminalBrowserInputQueue, terminalBrowserInputBytes)
+	}
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, done: make(chan struct{})}
+	if !s.submitInput(&terminalInput{p: make([]byte, terminalBrowserInputBytes)}) {
+		t.Fatal("exact browser byte reserve was not reachable")
+	}
+	if got := cap(s.input); got != terminalSchedulerQueue {
+		t.Fatalf("initialized scheduler channel capacity = %d, want %d", got, terminalSchedulerQueue)
+	}
+	waitSessionInput(t, s, 1, 0, time.Second)
+	if s.submitInput(&terminalInput{p: []byte{1}}) {
+		t.Fatal("browser byte reserve accepted one byte beyond its exact bound")
+	}
+	s.close()
+}
+
+func TestTerminalInputExactCombinedCallBoundAndCloseDrain(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	local := newLocalTerminalConn()
+	client := &TerminalClient{session: s, conn: local}
+	block := make([]byte, terminalInputQuantum)
+	for i := range terminalInputQueue {
+		if err := client.Write(block); err != nil {
+			t.Fatalf("admit local call %d of %d: %v", i+1, terminalInputQueue, err)
+		}
+	}
+	for i := range terminalBrowserInputQueue {
+		if !s.submitInput(&terminalInput{p: block}) {
+			t.Fatalf("admit browser call %d of %d", i+1, terminalBrowserInputQueue)
+		}
+	}
+	waitSessionInput(t, s, terminalSchedulerQueue, terminalSchedulerQueue-1, time.Second)
+	s.inputMu.Lock()
+	got := [6]int{s.inputCalls, s.inputBytes, s.localInputCalls, s.localInputBytes, s.browserInputCalls, s.browserInputBytes}
+	s.inputMu.Unlock()
+	want := [6]int{terminalSchedulerQueue, terminalSchedulerBytes, terminalInputQueue, terminalInputBytes, terminalBrowserInputQueue, terminalBrowserInputBytes}
+	if got != want {
+		t.Fatalf("combined ledgers = %v, want %v", got, want)
+	}
+	if err := client.Write([]byte("local-overflow")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("local call beyond combined bound = %v, want backpressure", err)
+	}
+	dead := make(chan struct{})
+	browserResult := make(chan bool, 1)
+	go func() { browserResult <- s.submitBrowserInput([]byte("browser-overflow"), dead) }()
+	waitInputCapacityWaiter(t, s)
+	select {
+	case result := <-browserResult:
+		t.Fatalf("browser call did not wait at combined bound: %v", result)
+	default:
+	}
+	s.close()
+	select {
+	case result := <-browserResult:
+		if result {
+			t.Fatal("browser call was admitted during close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not unblock browser at combined bound")
+	}
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("close did not drain combined bound")
+	}
+	waitInputAccounting(t, s, local, 0, 0, time.Second)
+	local.kill()
+}
+
+func TestBrowserLargeFrameUsesOrderedBoundedSchedulerChunks(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	if err := unix.SetNonblock(int(inputWrite.Fd()), true); err != nil {
+		t.Fatal(err)
+	}
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+	first := bytes.Repeat([]byte{'A'}, terminalBrowserInputBytes)
+	tail := []byte("[[ordered-second-browser-chunk]]")
+	frame := append(append([]byte(nil), first...), tail...)
+	dead := make(chan struct{})
+	result := make(chan bool, 1)
+	go func() { result <- s.submitBrowserInput(frame, dead) }()
+	waitInputCapacityWaiter(t, s)
+	s.inputMu.Lock()
+	if s.browserInputCalls != 1 || s.browserInputBytes != terminalBrowserInputBytes {
+		t.Fatalf("between chunks browser ledger = %d/%d, want 1/%d", s.browserInputCalls, s.browserInputBytes, terminalBrowserInputBytes)
+	}
+	s.inputMu.Unlock()
+	got := make([]byte, len(frame))
+	readDone := make(chan error, 1)
+	go func() { _, err := io.ReadFull(inputRead, got); readDone <- err }()
+	select {
+	case ok := <-result:
+		if !ok {
+			t.Fatal("large browser frame submission failed")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("large browser frame did not admit its second chunk")
+	}
+	select {
+	case err := <-readDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("large browser frame did not reach writer")
+	}
+	if !bytes.Equal(got, frame) {
+		t.Fatal("large browser frame chunks were not written in order")
+	}
+	waitSessionInput(t, s, 0, 0, time.Second)
+	s.close()
+}
+
+func TestBrowserLargeFrameChunkWaitCancellationDrainsAccounting(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cancel func(*terminalSession, chan struct{})
+	}{
+		{name: "connection", cancel: func(_ *terminalSession, dead chan struct{}) { close(dead) }},
+		{name: "session", cancel: func(s *terminalSession, _ chan struct{}) { s.stopInput() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inputRead, inputWrite, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+			if err := unix.SetNonblock(int(inputWrite.Fd()), true); err != nil {
+				t.Fatal(err)
+			}
+			s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalSchedulerQueue), done: make(chan struct{})}
+			frame := make([]byte, terminalBrowserInputBytes+1)
+			dead := make(chan struct{})
+			result := make(chan bool, 1)
+			go func() { result <- s.submitBrowserInput(frame, dead) }()
+			waitInputCapacityWaiter(t, s)
+			tc.cancel(s, dead)
+			select {
+			case ok := <-result:
+				if ok {
+					t.Fatal("cancelled between-chunk submission succeeded")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("between-chunk cancellation did not unblock submission")
+			}
+			s.close()
+			select {
+			case <-s.inputStopped:
+			case <-time.After(time.Second):
+				t.Fatal("scheduler did not stop after chunk cancellation")
+			}
+			s.inputMu.Lock()
+			ledgers := [4]int{s.inputCalls, s.inputBytes, s.browserInputCalls, s.browserInputBytes}
+			s.inputMu.Unlock()
+			if ledgers != [4]int{} {
+				t.Fatalf("chunk cancellation leaked ledgers: %v", ledgers)
+			}
+		})
+	}
+}
+
+func TestTerminalInputCallBoundLeavesActiveRequestARequeueSlot(t *testing.T) {
+	_, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+	local := newLocalTerminalConn()
+	client := &TerminalClient{session: s, conn: local}
+	s.startInput()
+	<-s.inputStarted
+	for i := range terminalInputQueue {
+		if err := client.Write([]byte{byte(i)}); err != nil {
+			t.Fatalf("admit call %d of exact %d-call bound: %v", i+1, terminalInputQueue, err)
+		}
+	}
+	waitSessionInput(t, s, terminalInputQueue, terminalInputQueue-1, time.Second)
+	if got, want := cap(s.input), terminalInputQueue; got != want {
+		t.Fatalf("scheduler channel capacity = %d, want %d so the active request retains one requeue slot", got, want)
+	}
+	// Let the active request time out and exercise its tail requeue before
+	// detach. A channel sized only for the other 255 calls deadlocks here.
+	time.Sleep(2 * terminalInputPollWindow)
+	local.kill()
+	waitInputAccounting(t, s, local, 0, 0, terminalInputPollWindow+100*time.Millisecond)
+	s.close()
+}
+
+func TestTerminalInputFatalWriteClosesOwnerlessSessionAndReleasesAccounting(t *testing.T) {
+	inputRead, inputWrite := fullNonblockingPipe(t)
+	s := &terminalSession{ptmx: inputWrite, input: make(chan *terminalInput, terminalInputQueue), done: make(chan struct{})}
+	local := newLocalTerminalConn()
+	client := &TerminalClient{session: s, conn: local}
+	s.startInput()
+	if err := client.Write([]byte("current")); err != nil {
+		t.Fatal(err)
+	}
+	waitSessionInput(t, s, 1, 0, time.Second)
+	if err := client.Write([]byte("queued")); err != nil {
+		t.Fatal(err)
+	}
+	if err := inputRead.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-s.inputStopped:
+	case <-time.After(time.Second):
+		t.Fatal("fatal PTY write/POLLERR did not stop ownerless session scheduler")
+	}
+	waitInputAccounting(t, s, local, 0, 0, time.Second)
+	select {
+	case <-s.done:
+	default:
+		t.Fatal("fatal PTY write/POLLERR did not converge ownerless session close")
+	}
+	local.kill()
+}
+
+func TestTerminalInputHasOneRawPTYWriterAndOneScheduler(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "terminal_sessions.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawWrites, schedulerStarts, onceStarts := 0, 0, 0
+	ast.Inspect(f, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		if sel.Sel.Name == "Write" {
+			pkg, unixWrite := sel.X.(*ast.Ident)
+			if !unixWrite || pkg.Name != "unix" {
+				t.Errorf("direct terminal_sessions.go Write call at %s; PTY input must use ptyWrite", fset.Position(call.Pos()))
+			} else {
+				rawWrites++
+			}
+		}
+		if sel.Sel.Name == "Fd" {
+			t.Errorf("terminal_sessions.go File.Fd call at %s; raw PTY operations must preserve runtime pollability", fset.Position(call.Pos()))
+		}
+		if sel.Sel.Name == "inputLoop" {
+			schedulerStarts++
+		}
+		if sel.Sel.Name == "Do" {
+			if x, ok := sel.X.(*ast.SelectorExpr); ok && x.Sel.Name == "inputOnce" {
+				onceStarts++
+			}
+		}
+		return true
+	})
+	if rawWrites != 1 {
+		t.Fatalf("unix.Write PTY helpers = %d, want exactly one", rawWrites)
+	}
+	if schedulerStarts != 1 || onceStarts != 1 {
+		t.Fatalf("scheduler structure: inputLoop calls=%d inputOnce.Do calls=%d, want 1/1", schedulerStarts, onceStarts)
+	}
+	source, err := os.ReadFile("terminal_sessions.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(source, []byte("s.submitBrowserInput(frame.Data, conn.dead)")) {
+		t.Fatal("browser attach does not submit through the terminal input scheduler")
+	}
+}
+
+func fullNonblockingPipe(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+	fd := int(w.Fd())
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatal(err)
+	}
+	block := make([]byte, 4<<10)
+	for {
+		if _, err := unix.Write(fd, block); err == unix.EAGAIN {
+			return r, w
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func waitSessionInput(t *testing.T, s *terminalSession, calls, queued int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		s.inputMu.Lock()
+		gotCalls := s.inputCalls
+		s.inputMu.Unlock()
+		if gotCalls == calls && (queued < 0 || len(s.input) == queued) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("session input calls/queued = %d/%d, want %d/%d", gotCalls, len(s.input), calls, queued)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitInputCapacityWaiter(t *testing.T, s *terminalSession) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		s.inputMu.Lock()
+		waiting := s.inputCapacity != nil
+		s.inputMu.Unlock()
+		if waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("browser submission did not enter capacity wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitInputAccounting(t *testing.T, s *terminalSession, local *localTerminalConn, calls, inputBytes int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		s.inputMu.Lock()
+		sc, sb := s.inputCalls, s.inputBytes
+		s.inputMu.Unlock()
+		lc, lb := local.inputCalls.Load(), local.inputBytes.Load()
+		if sc == calls && sb == inputBytes && lc == int64(calls) && lb == int64(inputBytes) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("input accounting session=%d/%d local=%d/%d, want %d/%d", sc, sb, lc, lb, calls, inputBytes)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func assertPTYNonblocking(t *testing.T, f *os.File, after string) {
+	t.Helper()
+	rc, err := f.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var flags int
+	var opErr error
+	if err := rc.Control(func(fd uintptr) { flags, opErr = unix.FcntlInt(fd, unix.F_GETFL, 0) }); err != nil {
+		t.Fatal(err)
+	}
+	if opErr != nil {
+		t.Fatal(opErr)
+	}
+	if flags&unix.O_NONBLOCK == 0 {
+		t.Fatalf("PTY master lost O_NONBLOCK after %s", after)
+	}
+}
+
+func rawPTYSize(f *os.File) (rows, cols int, err error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return 0, 0, err
+	}
+	var size *unix.Winsize
+	var opErr error
+	if err := rc.Control(func(fd uintptr) { size, opErr = unix.IoctlGetWinsize(int(fd), unix.TIOCGWINSZ) }); err != nil {
+		return 0, 0, err
+	}
+	if opErr != nil {
+		return 0, 0, opErr
+	}
+	return int(size.Row), int(size.Col), nil
+}
+
+// The browser sibling above proves the same bounded queue design over a sealed
+// transport. This local control proves that an unread local output channel also
+// cannot park the PTY read path and is detached at terminalWriteTO.
+func TestLocalTerminalOutputNeverBlocksOnStalledClient(t *testing.T) {
+	s := &terminalSession{id: "local-stall", done: make(chan struct{})}
+	stalled := newLocalTerminalConn()
+	if got := cap(stalled.output); got != 1 {
+		t.Fatalf("local decoded output queue capacity = %d, want one bounded handoff", got)
+	}
+	if err := s.attachConn(stalled); err != nil {
+		t.Fatal(err)
+	}
+	go func() { <-stalled.dead; s.detach(stalled) }()
+	start := time.Now()
+	for range 150 {
+		s.output(make([]byte, 8<<10))
+	}
+	if elapsed := time.Since(start); elapsed > terminalWriteTO/2 {
+		t.Fatalf("local stalled output took %s; PTY path waited on local client", elapsed)
+	}
+	// Fill the local consumer queue one writer hand-off at a time. This avoids
+	// treating a particular goroutine scheduling pattern during the output burst
+	// as evidence that the write-deadline path is reachable.
+	deadline := time.Now().Add(time.Second)
+	for len(stalled.output) < cap(stalled.output) {
+		if !stalled.enqueue(relay.EncodeData([]byte("x"))) {
+			t.Fatal("could not queue local output while filling its consumer buffer")
+		}
+		for len(stalled.send) != 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("local writer did not consume queued output")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if !stalled.enqueue(relay.EncodeData([]byte("x"))) {
+		t.Fatal("could not queue output that should block the local writer")
+	}
+	select {
+	case <-stalled.dead:
+	case <-time.After(terminalWriteTO + time.Second):
+		t.Fatal("stalled local client was not detached at the write deadline")
+	}
+	waitConns(t, s, 0)
+	s.mu.Lock()
+	if s.expires != nil {
+		s.expires.Stop()
+	}
+	s.mu.Unlock()
+}
+
+func TestLocalTerminalClientRechecksPolicyOnReattach(t *testing.T) {
+	dir := withTempConfigDir(t)
+	allowed := filepath.Join(dir, "allowed")
+	if err := os.Mkdir(allowed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(fmt.Sprintf(`{"allowedRoots":[%q]}`, allowed)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	if _, err := d.AttachTerminal(t.TempDir(), "local-policy", 80, 24); err == nil {
+		t.Fatal("local create outside allowedRoots succeeded")
+	}
+	client, err := d.AttachTerminal(allowed, "local-policy", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.session.close() })
+	<-client.Output()
+	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(`{"terminalsDisabled":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AttachTerminal(allowed, "local-policy", 80, 24); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("policy-denied reattach error = %v", err)
+	}
+	if d.terminals["local-policy"] != client.session {
+		t.Fatal("policy denial removed the existing terminal")
 	}
 }
 

@@ -21,13 +21,14 @@ func TestDeviceStatusValuesArePinnedToTheirWireLiterals(t *testing.T) {
 	}
 }
 
-// All 27 JSON tag occurrences in contract.go are shared HTTP control-plane
+// All 31 JSON tag occurrences in contract.go are shared HTTP control-plane
 // contracts between the api and system binaries, so none are excluded. This is
 // the complete inventory, grouped by DTO:
 //
 //   - SystemInfo (5): id, name, hostname, online, ip_addr
 //   - PortInfo (3): project, port, label
 //   - ProjectInfo (4): id, name, root_dir, ports
+//   - TerminalSessionInfo (4): id, project_id, project_name, session_id
 //   - PortEntry (3): id, port, label
 //   - DeviceStartRequest (2): client_id, hostname
 //   - DeviceStartResponse (5): user_code, device_code, verification_url,
@@ -51,6 +52,10 @@ func TestControlPlaneDTOTagsArePinnedToLiteralPayloads(t *testing.T) {
 	t.Run("ProjectInfo", func(t *testing.T) {
 		assertLiteralJSON(t, `{"id":"proj-1","name":"ormos","root_dir":"/code/ormos","ports":[{"id":"port-1","port":8080,"label":"web"}]}`,
 			ProjectInfo{ID: "proj-1", Name: "ormos", RootDir: "/code/ormos", Ports: []PortEntry{{ID: "port-1", Port: 8080, Label: "web"}}})
+	})
+	t.Run("TerminalSessionInfo", func(t *testing.T) {
+		assertLiteralJSON(t, `{"id":"terminal-1","project_id":"proj-1","project_name":"ormos","session_id":"session-1"}`,
+			TerminalSessionInfo{ID: "terminal-1", ProjectID: "proj-1", ProjectName: "ormos", SessionID: "session-1"})
 	})
 	t.Run("PortEntry", func(t *testing.T) {
 		assertLiteralJSON(t, `{"id":"port-1","port":8080,"label":"web"}`,

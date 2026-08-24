@@ -4,6 +4,7 @@ package system
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -78,6 +79,37 @@ const (
 	// output to batch with. It is the entire latency cost of coalescing, and it
 	// is paid only by output that already arrived in tty-chunk quantities.
 	terminalCoalesceWindow = 2 * time.Millisecond
+	// terminalLocalActionTO gives an in-process attachment the same bounded
+	// action window that a relay request obtains from its accepted fence.
+	terminalLocalActionTO = 10 * time.Second
+	// terminalInputQueue bounds accepted local Write calls, including the one the
+	// input worker is currently processing. terminalInputBytes bounds the copied
+	// bytes belonging to those calls, including that in-flight call. Caller-owned
+	// input is never counted or retained when admission rejects it.
+	terminalInputQueue = terminalSendQueue
+	terminalInputBytes = terminalSendBytes
+	// Browser input has its own reserve beyond the entire local-input budget.
+	// Thus a maximal accepted local workload (256 calls/1 MiB) still leaves 64
+	// calls/256 KiB for browser keystrokes in the same scheduler. Browser frames
+	// larger than the byte reserve are admitted in bounded chunks.
+	terminalBrowserInputQueue = 64
+	terminalBrowserInputBytes = 256 << 10
+	terminalSchedulerQueue    = terminalInputQueue + terminalBrowserInputQueue
+	terminalSchedulerBytes    = terminalInputBytes + terminalBrowserInputBytes
+	terminalInputPollWindow   = 25 * time.Millisecond
+	terminalInputQuantum      = 4 << 10
+)
+
+var (
+	// ErrTerminalInputBackpressure means a local Write was not accepted. Callers
+	// may retry after consuming output or yielding; bytes are never dropped.
+	ErrTerminalInputBackpressure = errors.New("terminal input backpressure")
+	// ErrTerminalInputTooLarge means one input exceeds the fixed per-call limit
+	// and cannot become acceptable by retrying.
+	ErrTerminalInputTooLarge = errors.New("terminal input is too large")
+	// ErrTerminalClientClosed means this attachment has detached or its session
+	// ended. It never means the shared shell was killed by the attachment.
+	ErrTerminalClientClosed = errors.New("terminal attachment is closed")
 )
 
 // terminalKillGrace is how long close waits for the shell's process group to
@@ -182,15 +214,48 @@ type terminalSession struct {
 	cmd   *exec.Cmd
 	pgid  int // the shell's process group id (it leads it: pty.Start sets Setsid)
 
-	mu        sync.Mutex
-	inputMu   sync.Mutex
-	conns     map[*sealedConn]struct{}
-	replay    replayRing
-	active    bool
-	closed    bool
-	expires   *time.Timer
-	done      chan struct{}
-	closeOnce sync.Once
+	mu                sync.Mutex
+	inputMu           sync.Mutex
+	input             chan *terminalInput
+	inputBytes        int
+	inputCalls        int
+	localInputBytes   int
+	localInputCalls   int
+	browserInputBytes int
+	browserInputCalls int
+	inputClosed       bool
+	inputCapacity     chan struct{} // closed and replaced under inputMu on accounting release
+	inputOnce         sync.Once
+	inputStarted      chan struct{}
+	inputStopped      chan struct{}
+	conns             map[terminalConn]struct{}
+	replay            replayRing
+	active            bool
+	closed            bool
+	expires           *time.Timer
+	done              chan struct{}
+	closeOnce         sync.Once
+}
+
+// terminalInput is one accepted browser or local request. The scheduler writes
+// at most terminalInputQuantum bytes before returning an unfinished request to
+// the tail, so FIFO admission cannot let a large local paste monopolise a
+// slowly-draining PTY ahead of browser keystrokes.
+type terminalInput struct {
+	p             []byte
+	off           int
+	local         *localTerminalConn
+	reservedBytes int // original local Write length; zero for browser/test submissions
+}
+
+// terminalConn is the common outbound half of a browser or local attachment.
+// It deliberately contains no read side: browser input remains sealed and
+// local input is accepted only through TerminalClient. Both kinds use the same
+// bounded fan-out queue and resynchronisation path.
+type terminalConn interface {
+	enqueue([]byte) bool
+	resync([]byte) bool
+	kill()
 }
 
 // sealedConn is one browser connection attached to a terminal session.
@@ -329,6 +394,205 @@ func (c *sealedConn) kill() {
 		_ = c.SetReadDeadline(time.Now())
 		_ = c.Close()
 	})
+}
+
+// TerminalClient is a local attachment to a terminal session. Output is raw
+// terminal bytes, including the reset-prefixed bounded replay sent on attach
+// and resynchronisation. Callers must treat output slices as read-only.
+//
+// Detach releases only this attachment; the session remains alive while any
+// browser or local attachment remains, then follows terminalDetachTTL.
+type TerminalClient struct {
+	session *terminalSession
+	conn    *localTerminalConn
+}
+
+// Output is the bounded stream of terminal output for this attachment. It is
+// not closed; receive it with Done. Done closes on Detach, slow-reader eviction,
+// session/process exit, or policy revocation.
+func (c *TerminalClient) Output() <-chan []byte { return c.conn.output }
+func (c *TerminalClient) Done() <-chan struct{} { return c.conn.dead }
+
+// Write copies and queues input for the shared PTY without blocking on a
+// non-reading slave. Local writes keep their acceptance order. Each live local
+// attachment holds at most 256 accepted queued-or-in-flight calls and 1 MiB of
+// implementation-owned copied bytes; rejected calls retain no copy. Success
+// means admission completed before Detach; teardown may discard those accepted
+// bytes. It returns ErrTerminalInputBackpressure when retrying may work,
+// ErrTerminalInputTooLarge for a permanently oversized call, and
+// ErrTerminalClientClosed after this attachment ends.
+func (c *TerminalClient) Write(p []byte) error {
+	c.conn.inputMu.Lock()
+	defer c.conn.inputMu.Unlock()
+	select {
+	case <-c.conn.dead:
+		return ErrTerminalClientClosed
+	default:
+	}
+	if len(p) > min(relay.MaxFrameSize, terminalInputBytes) {
+		return ErrTerminalInputTooLarge
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	// Local inputMu -> session inputMu is the only nested input lock order.
+	// releaseInput never takes local inputMu. This makes per-attachment and
+	// session-local admission one reserve-before-allocation transaction while
+	// retaining the existing ordering with kill/Detach.
+	if !c.session.reserveLocalInput(c.conn, len(p)) {
+		return ErrTerminalInputBackpressure
+	}
+	if c.conn.beforeInputCopy != nil {
+		c.conn.beforeInputCopy()
+	}
+	copy := c.conn.copyInput(p)
+	if !c.session.enqueueReservedLocalInput(&terminalInput{p: copy, local: c.conn, reservedBytes: len(p)}) {
+		return ErrTerminalInputBackpressure
+	}
+	return nil
+}
+
+// Resize updates the shared PTY's dimensions.
+func (c *TerminalClient) Resize(cols, rows int) error {
+	if !relay.ValidTerminalSize(cols, rows) {
+		return fmt.Errorf("invalid terminal size")
+	}
+	select {
+	case <-c.conn.dead:
+		return fmt.Errorf("terminal attachment is closed")
+	default:
+	}
+	return setPTYSize(c.session.ptmx, cols, rows)
+}
+
+// Detach releases this local attachment without ending its shared shell.
+func (c *TerminalClient) Detach() { c.session.detach(c.conn) }
+
+// AttachTerminal creates or reattaches a local terminal client. projectRoot is
+// passed through terminal so the same path resolution, policy checks and action
+// fence check run on every local create and reattach as on a browser request.
+func (d *system) AttachTerminal(projectRoot, sessionID string, cols, rows int) (*TerminalClient, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("missing session id")
+	}
+	header := relay.StreamHeader{Kind: relay.KindTerminal, Cwd: projectRoot, SessionID: sessionID, Cols: cols, Rows: rows}
+	s, err := d.terminal(header, d.actionTime().Add(terminalLocalActionTO))
+	if err != nil {
+		return nil, err
+	}
+	conn := newLocalTerminalConn()
+	if err := s.attachLocal(conn, cols, rows); err != nil {
+		conn.kill()
+		return nil, err
+	}
+	go func() {
+		<-conn.dead
+		s.detach(conn)
+	}()
+	return &TerminalClient{session: s, conn: conn}, nil
+}
+
+// localTerminalConn is a bounded in-memory counterpart to sealedConn. It does
+// not model a network connection or sealing; it only consumes the same encoded
+// fan-out frames, exposing data frames to the local TUI. A blocked consumer is
+// bounded by terminalWriteTO, just as a blocked browser write is.
+type localTerminalConn struct {
+	send    chan []byte
+	output  chan []byte
+	queued  atomic.Int64
+	dead    chan struct{}
+	killOne sync.Once
+
+	inputCalls atomic.Int64
+	inputBytes atomic.Int64
+	inputMu    sync.Mutex // serialises local Write acceptance order
+	copyInput  func([]byte) []byte
+	// Test seams; nil in production.
+	beforeInputCopy func()
+}
+
+func newLocalTerminalConn() *localTerminalConn {
+	c := &localTerminalConn{
+		send: make(chan []byte, terminalSendQueue),
+		// Hold one decoded chunk so AttachTerminal can publish the initial replay
+		// before returning without creating a second, unaccounted output backlog.
+		output:    make(chan []byte, 1),
+		dead:      make(chan struct{}),
+		copyInput: func(p []byte) []byte { return append([]byte(nil), p...) },
+	}
+	go c.writeLoop()
+	return c
+}
+
+func (c *localTerminalConn) enqueue(frame []byte) bool {
+	select {
+	case <-c.dead:
+		return false
+	default:
+	}
+	if c.queued.Load()+int64(len(frame)) > terminalSendBytes {
+		return false
+	}
+	select {
+	case c.send <- frame:
+		c.queued.Add(int64(len(frame)))
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *localTerminalConn) resync(frame []byte) bool {
+drain:
+	for {
+		select {
+		case stale := <-c.send:
+			c.queued.Add(-int64(len(stale)))
+		default:
+			break drain
+		}
+	}
+	return c.enqueue(frame)
+}
+
+func (c *localTerminalConn) writeLoop() {
+	for {
+		select {
+		case <-c.dead:
+			return
+		case frame := <-c.send:
+			c.queued.Add(-int64(len(frame)))
+			decoded, err := relay.DecodeFrame(frame)
+			if err != nil {
+				c.kill()
+				return
+			}
+			if decoded.Data == nil {
+				continue
+			}
+			timer := time.NewTimer(terminalWriteTO)
+			select {
+			case c.output <- decoded.Data:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-c.dead:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return
+			case <-timer.C:
+				c.kill()
+				return
+			}
+		}
+	}
+}
+
+func (c *localTerminalConn) kill() {
+	c.inputMu.Lock()
+	c.killOne.Do(func() { close(c.dead) })
+	c.inputMu.Unlock()
 }
 
 func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
@@ -471,6 +735,18 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 	if err != nil {
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
+	// pty.Start's master is not uniformly pollable: creack/pty opens it through
+	// os.OpenFile on Linux but wraps a blocking descriptor with os.NewFile on
+	// Darwin, and its startup ioctls call File.Fd. Duplicate it, make the new
+	// descriptor nonblocking before os.NewFile sees it, and retain only that
+	// runtime-pollable wrapper. No later operation calls File.Fd.
+	ptmx, err = normalizePTY(ptmx)
+	if err != nil {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, fmt.Errorf("normalise pty master: %w", err)
+	}
 	// pty.Start runs the shell with Setsid, so it leads a new session and its
 	// process group id equals its pid. Capture the pgid now — close needs it
 	// to signal the whole group, and by the time close runs the shell may
@@ -484,13 +760,19 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 	}
 	// Unconditional: the header's dimensions were validated at the top of this
 	// function, so there is no reachable case where they are zero.
-	_ = pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(h.Cols), Rows: uint16(h.Rows)})
-	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[*sealedConn]struct{}), done: make(chan struct{})}
+	if err := setPTYSize(ptmx, h.Cols, h.Rows); err != nil {
+		_ = ptmx.Close()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, fmt.Errorf("set pty size: %w", err)
+	}
+	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
 	d.terminals[h.SessionID] = s
 	d.addSession(1)
 	d.logf("terminal session started (%s)", d.cfg.Shell)
 	go s.readPTY()
 	go s.pollActivity()
+	s.startInput()
 	return s, nil
 }
 
@@ -523,20 +805,64 @@ func (d *system) enforcePolicy() {
 }
 
 func (s *terminalSession) attach(conn *sealedConn) {
+	if err := s.attachConn(conn); err != nil {
+		s.owner.logf("terminal refused: %v", err)
+		conn.kill()
+		return
+	}
+
+	for {
+		frame, err := conn.stream.ReadFrame()
+		if err != nil {
+			break
+		}
+		switch {
+		case frame.Data != nil:
+			if !s.submitBrowserInput(frame.Data, conn.dead) {
+				s.detach(conn)
+				return
+			}
+		case frame.Resize != nil:
+			if !relay.ValidTerminalSize(frame.Resize.Cols, frame.Resize.Rows) {
+				continue
+			}
+			_ = setPTYSize(s.ptmx, frame.Resize.Cols, frame.Resize.Rows)
+		}
+	}
+	s.detach(conn)
+}
+
+// attachLocal applies the dimensions promised by AttachTerminal while holding
+// the same session lock that admits the attachment, so a successful reattach
+// cannot return with the previous client's size still installed.
+func (s *terminalSession) attachLocal(conn *localTerminalConn, cols, rows int) error {
+	return s.attachConnSize(conn, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+}
+
+// attachConn adds either kind of terminal attachment and queues its initial
+// replay. The caller handles its input path after this returns successfully.
+func (s *terminalSession) attachConn(conn terminalConn) error {
+	return s.attachConnSize(conn, nil)
+}
+
+func (s *terminalSession) attachConnSize(conn terminalConn, size *pty.Winsize) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		conn.kill()
-		return
+		return fmt.Errorf("terminal session is closed")
 	}
 	if s.conns == nil {
-		s.conns = make(map[*sealedConn]struct{})
+		s.conns = make(map[terminalConn]struct{})
 	}
 	if len(s.conns) >= maxTerminalConns {
 		s.mu.Unlock()
-		s.owner.logf("terminal refused: session already has %d connections", maxTerminalConns)
-		conn.kill()
-		return
+		return fmt.Errorf("session already has %d connections", maxTerminalConns)
+	}
+	if size != nil {
+		if err := setPTYSize(s.ptmx, int(size.Cols), int(size.Rows)); err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("set terminal size: %w", err)
+		}
 	}
 	s.conns[conn] = struct{}{}
 	if s.expires != nil {
@@ -562,35 +888,13 @@ func (s *terminalSession) attach(conn *sealedConn) {
 		}
 		s.mu.Unlock()
 		conn.kill()
-		return
+		return fmt.Errorf("terminal attachment queue unavailable")
 	}
 	s.mu.Unlock()
-
-	for {
-		frame, err := conn.stream.ReadFrame()
-		if err != nil {
-			break
-		}
-		switch {
-		case frame.Data != nil:
-			s.inputMu.Lock()
-			if _, err := s.ptmx.Write(frame.Data); err != nil {
-				s.inputMu.Unlock()
-				s.detach(conn)
-				return
-			}
-			s.inputMu.Unlock()
-		case frame.Resize != nil:
-			if !relay.ValidTerminalSize(frame.Resize.Cols, frame.Resize.Rows) {
-				continue
-			}
-			_ = pty.Setsize(s.ptmx, &pty.Winsize{Cols: uint16(frame.Resize.Cols), Rows: uint16(frame.Resize.Rows)})
-		}
-	}
-	s.detach(conn)
+	return nil
 }
 
-func (s *terminalSession) detach(conn *sealedConn) {
+func (s *terminalSession) detach(conn terminalConn) {
 	conn.kill()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -601,6 +905,275 @@ func (s *terminalSession) detach(conn *sealedConn) {
 	if len(s.conns) == 0 && s.expires == nil {
 		s.expires = time.AfterFunc(terminalDetachTTL, s.close)
 	}
+}
+
+// submitInput is the common nonblocking admission primitive. Local callers use
+// it directly so Write remains immediate. Browser readers use
+// submitBrowserInput, which waits for this same scheduler's bounded reserve.
+func (s *terminalSession) submitInput(in *terminalInput) bool {
+	s.startInput()
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+	return s.submitInputLocked(in)
+}
+
+// reserveLocalInput is called with local.inputMu held. Accounting the request
+// before its copy also reserves its scheduler capacity: the production channel
+// has terminalSchedulerQueue slots and inputCalls includes active, queued, and
+// not-yet-enqueued reserved calls, so later admissions cannot consume this
+// request's future slot.
+func (s *terminalSession) reserveLocalInput(local *localTerminalConn, n int) bool {
+	s.startInput()
+	s.inputMu.Lock()
+	defer s.inputMu.Unlock()
+	if s.inputClosed ||
+		local.inputCalls.Load() >= terminalInputQueue || local.inputBytes.Load()+int64(n) > terminalInputBytes ||
+		s.localInputCalls >= terminalInputQueue || s.localInputBytes+n > terminalInputBytes ||
+		s.inputCalls >= terminalSchedulerQueue || s.inputBytes+n > terminalSchedulerBytes {
+		return false
+	}
+	s.inputCalls++
+	s.inputBytes += n
+	s.localInputCalls++
+	s.localInputBytes += n
+	local.inputCalls.Add(1)
+	local.inputBytes.Add(int64(n))
+	return true
+}
+
+// enqueueReservedLocalInput publishes a request whose accounting and channel
+// slot were reserved before its copy. Session close is the ordinary failure
+// path; the default is a defensive check for an incorrectly sized channel.
+func (s *terminalSession) enqueueReservedLocalInput(in *terminalInput) bool {
+	s.inputMu.Lock()
+	if !s.inputClosed {
+		select {
+		case s.input <- in:
+			s.inputMu.Unlock()
+			return true
+		default:
+		}
+	}
+	s.releaseInputLocked(in)
+	s.inputMu.Unlock()
+	in.local.inputCalls.Add(-1)
+	in.local.inputBytes.Add(-int64(in.accountedBytes()))
+	return false
+}
+
+func (s *terminalSession) submitInputLocked(in *terminalInput) bool {
+	if s.inputClosed || s.inputCalls >= terminalSchedulerQueue || s.inputBytes+len(in.p) > terminalSchedulerBytes {
+		return false
+	}
+	if in.local != nil {
+		if s.localInputCalls >= terminalInputQueue || s.localInputBytes+len(in.p) > terminalInputBytes {
+			return false
+		}
+	} else if s.browserInputCalls >= terminalBrowserInputQueue || s.browserInputBytes+len(in.p) > terminalBrowserInputBytes {
+		return false
+	}
+	select {
+	case s.input <- in:
+		s.inputCalls++
+		s.inputBytes += len(in.p)
+		if in.local != nil {
+			s.localInputCalls++
+			s.localInputBytes += len(in.p)
+		} else {
+			s.browserInputCalls++
+			s.browserInputBytes += len(in.p)
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// submitBrowserInput backpressures one browser reader without disconnecting it.
+// The generation channel is captured while inputMu protects the failed
+// admission, so a release cannot be missed between checking capacity and
+// waiting. A connection retains only its already-decoded frame while parked.
+func (s *terminalSession) submitBrowserInput(p []byte, dead <-chan struct{}) bool {
+	for len(p) > 0 {
+		n := min(len(p), terminalBrowserInputBytes)
+		in := &terminalInput{p: p[:n]}
+		for {
+			select {
+			case <-s.done:
+				return false
+			case <-dead:
+				return false
+			default:
+			}
+			s.startInput()
+			s.inputMu.Lock()
+			if s.submitInputLocked(in) {
+				s.inputMu.Unlock()
+				break
+			}
+			if s.inputClosed {
+				s.inputMu.Unlock()
+				return false
+			}
+			if s.inputCapacity == nil {
+				s.inputCapacity = make(chan struct{})
+			}
+			capacity := s.inputCapacity
+			s.inputMu.Unlock()
+			select {
+			case <-capacity:
+			case <-s.done:
+				return false
+			case <-dead:
+				return false
+			}
+		}
+		p = p[n:]
+	}
+	return true
+}
+
+func (s *terminalSession) startInput() {
+	s.inputOnce.Do(func() {
+		if s.input == nil {
+			s.input = make(chan *terminalInput, terminalSchedulerQueue)
+		}
+		s.inputStarted = make(chan struct{})
+		s.inputStopped = make(chan struct{})
+		go s.inputLoop()
+	})
+}
+
+func (s *terminalSession) releaseInput(in *terminalInput) {
+	s.inputMu.Lock()
+	s.releaseInputLocked(in)
+	s.inputMu.Unlock()
+	if in.local != nil {
+		in.local.inputCalls.Add(-1)
+		in.local.inputBytes.Add(-int64(in.accountedBytes()))
+	}
+}
+
+func (s *terminalSession) releaseInputLocked(in *terminalInput) {
+	n := in.accountedBytes()
+	s.inputCalls--
+	s.inputBytes -= n
+	if in.local != nil {
+		s.localInputCalls--
+		s.localInputBytes -= n
+	} else {
+		s.browserInputCalls--
+		s.browserInputBytes -= n
+	}
+	s.notifyInputCapacityLocked()
+}
+
+func (in *terminalInput) accountedBytes() int {
+	if in.reservedBytes != 0 {
+		return in.reservedBytes
+	}
+	return len(in.p)
+}
+
+func (s *terminalSession) notifyInputCapacityLocked() {
+	if s.inputCapacity != nil {
+		close(s.inputCapacity)
+		s.inputCapacity = nil
+	}
+}
+
+func (s *terminalSession) inputLoop() {
+	close(s.inputStarted)
+	defer close(s.inputStopped)
+	for {
+		select {
+		case <-s.done:
+			s.drainInput()
+			return
+		case in := <-s.input:
+			if in.local != nil {
+				select {
+				case <-in.local.dead:
+					s.releaseInput(in)
+					continue
+				default:
+				}
+			}
+			complete, err := s.writeInputQuantum(in)
+			if err != nil {
+				s.releaseInput(in)
+				s.stopInput()
+				s.drainInput()
+				go s.close()
+				return
+			}
+			if complete {
+				s.releaseInput(in)
+				continue
+			}
+			if in.off == len(in.p) {
+				s.releaseInput(in)
+				continue
+			}
+			select {
+			case <-s.done:
+				s.releaseInput(in)
+			case s.input <- in:
+				// Keep accounting: the request remains admitted at the queue tail.
+				// terminalSchedulerQueue counts the active request, so at most 319
+				// others can be queued while this one is out of the channel. The
+				// active request therefore always owns this requeue slot.
+			}
+		}
+	}
+}
+
+func (s *terminalSession) drainInput() {
+	for {
+		select {
+		case in := <-s.input:
+			s.releaseInput(in)
+		default:
+			return
+		}
+	}
+}
+
+// writeInputQuantum is the sole PTY write path. It uses the permanently
+// nonblocking descriptor directly, then waits no longer than 25ms for POLLOUT.
+func (s *terminalSession) writeInputQuantum(in *terminalInput) (complete bool, err error) {
+	limit := min(len(in.p), in.off+terminalInputQuantum)
+	deadline := time.Now().Add(terminalInputPollWindow)
+	for in.off < limit {
+		select {
+		case <-s.done:
+			return true, nil
+		default:
+		}
+		if in.local != nil {
+			select {
+			case <-in.local.dead:
+				return true, nil
+			default:
+			}
+		}
+		written, err := ptyWrite(s.ptmx, in.p[in.off:limit])
+		if written > 0 {
+			in.off += written
+			continue
+		}
+		if err != unix.EAGAIN && err != unix.EWOULDBLOCK {
+			return true, fmt.Errorf("write pty: %w", err)
+		}
+		ready, err := ptyWritable(s.ptmx, deadline)
+		if err != nil {
+			return true, err
+		}
+		if !ready {
+			return false, nil
+		}
+	}
+	return in.off == len(in.p), nil
 }
 
 func (s *terminalSession) readPTY() {
@@ -621,6 +1194,129 @@ func (s *terminalSession) readPTY() {
 			return
 		}
 	}
+}
+
+func setPTYNonblock(f *os.File) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) { opErr = unix.SetNonblock(int(fd), true) }); err != nil {
+		return err
+	}
+	return opErr
+}
+
+func setPTYSize(f *os.File, cols, rows int) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) {
+		opErr = unix.IoctlSetWinsize(int(fd), unix.TIOCSWINSZ, &unix.Winsize{Col: uint16(cols), Row: uint16(rows)})
+	}); err != nil {
+		return err
+	}
+	return opErr
+}
+
+// normalizePTY returns a separately owned wrapper whose descriptor was already
+// O_NONBLOCK when os.NewFile registered it with Go's poller. Wrapping the same
+// descriptor would create two owners; duplicating first makes closing the
+// creack/pty wrapper safe and keeps RawConn.Read deadline-capable on both Linux
+// and Darwin.
+func normalizePTY(f *os.File) (*os.File, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return f, err
+	}
+	dup := -1
+	var opErr error
+	if err := rc.Control(func(fd uintptr) {
+		dup, opErr = unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 0)
+		if opErr == nil {
+			opErr = unix.SetNonblock(dup, true)
+		}
+	}); err != nil {
+		return f, err
+	}
+	if opErr != nil {
+		if dup >= 0 {
+			_ = unix.Close(dup)
+		}
+		return f, opErr
+	}
+	normalized := os.NewFile(uintptr(dup), f.Name())
+	if normalized == nil {
+		_ = unix.Close(dup)
+		return f, fmt.Errorf("wrap duplicated pty descriptor")
+	}
+	if err := normalized.SetReadDeadline(time.Time{}); err != nil {
+		_ = normalized.Close()
+		return f, fmt.Errorf("register pty with runtime poller: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = normalized.Close()
+		return f, err
+	}
+	return normalized, nil
+}
+
+func ptyWrite(f *os.File, p []byte) (n int, err error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) {
+		for {
+			n, opErr = unix.Write(int(fd), p)
+			if opErr != unix.EINTR {
+				return
+			}
+		}
+	}); err != nil {
+		return 0, err
+	}
+	return n, opErr
+}
+
+func ptyWritable(f *os.File, deadline time.Time) (bool, error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return false, err
+	}
+	ready := false
+	var opErr error
+	err = rc.Control(func(fd uintptr) {
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+		for {
+			left := time.Until(deadline)
+			if left <= 0 {
+				return
+			}
+			n, pollErr := unix.Poll(pfd, int((left+time.Millisecond-1)/time.Millisecond))
+			if pollErr == unix.EINTR {
+				continue
+			}
+			if pollErr != nil {
+				opErr = pollErr
+				return
+			}
+			if n > 0 && pfd[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+				opErr = fmt.Errorf("pty poll terminal revents %#x", pfd[0].Revents)
+				return
+			}
+			ready = n > 0 && pfd[0].Revents&unix.POLLOUT != 0
+			return
+		}
+	})
+	if err != nil {
+		return false, err
+	}
+	return ready, opErr
 }
 
 // ptyReader reads coalesced chunks from a PTY master.
@@ -666,7 +1362,7 @@ func newPTYReader(f *os.File) (*ptyReader, error) {
 // leaves without waiting a nanosecond, and bulk output gets the full window
 // whatever the host is doing.
 func (p *ptyReader) read(buf []byte) (n, reads int, err error) {
-	n, err = p.f.Read(buf)
+	n, err = p.readOnce(buf)
 	reads = 1
 	if err != nil || n < terminalCoalesceMinChunk || p.blind {
 		return n, reads, err
@@ -676,7 +1372,7 @@ func (p *ptyReader) read(buf []byte) (n, reads int, err error) {
 		if !p.readable(deadline) {
 			return n, reads, nil
 		}
-		m, rerr := p.f.Read(buf[n:])
+		m, rerr := p.readOnce(buf[n:])
 		reads++
 		n += m
 		if rerr != nil {
@@ -684,6 +1380,23 @@ func (p *ptyReader) read(buf []byte) (n, reads int, err error) {
 		}
 	}
 	return n, reads, nil
+}
+
+func (p *ptyReader) readOnce(buf []byte) (n int, err error) {
+	var opErr error
+	err = p.rc.Read(func(fd uintptr) bool {
+		for {
+			n, opErr = unix.Read(int(fd), buf)
+			if opErr != unix.EINTR {
+				break
+			}
+		}
+		return opErr != unix.EAGAIN && opErr != unix.EWOULDBLOCK
+	})
+	if err != nil {
+		return n, err
+	}
+	return n, opErr
 }
 
 // readable reports whether the master has bytes ready, waiting no later than
@@ -741,7 +1454,7 @@ func (s *terminalSession) output(data []byte) {
 		return
 	}
 	s.replay.append(data)
-	var dropped []*sealedConn
+	var dropped []terminalConn
 	if len(s.conns) > 0 {
 		// Encoded here, under the lock, rather than before it. encodeFrame
 		// copies, and that copy is both what makes readPTY's reusable buffer
@@ -785,8 +1498,8 @@ func (s *terminalSession) catchUp() []byte {
 //
 // It also arms the detach TTL when the last connection goes, which is how a
 // session whose every client died eventually reaps itself.
-func (s *terminalSession) broadcast(frame []byte, resendOnResync bool) []*sealedConn {
-	var dropped []*sealedConn
+func (s *terminalSession) broadcast(frame []byte, resendOnResync bool) []terminalConn {
+	var dropped []terminalConn
 	var catchUp []byte
 	for conn := range s.conns {
 		if conn.enqueue(frame) {
@@ -811,7 +1524,7 @@ func (s *terminalSession) broadcast(frame []byte, resendOnResync bool) []*sealed
 	return dropped
 }
 
-func killAll(conns []*sealedConn) {
+func killAll(conns []terminalConn) {
 	for _, conn := range conns {
 		conn.kill()
 	}
@@ -825,13 +1538,25 @@ func (s *terminalSession) pollActivity() {
 		case <-s.done:
 			return
 		case <-ticker.C:
-			fg, err := unix.IoctlGetInt(int(s.ptmx.Fd()), unix.TIOCGPGRP)
+			fg, err := ptyForegroundPgrp(s.ptmx)
 			if err != nil {
 				return
 			}
 			s.setActivity(fg > 0 && fg != s.cmd.Process.Pid)
 		}
 	}
+}
+
+func ptyForegroundPgrp(f *os.File) (fg int, err error) {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var opErr error
+	if err := rc.Control(func(fd uintptr) { fg, opErr = unix.IoctlGetInt(int(fd), unix.TIOCGPGRP) }); err != nil {
+		return 0, err
+	}
+	return fg, opErr
 }
 
 func (s *terminalSession) setActivity(active bool) {
@@ -865,6 +1590,9 @@ func (s *terminalSession) setActivity(active bool) {
 // closed anything that matters.
 func (s *terminalSession) killProcessGroup() {
 	if s.cmd == nil || s.cmd.Process == nil {
+		if s.ptmx != nil {
+			_ = s.ptmx.Close()
+		}
 		return
 	}
 	if s.pgid > 0 {
@@ -899,6 +1627,7 @@ func (s *terminalSession) killProcessGroup() {
 
 func (s *terminalSession) close() {
 	s.closeOnce.Do(func() {
+		s.stopInput()
 		s.mu.Lock()
 		s.closed = true
 		conns := s.conns
@@ -915,14 +1644,28 @@ func (s *terminalSession) close() {
 			conn.kill()
 		}
 		s.killProcessGroup()
-		close(s.done)
 
-		s.owner.terminalMu.Lock()
-		if s.owner.terminals[s.id] == s {
-			delete(s.owner.terminals, s.id)
+		if s.owner != nil {
+			s.owner.terminalMu.Lock()
+			if s.owner.terminals[s.id] == s {
+				delete(s.owner.terminals, s.id)
+			}
+			s.owner.terminalMu.Unlock()
+			s.owner.addSession(-1)
+			s.owner.logf("terminal session ended")
 		}
-		s.owner.terminalMu.Unlock()
-		s.owner.addSession(-1)
-		s.owner.logf("terminal session ended")
 	})
+}
+
+// stopInput is the admission/worker half of close. Closing done before process
+// teardown makes queued and currently polled requests release within one 25ms
+// poll window, independently of the process-group grace period.
+func (s *terminalSession) stopInput() {
+	s.inputMu.Lock()
+	if !s.inputClosed {
+		s.inputClosed = true
+		close(s.done)
+		s.notifyInputCapacityLocked()
+	}
+	s.inputMu.Unlock()
 }
