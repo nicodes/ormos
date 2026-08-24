@@ -4,6 +4,7 @@ package system
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -479,6 +480,22 @@ func TestLocalTerminalClientSharesBrowserSession(t *testing.T) {
 	}
 
 resized:
+	if err := browserClient.WriteFrame(relay.EncodeData([]byte("browser input\n"))); err != nil {
+		t.Fatalf("browser input: %v", err)
+	}
+	deadline = time.After(5 * time.Second)
+	for {
+		select {
+		case output := <-local.Output():
+			if strings.Contains(string(output), "browser input") {
+				goto resizedByBrowser
+			}
+		case <-deadline:
+			t.Fatal("browser input did not reach the same PTY as local input")
+		}
+	}
+
+resizedByBrowser:
 	if err := local.Resize(100, 40); err != nil {
 		t.Fatalf("local resize: %v", err)
 	}
@@ -494,6 +511,37 @@ resized:
 	waitConns(t, local.session, 1) // browser remains; detach did not kill the shell.
 	if d.terminals["local-shared"] != local.session {
 		t.Fatal("local detach removed a shell still attached in the browser")
+	}
+}
+
+func TestLocalTerminalCreationUsesTerminalSessionLimit(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	root := t.TempDir()
+	clients := make([]*TerminalClient, 0, maxTerminalSessions)
+	for i := range maxTerminalSessions {
+		client, err := d.AttachTerminal(root, fmt.Sprintf("local-session-%d", i), 80, 24)
+		if err != nil {
+			t.Fatalf("local session %d: %v", i, err)
+		}
+		<-client.Output()
+		clients = append(clients, client)
+	}
+	t.Cleanup(func() {
+		for _, client := range clients {
+			client.session.close()
+		}
+	})
+	if _, err := d.AttachTerminal(root, "local-session-over-limit", 80, 24); err == nil || !strings.Contains(err.Error(), "session limit") {
+		t.Fatalf("local session limit error = %v", err)
+	}
+
+	// Browser headers enter the same terminal authority. Calling it directly is
+	// the control for the already-sealed browser path: sealing happens before
+	// terminal(), but neither can bypass its shared session limit.
+	header := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, Cwd: root, SessionID: "browser-session-over-limit", Cols: 80, Rows: 24})
+	if _, err := d.terminal(header, acceptedFenceDeadline(t, header)); err == nil || !strings.Contains(err.Error(), "session limit") {
+		t.Fatalf("browser terminal authority limit error = %v", err)
 	}
 }
 
@@ -520,12 +568,19 @@ func TestLocalTerminalClientReplayDetachAndConnectionLimit(t *testing.T) {
 		t.Fatal("last local detach did not arm terminal TTL")
 	}
 
-	reattached, err := d.AttachTerminal(root, "local-limit", 80, 24)
+	reattached, err := d.AttachTerminal(root, "local-limit", 100, 40)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reattached.session != first.session {
 		t.Fatal("local reattach created a duplicate shell")
+	}
+	rows, cols, err := pty.Getsize(reattached.session.ptmx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cols != 100 || rows != 40 {
+		t.Fatalf("reattached PTY size = %dx%d, want 100x40", cols, rows)
 	}
 	if got, want := string(<-reattached.Output()), terminalResyncPrefix+"replayed"; got != want {
 		t.Fatalf("local replay = %q, want %q", got, want)
@@ -544,6 +599,140 @@ func TestLocalTerminalClientReplayDetachAndConnectionLimit(t *testing.T) {
 	}
 	for _, client := range clients {
 		client.Detach()
+	}
+}
+
+// A local TUI must never be held hostage by a PTY whose slave has stopped
+// reading. The browser sibling remains the control: once the local attachment
+// is gone, a browser can still write to this one PTY.
+func TestLocalTerminalDetachReleasesInputAndDoesNotStarveBrowser(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	fd := int(inputWrite.Fd())
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatal(err)
+	}
+	filled := 0
+	fill := make([]byte, terminalInputChunk)
+	for {
+		n, err := unix.Write(fd, fill)
+		filled += n
+		if err == unix.EAGAIN {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		t.Fatal(err)
+	}
+	s := &terminalSession{id: "local-input", ptmx: inputWrite, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
+	localConn := newLocalTerminalConn()
+	if err := s.attachConn(localConn); err != nil {
+		t.Fatal(err)
+	}
+	go localConn.inputLoop(s)
+	local := &TerminalClient{session: s, conn: localConn}
+
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- local.Write(make([]byte, terminalSendBytes)) }()
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("local Write returned %v before detach", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local Write blocked while PTY slave was not reading")
+	}
+
+	local.Detach()
+	select {
+	case <-local.Done():
+	case <-time.After(time.Second):
+		t.Fatal("local detach did not close Done")
+	}
+	select {
+	case <-localConn.inputDone:
+	case <-time.After(time.Second):
+		t.Fatal("local input worker did not release queued input after detach")
+	}
+	readFD := int(inputRead.Fd())
+	if err := unix.SetNonblock(readFD, true); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, err := unix.Read(readFD, make([]byte, filled))
+		if err == unix.EAGAIN {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := unix.SetNonblock(readFD, false); err != nil {
+		t.Fatal(err)
+	}
+
+	browser, browserClient := sealedPair(t, "local-input")
+	go s.attach(browser)
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatalf("read browser replay: %v", err)
+	}
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatalf("read browser activity: %v", err)
+	}
+	if err := browserClient.WriteFrame(relay.EncodeData([]byte("browser input"))); err != nil {
+		t.Fatalf("write browser input: %v", err)
+	}
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, len("browser input"))
+		_, err := io.ReadFull(inputRead, buf)
+		if err != nil {
+			got <- nil
+			return
+		}
+		got <- buf
+	}()
+	select {
+	case data := <-got:
+		if string(data) != "browser input" {
+			t.Fatalf("browser input after local detach = %q", data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("browser input was starved after local detach")
+	}
+	browser.kill()
+}
+
+func TestLocalTerminalWriteBoundsInputByBytes(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	s := &terminalSession{id: "local-input-bound", ptmx: inputWrite, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
+	conn := newLocalTerminalConn()
+	if err := s.attachConn(conn); err != nil {
+		t.Fatal(err)
+	}
+	go conn.inputLoop(s)
+	client := &TerminalClient{session: s, conn: conn}
+	if err := client.Write(make([]byte, terminalInputBytes)); err != nil {
+		t.Fatalf("fill bounded local input queue: %v", err)
+	}
+	if err := client.Write([]byte("x")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatalf("input beyond byte budget error = %v, want ErrTerminalInputBackpressure", err)
+	}
+	client.Detach()
+	select {
+	case <-conn.inputDone:
+	case <-time.After(time.Second):
+		t.Fatal("detach did not release bounded local input worker")
 	}
 }
 

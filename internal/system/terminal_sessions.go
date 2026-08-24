@@ -4,8 +4,8 @@ package system
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -82,6 +82,22 @@ const (
 	// terminalLocalActionTO gives an in-process attachment the same bounded
 	// action window that a relay request obtains from its accepted fence.
 	terminalLocalActionTO = 10 * time.Second
+	// terminalInputQueue bounds both queued local calls and their copied bytes.
+	// It is intentionally the same byte budget as outbound terminal traffic:
+	// four local attachments cannot turn pasted input into unbounded agent memory.
+	terminalInputQueue      = terminalSendQueue
+	terminalInputBytes      = terminalSendBytes
+	terminalInputPollWindow = 25 * time.Millisecond
+	terminalInputChunk      = 4 << 10
+)
+
+var (
+	// ErrTerminalInputBackpressure means a local Write was not accepted. Callers
+	// may retry after consuming output or yielding; bytes are never dropped.
+	ErrTerminalInputBackpressure = errors.New("terminal input backpressure")
+	// ErrTerminalClientClosed means this attachment has detached or its session
+	// ended. It never means the shared shell was killed by the attachment.
+	ErrTerminalClientClosed = errors.New("terminal attachment is closed")
 )
 
 // terminalKillGrace is how long close waits for the shell's process group to
@@ -356,34 +372,45 @@ type TerminalClient struct {
 	conn    *localTerminalConn
 }
 
-// Output is the bounded stream of terminal output for this attachment. Done is
-// closed if this attachment is detached because its consumer stopped draining.
+// Output is the bounded stream of terminal output for this attachment. It is
+// not closed; receive it with Done. Done closes on Detach, slow-reader eviction,
+// session/process exit, or policy revocation.
 func (c *TerminalClient) Output() <-chan []byte { return c.conn.output }
 func (c *TerminalClient) Done() <-chan struct{} { return c.conn.dead }
 
-// Write sends input to the shared PTY.
+// Write copies and queues input for the shared PTY without blocking on a
+// non-reading slave. Local writes keep their acceptance order. It returns
+// ErrTerminalInputBackpressure when the bounded queue cannot accept the bytes,
+// and ErrTerminalClientClosed after this attachment ends.
 func (c *TerminalClient) Write(p []byte) error {
-	if len(p) > relay.MaxFrameSize {
-		return fmt.Errorf("terminal input exceeds max frame size")
+	if len(p) > relay.MaxFrameSize || len(p) > terminalInputBytes {
+		return ErrTerminalInputBackpressure
 	}
+	if len(p) == 0 {
+		return nil
+	}
+	copy := append([]byte(nil), p...)
+	c.conn.inputMu.Lock()
+	defer c.conn.inputMu.Unlock()
 	select {
 	case <-c.conn.dead:
-		return fmt.Errorf("terminal attachment is closed")
+		return ErrTerminalClientClosed
 	default:
 	}
-	c.session.inputMu.Lock()
-	defer c.session.inputMu.Unlock()
-	for len(p) > 0 {
-		n, err := c.session.ptmx.Write(p)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		p = p[n:]
+	if c.conn.inputBytes.Load()+int64(len(copy)) > terminalInputBytes {
+		return ErrTerminalInputBackpressure
 	}
-	return nil
+	c.conn.inputBytes.Add(int64(len(copy)))
+	select {
+	case <-c.conn.dead:
+		c.conn.inputBytes.Add(-int64(len(copy)))
+		return ErrTerminalClientClosed
+	case c.conn.input <- copy:
+		return nil
+	default:
+		c.conn.inputBytes.Add(-int64(len(copy)))
+		return ErrTerminalInputBackpressure
+	}
 }
 
 // Resize updates the shared PTY's dimensions.
@@ -415,10 +442,11 @@ func (d *system) AttachTerminal(projectRoot, sessionID string, cols, rows int) (
 		return nil, err
 	}
 	conn := newLocalTerminalConn()
-	if err := s.attachConn(conn); err != nil {
+	if err := s.attachLocal(conn, cols, rows); err != nil {
 		conn.kill()
 		return nil, err
 	}
+	go conn.inputLoop(s)
 	go func() {
 		<-conn.dead
 		s.detach(conn)
@@ -436,6 +464,11 @@ type localTerminalConn struct {
 	queued  atomic.Int64
 	dead    chan struct{}
 	killOne sync.Once
+
+	input      chan []byte
+	inputBytes atomic.Int64
+	inputMu    sync.Mutex // serialises local Write acceptance order
+	inputDone  chan struct{}
 }
 
 func newLocalTerminalConn() *localTerminalConn {
@@ -443,8 +476,10 @@ func newLocalTerminalConn() *localTerminalConn {
 		send: make(chan []byte, terminalSendQueue),
 		// Hold one decoded chunk so AttachTerminal can publish the initial replay
 		// before returning without creating a second, unaccounted output backlog.
-		output: make(chan []byte, 1),
-		dead:   make(chan struct{}),
+		output:    make(chan []byte, 1),
+		dead:      make(chan struct{}),
+		input:     make(chan []byte, terminalInputQueue),
+		inputDone: make(chan struct{}),
 	}
 	go c.writeLoop()
 	return c
@@ -517,6 +552,94 @@ func (c *localTerminalConn) writeLoop() {
 
 func (c *localTerminalConn) kill() {
 	c.killOne.Do(func() { close(c.dead) })
+}
+
+// inputLoop is one worker per attachment, never one per Write. It waits for
+// POLLOUT before entering the session's shared input critical section, so a
+// full local PTY cannot pin inputMu and starve a browser. poll is available on
+// both supported Unix targets; its short timeout makes waiting detach-aware
+// without claiming that an already-entered kernel Write can be cancelled.
+func (c *localTerminalConn) inputLoop(s *terminalSession) {
+	defer func() {
+		for {
+			select {
+			case p := <-c.input:
+				c.inputBytes.Add(-int64(len(p)))
+			default:
+				close(c.inputDone)
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-c.dead:
+			return
+		case p := <-c.input:
+			if !c.writeInput(s, p) {
+				c.inputBytes.Add(-int64(len(p)))
+				return
+			}
+			c.inputBytes.Add(-int64(len(p)))
+		}
+	}
+}
+
+func (c *localTerminalConn) writeInput(s *terminalSession, p []byte) bool {
+	for len(p) > 0 {
+		if !c.waitWritable(s.ptmx) {
+			return false
+		}
+		select {
+		case <-c.dead:
+			return false
+		default:
+		}
+		n := min(len(p), terminalInputChunk)
+		s.inputMu.Lock()
+		select {
+		case <-c.dead:
+			s.inputMu.Unlock()
+			return false
+		default:
+		}
+		written, err := s.ptmx.Write(p[:n])
+		s.inputMu.Unlock()
+		if err != nil || written == 0 {
+			c.kill()
+			return false
+		}
+		p = p[written:]
+	}
+	return true
+}
+
+func (c *localTerminalConn) waitWritable(f *os.File) bool {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		c.kill()
+		return false
+	}
+	for {
+		select {
+		case <-c.dead:
+			return false
+		default:
+		}
+		ready := false
+		err := rc.Control(func(fd uintptr) {
+			pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+			n, pollErr := unix.Poll(pfd, int(terminalInputPollWindow/time.Millisecond))
+			ready = pollErr == nil && n > 0 && pfd[0].Revents&unix.POLLOUT != 0
+		})
+		if err != nil {
+			c.kill()
+			return false
+		}
+		if ready {
+			return true
+		}
+	}
 }
 
 func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
@@ -741,9 +864,20 @@ func (s *terminalSession) attach(conn *sealedConn) {
 	s.detach(conn)
 }
 
+// attachLocal applies the dimensions promised by AttachTerminal while holding
+// the same session lock that admits the attachment, so a successful reattach
+// cannot return with the previous client's size still installed.
+func (s *terminalSession) attachLocal(conn *localTerminalConn, cols, rows int) error {
+	return s.attachConnSize(conn, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+}
+
 // attachConn adds either kind of terminal attachment and queues its initial
 // replay. The caller handles its input path after this returns successfully.
 func (s *terminalSession) attachConn(conn terminalConn) error {
+	return s.attachConnSize(conn, nil)
+}
+
+func (s *terminalSession) attachConnSize(conn terminalConn, size *pty.Winsize) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -755,6 +889,12 @@ func (s *terminalSession) attachConn(conn terminalConn) error {
 	if len(s.conns) >= maxTerminalConns {
 		s.mu.Unlock()
 		return fmt.Errorf("session already has %d connections", maxTerminalConns)
+	}
+	if size != nil {
+		if err := pty.Setsize(s.ptmx, size); err != nil {
+			s.mu.Unlock()
+			return fmt.Errorf("set terminal size: %w", err)
+		}
 	}
 	s.conns[conn] = struct{}{}
 	if s.expires != nil {
