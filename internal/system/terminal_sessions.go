@@ -5,6 +5,7 @@ package system
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -78,6 +79,9 @@ const (
 	// output to batch with. It is the entire latency cost of coalescing, and it
 	// is paid only by output that already arrived in tty-chunk quantities.
 	terminalCoalesceWindow = 2 * time.Millisecond
+	// terminalLocalActionTO gives an in-process attachment the same bounded
+	// action window that a relay request obtains from its accepted fence.
+	terminalLocalActionTO = 10 * time.Second
 )
 
 // terminalKillGrace is how long close waits for the shell's process group to
@@ -184,13 +188,23 @@ type terminalSession struct {
 
 	mu        sync.Mutex
 	inputMu   sync.Mutex
-	conns     map[*sealedConn]struct{}
+	conns     map[terminalConn]struct{}
 	replay    replayRing
 	active    bool
 	closed    bool
 	expires   *time.Timer
 	done      chan struct{}
 	closeOnce sync.Once
+}
+
+// terminalConn is the common outbound half of a browser or local attachment.
+// It deliberately contains no read side: browser input remains sealed and
+// local input is accepted only through TerminalClient. Both kinds use the same
+// bounded fan-out queue and resynchronisation path.
+type terminalConn interface {
+	enqueue([]byte) bool
+	resync([]byte) bool
+	kill()
 }
 
 // sealedConn is one browser connection attached to a terminal session.
@@ -329,6 +343,180 @@ func (c *sealedConn) kill() {
 		_ = c.SetReadDeadline(time.Now())
 		_ = c.Close()
 	})
+}
+
+// TerminalClient is a local attachment to a terminal session. Output is raw
+// terminal bytes, including the reset-prefixed bounded replay sent on attach
+// and resynchronisation. Callers must treat output slices as read-only.
+//
+// Detach releases only this attachment; the session remains alive while any
+// browser or local attachment remains, then follows terminalDetachTTL.
+type TerminalClient struct {
+	session *terminalSession
+	conn    *localTerminalConn
+}
+
+// Output is the bounded stream of terminal output for this attachment. Done is
+// closed if this attachment is detached because its consumer stopped draining.
+func (c *TerminalClient) Output() <-chan []byte { return c.conn.output }
+func (c *TerminalClient) Done() <-chan struct{} { return c.conn.dead }
+
+// Write sends input to the shared PTY.
+func (c *TerminalClient) Write(p []byte) error {
+	if len(p) > relay.MaxFrameSize {
+		return fmt.Errorf("terminal input exceeds max frame size")
+	}
+	select {
+	case <-c.conn.dead:
+		return fmt.Errorf("terminal attachment is closed")
+	default:
+	}
+	c.session.inputMu.Lock()
+	defer c.session.inputMu.Unlock()
+	for len(p) > 0 {
+		n, err := c.session.ptmx.Write(p)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
+// Resize updates the shared PTY's dimensions.
+func (c *TerminalClient) Resize(cols, rows int) error {
+	if !relay.ValidTerminalSize(cols, rows) {
+		return fmt.Errorf("invalid terminal size")
+	}
+	select {
+	case <-c.conn.dead:
+		return fmt.Errorf("terminal attachment is closed")
+	default:
+	}
+	return pty.Setsize(c.session.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+}
+
+// Detach releases this local attachment without ending its shared shell.
+func (c *TerminalClient) Detach() { c.session.detach(c.conn) }
+
+// AttachTerminal creates or reattaches a local terminal client. projectRoot is
+// passed through terminal so the same path resolution, policy checks and action
+// fence check run on every local create and reattach as on a browser request.
+func (d *system) AttachTerminal(projectRoot, sessionID string, cols, rows int) (*TerminalClient, error) {
+	if sessionID == "" {
+		return nil, fmt.Errorf("missing session id")
+	}
+	header := relay.StreamHeader{Kind: relay.KindTerminal, Cwd: projectRoot, SessionID: sessionID, Cols: cols, Rows: rows}
+	s, err := d.terminal(header, d.actionTime().Add(terminalLocalActionTO))
+	if err != nil {
+		return nil, err
+	}
+	conn := newLocalTerminalConn()
+	if err := s.attachConn(conn); err != nil {
+		conn.kill()
+		return nil, err
+	}
+	go func() {
+		<-conn.dead
+		s.detach(conn)
+	}()
+	return &TerminalClient{session: s, conn: conn}, nil
+}
+
+// localTerminalConn is a bounded in-memory counterpart to sealedConn. It does
+// not model a network connection or sealing; it only consumes the same encoded
+// fan-out frames, exposing data frames to the local TUI. A blocked consumer is
+// bounded by terminalWriteTO, just as a blocked browser write is.
+type localTerminalConn struct {
+	send    chan []byte
+	output  chan []byte
+	queued  atomic.Int64
+	dead    chan struct{}
+	killOne sync.Once
+}
+
+func newLocalTerminalConn() *localTerminalConn {
+	c := &localTerminalConn{
+		send: make(chan []byte, terminalSendQueue),
+		// Hold one decoded chunk so AttachTerminal can publish the initial replay
+		// before returning without creating a second, unaccounted output backlog.
+		output: make(chan []byte, 1),
+		dead:   make(chan struct{}),
+	}
+	go c.writeLoop()
+	return c
+}
+
+func (c *localTerminalConn) enqueue(frame []byte) bool {
+	select {
+	case <-c.dead:
+		return false
+	default:
+	}
+	if c.queued.Load()+int64(len(frame)) > terminalSendBytes {
+		return false
+	}
+	select {
+	case c.send <- frame:
+		c.queued.Add(int64(len(frame)))
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *localTerminalConn) resync(frame []byte) bool {
+drain:
+	for {
+		select {
+		case stale := <-c.send:
+			c.queued.Add(-int64(len(stale)))
+		default:
+			break drain
+		}
+	}
+	return c.enqueue(frame)
+}
+
+func (c *localTerminalConn) writeLoop() {
+	for {
+		select {
+		case <-c.dead:
+			return
+		case frame := <-c.send:
+			c.queued.Add(-int64(len(frame)))
+			decoded, err := relay.DecodeFrame(frame)
+			if err != nil {
+				c.kill()
+				return
+			}
+			if decoded.Data == nil {
+				continue
+			}
+			timer := time.NewTimer(terminalWriteTO)
+			select {
+			case c.output <- decoded.Data:
+				if !timer.Stop() {
+					<-timer.C
+				}
+			case <-c.dead:
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return
+			case <-timer.C:
+				c.kill()
+				return
+			}
+		}
+	}
+}
+
+func (c *localTerminalConn) kill() {
+	c.killOne.Do(func() { close(c.dead) })
 }
 
 func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
@@ -485,7 +673,7 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 	// Unconditional: the header's dimensions were validated at the top of this
 	// function, so there is no reachable case where they are zero.
 	_ = pty.Setsize(ptmx, &pty.Winsize{Cols: uint16(h.Cols), Rows: uint16(h.Rows)})
-	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[*sealedConn]struct{}), done: make(chan struct{})}
+	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
 	d.terminals[h.SessionID] = s
 	d.addSession(1)
 	d.logf("terminal session started (%s)", d.cfg.Shell)
@@ -523,48 +711,11 @@ func (d *system) enforcePolicy() {
 }
 
 func (s *terminalSession) attach(conn *sealedConn) {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	if err := s.attachConn(conn); err != nil {
+		s.owner.logf("terminal refused: %v", err)
 		conn.kill()
 		return
 	}
-	if s.conns == nil {
-		s.conns = make(map[*sealedConn]struct{})
-	}
-	if len(s.conns) >= maxTerminalConns {
-		s.mu.Unlock()
-		s.owner.logf("terminal refused: session already has %d connections", maxTerminalConns)
-		conn.kill()
-		return
-	}
-	s.conns[conn] = struct{}{}
-	if s.expires != nil {
-		s.expires.Stop()
-		s.expires = nil
-	}
-	// Replaying the bounded terminal history lets an xterm reconstruct the
-	// current display after mobile sleep or a WebView remount. It is queued like
-	// everything else, so it cannot block the lock, and a browser that never
-	// reads it costs this connection alone.
-	//
-	// Neither enqueue can fail here — the connection is new, so its queue is
-	// empty, and the catch-up frame is bounded by terminalReplayBytes, a quarter
-	// of the byte budget. It is still checked, because the failure mode if that
-	// ever stops being true is a browser painting live output onto a screen it
-	// never received, with nothing anywhere saying so.
-	if !conn.enqueue(relay.EncodeData(s.catchUp())) || !conn.enqueue(relay.EncodeActivity(s.active)) {
-		delete(s.conns, conn)
-		// Back to no connections, and attach stopped the timer above — without
-		// re-arming it the session would keep its shell until the process died.
-		if len(s.conns) == 0 && s.expires == nil {
-			s.expires = time.AfterFunc(terminalDetachTTL, s.close)
-		}
-		s.mu.Unlock()
-		conn.kill()
-		return
-	}
-	s.mu.Unlock()
 
 	for {
 		frame, err := conn.stream.ReadFrame()
@@ -590,7 +741,52 @@ func (s *terminalSession) attach(conn *sealedConn) {
 	s.detach(conn)
 }
 
-func (s *terminalSession) detach(conn *sealedConn) {
+// attachConn adds either kind of terminal attachment and queues its initial
+// replay. The caller handles its input path after this returns successfully.
+func (s *terminalSession) attachConn(conn terminalConn) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return fmt.Errorf("terminal session is closed")
+	}
+	if s.conns == nil {
+		s.conns = make(map[terminalConn]struct{})
+	}
+	if len(s.conns) >= maxTerminalConns {
+		s.mu.Unlock()
+		return fmt.Errorf("session already has %d connections", maxTerminalConns)
+	}
+	s.conns[conn] = struct{}{}
+	if s.expires != nil {
+		s.expires.Stop()
+		s.expires = nil
+	}
+	// Replaying the bounded terminal history lets an xterm reconstruct the
+	// current display after mobile sleep or a WebView remount. It is queued like
+	// everything else, so it cannot block the lock, and a browser that never
+	// reads it costs this connection alone.
+	//
+	// Neither enqueue can fail here — the connection is new, so its queue is
+	// empty, and the catch-up frame is bounded by terminalReplayBytes, a quarter
+	// of the byte budget. It is still checked, because the failure mode if that
+	// ever stops being true is a browser painting live output onto a screen it
+	// never received, with nothing anywhere saying so.
+	if !conn.enqueue(relay.EncodeData(s.catchUp())) || !conn.enqueue(relay.EncodeActivity(s.active)) {
+		delete(s.conns, conn)
+		// Back to no connections, and attach stopped the timer above — without
+		// re-arming it the session would keep its shell until the process died.
+		if len(s.conns) == 0 && s.expires == nil {
+			s.expires = time.AfterFunc(terminalDetachTTL, s.close)
+		}
+		s.mu.Unlock()
+		conn.kill()
+		return fmt.Errorf("terminal attachment queue unavailable")
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *terminalSession) detach(conn terminalConn) {
 	conn.kill()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -741,7 +937,7 @@ func (s *terminalSession) output(data []byte) {
 		return
 	}
 	s.replay.append(data)
-	var dropped []*sealedConn
+	var dropped []terminalConn
 	if len(s.conns) > 0 {
 		// Encoded here, under the lock, rather than before it. encodeFrame
 		// copies, and that copy is both what makes readPTY's reusable buffer
@@ -785,8 +981,8 @@ func (s *terminalSession) catchUp() []byte {
 //
 // It also arms the detach TTL when the last connection goes, which is how a
 // session whose every client died eventually reaps itself.
-func (s *terminalSession) broadcast(frame []byte, resendOnResync bool) []*sealedConn {
-	var dropped []*sealedConn
+func (s *terminalSession) broadcast(frame []byte, resendOnResync bool) []terminalConn {
+	var dropped []terminalConn
 	var catchUp []byte
 	for conn := range s.conns {
 		if conn.enqueue(frame) {
@@ -811,7 +1007,7 @@ func (s *terminalSession) broadcast(frame []byte, resendOnResync bool) []*sealed
 	return dropped
 }
 
-func killAll(conns []*sealedConn) {
+func killAll(conns []terminalConn) {
 	for _, conn := range conns {
 		conn.kill()
 	}
