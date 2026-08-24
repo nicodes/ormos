@@ -426,6 +426,208 @@ func TestTerminalSessionBroadcastsToMultipleClients(t *testing.T) {
 	}
 }
 
+// Local attachments deliberately use the same session fan-out as their sealed
+// browser siblings. This is the control comparison: both receive one output
+// from one session, rather than a local attach starting a second shell.
+func TestLocalTerminalClientSharesBrowserSession(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	root := t.TempDir()
+	local, err := d.AttachTerminal(root, "local-shared", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { local.session.close() })
+	if got := string(<-local.Output()); got != terminalResyncPrefix {
+		t.Fatalf("local initial replay = %q, want reset", got)
+	}
+
+	browser, browserClient := sealedPair(t, "local-shared")
+	go local.session.attach(browser)
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatalf("read browser initial replay: %v", err)
+	}
+	if _, err := browserClient.ReadFrame(); err != nil {
+		t.Fatalf("read browser initial activity: %v", err)
+	}
+
+	local.session.output([]byte("shared with both"))
+	if got := string(<-local.Output()); got != "shared with both" {
+		t.Fatalf("local output = %q", got)
+	}
+	frame, err := browserClient.ReadFrame()
+	if err != nil {
+		t.Fatalf("read browser output: %v", err)
+	}
+	if got := string(frame.Data); got != "shared with both" {
+		t.Fatalf("browser output = %q", got)
+	}
+
+	if err := local.Write([]byte("local input\n")); err != nil {
+		t.Fatalf("local input: %v", err)
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case output := <-local.Output():
+			if strings.Contains(string(output), "local input") {
+				goto resized
+			}
+		case <-deadline:
+			t.Fatal("local input did not reach the shared PTY")
+		}
+	}
+
+resized:
+	if err := local.Resize(100, 40); err != nil {
+		t.Fatalf("local resize: %v", err)
+	}
+	rows, cols, err := pty.Getsize(local.session.ptmx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cols != 100 || rows != 40 {
+		t.Fatalf("PTY size = %dx%d, want 100x40", cols, rows)
+	}
+
+	local.Detach()
+	waitConns(t, local.session, 1) // browser remains; detach did not kill the shell.
+	if d.terminals["local-shared"] != local.session {
+		t.Fatal("local detach removed a shell still attached in the browser")
+	}
+}
+
+func TestLocalTerminalClientReplayDetachAndConnectionLimit(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	root := t.TempDir()
+	first, err := d.AttachTerminal(root, "local-limit", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { first.session.close() })
+	<-first.Output() // initial reset
+	first.session.output([]byte("replayed"))
+	if got := string(<-first.Output()); got != "replayed" {
+		t.Fatalf("first output = %q", got)
+	}
+	first.Detach()
+	waitConns(t, first.session, 0)
+	first.session.mu.Lock()
+	armed := first.session.expires != nil
+	first.session.mu.Unlock()
+	if !armed {
+		t.Fatal("last local detach did not arm terminal TTL")
+	}
+
+	reattached, err := d.AttachTerminal(root, "local-limit", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reattached.session != first.session {
+		t.Fatal("local reattach created a duplicate shell")
+	}
+	if got, want := string(<-reattached.Output()), terminalResyncPrefix+"replayed"; got != want {
+		t.Fatalf("local replay = %q, want %q", got, want)
+	}
+	clients := []*TerminalClient{reattached}
+	for len(clients) < maxTerminalConns {
+		client, err := d.AttachTerminal(root, "local-limit", 80, 24)
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-client.Output()
+		clients = append(clients, client)
+	}
+	if _, err := d.AttachTerminal(root, "local-limit", 80, 24); err == nil || !strings.Contains(err.Error(), "connections") {
+		t.Fatalf("connection over limit error = %v, want connection-limit refusal", err)
+	}
+	for _, client := range clients {
+		client.Detach()
+	}
+}
+
+// The browser sibling above proves the same bounded queue design over a sealed
+// transport. This local control proves that an unread local output channel also
+// cannot park the PTY read path and is detached at terminalWriteTO.
+func TestLocalTerminalOutputNeverBlocksOnStalledClient(t *testing.T) {
+	s := &terminalSession{id: "local-stall", done: make(chan struct{})}
+	stalled := newLocalTerminalConn()
+	if got := cap(stalled.output); got != 1 {
+		t.Fatalf("local decoded output queue capacity = %d, want one bounded handoff", got)
+	}
+	if err := s.attachConn(stalled); err != nil {
+		t.Fatal(err)
+	}
+	go func() { <-stalled.dead; s.detach(stalled) }()
+	start := time.Now()
+	for range 150 {
+		s.output(make([]byte, 8<<10))
+	}
+	if elapsed := time.Since(start); elapsed > terminalWriteTO/2 {
+		t.Fatalf("local stalled output took %s; PTY path waited on local client", elapsed)
+	}
+	// Fill the local consumer queue one writer hand-off at a time. This avoids
+	// treating a particular goroutine scheduling pattern during the output burst
+	// as evidence that the write-deadline path is reachable.
+	deadline := time.Now().Add(time.Second)
+	for len(stalled.output) < cap(stalled.output) {
+		if !stalled.enqueue(relay.EncodeData([]byte("x"))) {
+			t.Fatal("could not queue local output while filling its consumer buffer")
+		}
+		for len(stalled.send) != 0 {
+			if time.Now().After(deadline) {
+				t.Fatal("local writer did not consume queued output")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if !stalled.enqueue(relay.EncodeData([]byte("x"))) {
+		t.Fatal("could not queue output that should block the local writer")
+	}
+	select {
+	case <-stalled.dead:
+	case <-time.After(terminalWriteTO + time.Second):
+		t.Fatal("stalled local client was not detached at the write deadline")
+	}
+	waitConns(t, s, 0)
+	s.mu.Lock()
+	if s.expires != nil {
+		s.expires.Stop()
+	}
+	s.mu.Unlock()
+}
+
+func TestLocalTerminalClientRechecksPolicyOnReattach(t *testing.T) {
+	dir := withTempConfigDir(t)
+	allowed := filepath.Join(dir, "allowed")
+	if err := os.Mkdir(allowed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(fmt.Sprintf(`{"allowedRoots":[%q]}`, allowed)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	if _, err := d.AttachTerminal(t.TempDir(), "local-policy", 80, 24); err == nil {
+		t.Fatal("local create outside allowedRoots succeeded")
+	}
+	client, err := d.AttachTerminal(allowed, "local-policy", 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.session.close() })
+	<-client.Output()
+	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(`{"terminalsDisabled":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.AttachTerminal(allowed, "local-policy", 80, 24); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("policy-denied reattach error = %v", err)
+	}
+	if d.terminals["local-policy"] != client.session {
+		t.Fatal("policy denial removed the existing terminal")
+	}
+}
+
 // A session's id can be asked for with any cwd on the header: the requested
 // directory passes the policy check, then the lookup returns a shell rooted
 // somewhere the policy would never have allowed. Reattach has to re-decide
