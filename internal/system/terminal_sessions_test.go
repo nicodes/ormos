@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -733,6 +735,186 @@ func TestLocalTerminalWriteBoundsInputByBytes(t *testing.T) {
 	case <-conn.inputDone:
 	case <-time.After(time.Second):
 		t.Fatal("detach did not release bounded local input worker")
+	}
+}
+
+func TestLocalTerminalWriteReservesCallsAndBytesBeforeCopy(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	fd := int(inputWrite.Fd())
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, err := unix.Write(fd, make([]byte, 4<<10))
+		if err == unix.EAGAIN {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		t.Fatal(err)
+	}
+	s := &terminalSession{ptmx: inputWrite, done: make(chan struct{})}
+	conn := newLocalTerminalConn()
+	go conn.inputLoop(s)
+	client := &TerminalClient{session: s, conn: conn}
+	var copied atomic.Int64
+	conn.copyInput = func(p []byte) []byte {
+		copied.Add(1)
+		return append([]byte(nil), p...)
+	}
+	if err := client.Write([]byte("x")); err != nil {
+		t.Fatalf("initial in-flight input: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(conn.input) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("input worker did not take the in-flight call")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	var accepted atomic.Int64
+	accepted.Add(1) // the worker holds this first call in the exact bound.
+	var group sync.WaitGroup
+	for range 2 * terminalInputQueue {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			if client.Write([]byte("x")) == nil {
+				accepted.Add(1)
+			}
+		}()
+	}
+	group.Wait()
+	if got := accepted.Load(); got != terminalInputQueue {
+		t.Fatalf("accepted local input calls = %d, want exact bound %d", got, terminalInputQueue)
+	}
+	if got := copied.Load(); got != accepted.Load() {
+		t.Fatalf("implementation copies = %d, accepted calls = %d; rejected calls allocated", got, accepted.Load())
+	}
+	if got := conn.inputCalls.Load(); got != terminalInputQueue {
+		t.Fatalf("reserved local input calls = %d, want %d", got, terminalInputQueue)
+	}
+	if got := conn.inputBytes.Load(); got != terminalInputQueue {
+		t.Fatalf("reserved local input bytes = %d, want %d", got, terminalInputQueue)
+	}
+	conn.kill()
+	<-conn.inputDone
+}
+
+func TestLocalTerminalWriteRejectsOversizedInputWithoutCopy(t *testing.T) {
+	conn := newLocalTerminalConn()
+	client := &TerminalClient{conn: conn}
+	var copied atomic.Int64
+	conn.copyInput = func(p []byte) []byte {
+		copied.Add(1)
+		return append([]byte(nil), p...)
+	}
+	err := client.Write(make([]byte, min(relay.MaxFrameSize, terminalInputBytes)+1))
+	if !errors.Is(err, ErrTerminalInputTooLarge) {
+		t.Fatalf("oversized local input error = %v, want ErrTerminalInputTooLarge", err)
+	}
+	if errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatal("oversized input matched retryable ErrTerminalInputBackpressure")
+	}
+	if got := copied.Load(); got != 0 {
+		t.Fatalf("oversized input made %d implementation copies", got)
+	}
+	conn.kill()
+}
+
+func TestLocalTerminalWriteAdmissionIsOrderedWithDetach(t *testing.T) {
+	conn := newLocalTerminalConn()
+	client := &TerminalClient{conn: conn}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	conn.beforeInputCopy = func() {
+		close(entered)
+		<-release
+	}
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- client.Write([]byte("accepted before detach")) }()
+	<-entered // reservation and the inputMu ownership are now established.
+	detached := make(chan struct{})
+	go func() { conn.kill(); close(detached) }()
+	select {
+	case <-detached:
+		t.Fatal("detach passed a Write already holding admission")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if err := <-writeDone; err != nil {
+		t.Fatalf("Write admitted before detach = %v", err)
+	}
+	<-detached
+	if err := client.Write([]byte("after detach")); !errors.Is(err, ErrTerminalClientClosed) {
+		t.Fatalf("Write after detach = %v, want ErrTerminalClientClosed", err)
+	}
+}
+
+// A browser can consume POLLOUT after the local worker's first poll. The second
+// poll must run while inputMu is held, or the following <= PIPE_BUF write can
+// block under that lock. A real pipe supplies the readiness semantics; the
+// callback represents the sibling master writer in the stale interval.
+func TestLocalTerminalRechecksWritableWhileHoldingInputLock(t *testing.T) {
+	inputRead, inputWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inputRead.Close(); _ = inputWrite.Close() })
+	fd := int(inputWrite.Fd())
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		_, err := unix.Write(fd, make([]byte, 4<<10))
+		if err == unix.EAGAIN {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(inputRead, make([]byte, 4<<10)); err != nil {
+		t.Fatalf("make pipe writable for initial poll: %v", err)
+	}
+	s := &terminalSession{ptmx: inputWrite, done: make(chan struct{})}
+	conn := newLocalTerminalConn()
+	consumed := make(chan struct{})
+	var once sync.Once
+	conn.beforeInputRecheck = func() {
+		once.Do(func() {
+			if _, err := unix.Write(fd, make([]byte, 4<<10)); err != nil {
+				t.Errorf("consume stale POLLOUT: %v", err)
+			}
+			close(consumed)
+		})
+	}
+	go conn.inputLoop(s)
+	client := &TerminalClient{session: s, conn: conn}
+	if err := client.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	<-consumed
+	time.Sleep(2 * terminalInputPollWindow)
+	if !s.inputMu.TryLock() {
+		t.Fatal("stale POLLOUT let local input hold inputMu in a blocking write")
+	}
+	s.inputMu.Unlock()
+	conn.kill()
+	select {
+	case <-conn.inputDone:
+	case <-time.After(time.Second):
+		t.Fatal("detach did not release stale-readiness input worker")
 	}
 }
 
