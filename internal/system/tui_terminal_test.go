@@ -212,6 +212,18 @@ func TestTerminalScreenIgnoresStaleAttachAfterDetach(t *testing.T) {
 	}
 }
 
+func TestTerminalScreenDetachesSupersededClient(t *testing.T) {
+	m, client, _ := openTestTerminal(t)
+	next, command := m.Update(terminalCreatedMsg{
+		projectID: "project-a", projectRoot: "/alpha", sessionID: "new-tab",
+	})
+	m = next.(model)
+	_, _, detached := client.snapshot()
+	if detached != 1 || m.mode != modeTerminal || m.term == nil || m.term.label != "new-tab" || command == nil {
+		t.Fatalf("superseded terminal detach=%d mode=%v terminal=%#v command=%v", detached, m.mode, m.term, command != nil)
+	}
+}
+
 func TestTerminalScreenAttachFailureReturnsSafely(t *testing.T) {
 	m := terminalDashboard(t)
 	oldAttach := attachTerminalScreen
@@ -260,6 +272,74 @@ func TestTerminalScreenRetriesBackpressureAndReturnsErrorsSafely(t *testing.T) {
 	}
 }
 
+func TestTerminalScreenTracksModesAndEncodesPasteAndCursor(t *testing.T) {
+	m, _, _ := openTestTerminal(t)
+	generation := m.term.generation
+	next, _ := m.Update(terminalOutputMsg{
+		generation: generation,
+		data:       []byte("\x1b[?1h\x1b[?2004h"),
+	})
+	m = next.(model)
+	if !m.term.applicationCursor || !m.term.bracketedPaste {
+		t.Fatalf("enabled modes cursor=%v paste=%v", m.term.applicationCursor, m.term.bracketedPaste)
+	}
+	if got := string(terminalKeyBytes(tea.KeyMsg{Type: tea.KeyUp}, m.term.applicationCursor, m.term.bracketedPaste)); got != "\x1bOA" {
+		t.Fatalf("application cursor = %q", got)
+	}
+	paste := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("echo one\necho two"), Paste: true}
+	if got := string(terminalKeyBytes(paste, m.term.applicationCursor, m.term.bracketedPaste)); got != "\x1b[200~echo one\necho two\x1b[201~" {
+		t.Fatalf("bracketed paste = %q", got)
+	}
+
+	next, _ = m.Update(terminalOutputMsg{
+		generation: generation,
+		data:       []byte("\x1b[?1l\x1b[?2004l"),
+	})
+	m = next.(model)
+	if m.term.applicationCursor || m.term.bracketedPaste {
+		t.Fatalf("disabled modes cursor=%v paste=%v", m.term.applicationCursor, m.term.bracketedPaste)
+	}
+	if got := string(terminalKeyBytes(paste, false, false)); got != "echo one\necho two" {
+		t.Fatalf("plain paste = %q", got)
+	}
+}
+
+func TestTerminalScreenClampsEmulatorAndSerializesDeviceResponses(t *testing.T) {
+	m, client, _ := openTestTerminal(t)
+	generation := m.term.generation
+	next, firstWrite := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = next.(model)
+	next, _ = m.Update(terminalOutputMsg{
+		generation: generation,
+		data:       []byte("\x1b[999dX\x1b[999L"),
+	})
+	m = next.(model)
+	if m.term.emulator.Height != 27 || m.term.emulator.Width != 80 {
+		t.Fatalf("emulator grew to %dx%d", m.term.emulator.Width, m.term.emulator.Height)
+	}
+	view := m.View()
+	if strings.Count(view, "\n")+1 != 30 || !strings.Contains(view, "ormos terminal") || !strings.Contains(view, "Ctrl-G: dashboard") {
+		t.Fatalf("grown terminal hid chrome:\n%s", view)
+	}
+	next, _ = m.Update(terminalOutputMsg{generation: generation, data: []byte("\x1b[6n\x1b[c")})
+	m = next.(model)
+	if len(m.term.input) != 2 || string(m.term.input[0]) != "x" || string(m.term.input[1]) != "\x1b[27;2R\x1b[?62;22c" {
+		t.Fatalf("serialized input = %q", m.term.input)
+	}
+
+	next, secondWrite := m.Update(firstWrite())
+	m = next.(model)
+	if secondWrite == nil {
+		t.Fatal("device response was not scheduled after keyboard input")
+	}
+	next, _ = m.Update(secondWrite())
+	m = next.(model)
+	writes, _, _ := client.snapshot()
+	if len(writes) != 2 || string(writes[0]) != "x" || string(writes[1]) != "\x1b[27;2R\x1b[?62;22c" {
+		t.Fatalf("device response writes = %q", writes)
+	}
+}
+
 func TestTerminalKeyBytes(t *testing.T) {
 	tests := []struct {
 		name string
@@ -284,7 +364,7 @@ func TestTerminalKeyBytes(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := string(terminalKeyBytes(test.key)); got != test.want {
+			if got := string(terminalKeyBytes(test.key, false, false)); got != test.want {
 				t.Fatalf("encoded = %q, want %q", got, test.want)
 			}
 		})
