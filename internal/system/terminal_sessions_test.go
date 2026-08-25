@@ -11,6 +11,7 @@ import (
 	"go/token"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,50 @@ import (
 	"github.com/nicodes/ormos/relay"
 	"golang.org/x/sys/unix"
 )
+
+func runningTerminalInfo(id string) relay.TerminalSessionInfo {
+	return relay.TerminalSessionInfo{ID: id, SessionID: id, State: relay.TerminalStateRunning, Generation: 1}
+}
+
+func TestLifecycleTerminalValidationControlsPTYCreation(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	for _, tc := range []struct {
+		name, state string
+		generation  int
+		wantCreate  bool
+	}{
+		{"missing record", "running", 1, false},
+		{"exited", relay.TerminalStateExited, 1, false},
+		{"stale generation", relay.TerminalStateRunning, 2, false},
+		{"valid running sibling", relay.TerminalStateRunning, 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withTempConfigDir(t)
+			d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/cat"})
+			httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				row := `{"id":"record","session_id":"session","state":"` + tc.state + `","generation":` + fmt.Sprint(tc.generation) + `}`
+				if tc.name == "missing record" {
+					row = `{"id":"other","session_id":"session","state":"running","generation":1}`
+				}
+				return testHTTPResponse(http.StatusOK, `{"sessions":[`+row+`]}`), nil
+			})}
+			h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, Cwd: t.TempDir(), SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+			s, err := d.terminal(h, acceptedFenceDeadline(t, h))
+			if (err == nil) != tc.wantCreate {
+				t.Fatalf("err=%v wantCreate=%v", err, tc.wantCreate)
+			}
+			if tc.wantCreate {
+				if s == nil {
+					t.Fatal("valid lifecycle row did not create PTY")
+				}
+				s.close()
+			} else if len(d.terminals) != 0 {
+				t.Fatalf("refused request created %d PTYs", len(d.terminals))
+			}
+		})
+	}
+}
 
 // sealedPair builds both ends of one sealed connection over a net.Pipe, the way
 // handleTerminal does after the client hello: the agent seals with
@@ -439,7 +484,7 @@ func TestLocalTerminalClientSharesBrowserSession(t *testing.T) {
 	withTempConfigDir(t)
 	d := newSystem(systemConfig{Shell: "/bin/cat"})
 	root := t.TempDir()
-	local, err := d.AttachTerminal(root, "local-shared", 80, 24)
+	local, err := d.AttachTerminal(root, runningTerminalInfo("local-shared"), 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,7 +570,8 @@ func TestLocalTerminalCreationUsesTerminalSessionLimit(t *testing.T) {
 	root := t.TempDir()
 	clients := make([]*TerminalClient, 0, maxTerminalSessions)
 	for i := range maxTerminalSessions {
-		client, err := d.AttachTerminal(root, fmt.Sprintf("local-session-%d", i), 80, 24)
+		id := fmt.Sprintf("local-session-%d", i)
+		client, err := d.AttachTerminal(root, runningTerminalInfo(id), 80, 24)
 		if err != nil {
 			t.Fatalf("local session %d: %v", i, err)
 		}
@@ -537,7 +583,7 @@ func TestLocalTerminalCreationUsesTerminalSessionLimit(t *testing.T) {
 			client.session.close()
 		}
 	})
-	if _, err := d.AttachTerminal(root, "local-session-over-limit", 80, 24); err == nil || !strings.Contains(err.Error(), "session limit") {
+	if _, err := d.AttachTerminal(root, runningTerminalInfo("local-session-over-limit"), 80, 24); err == nil || !strings.Contains(err.Error(), "session limit") {
 		t.Fatalf("local session limit error = %v", err)
 	}
 
@@ -554,7 +600,7 @@ func TestLocalTerminalClientReplayDetachAndConnectionLimit(t *testing.T) {
 	withTempConfigDir(t)
 	d := newSystem(systemConfig{Shell: "/bin/cat"})
 	root := t.TempDir()
-	first, err := d.AttachTerminal(root, "local-limit", 80, 24)
+	first, err := d.AttachTerminal(root, runningTerminalInfo("local-limit"), 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -573,7 +619,7 @@ func TestLocalTerminalClientReplayDetachAndConnectionLimit(t *testing.T) {
 		t.Fatal("last local detach did not arm terminal TTL")
 	}
 
-	reattached, err := d.AttachTerminal(root, "local-limit", 100, 40)
+	reattached, err := d.AttachTerminal(root, runningTerminalInfo("local-limit"), 100, 40)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,14 +638,14 @@ func TestLocalTerminalClientReplayDetachAndConnectionLimit(t *testing.T) {
 	}
 	clients := []*TerminalClient{reattached}
 	for len(clients) < maxTerminalConns {
-		client, err := d.AttachTerminal(root, "local-limit", 80, 24)
+		client, err := d.AttachTerminal(root, runningTerminalInfo("local-limit"), 80, 24)
 		if err != nil {
 			t.Fatal(err)
 		}
 		<-client.Output()
 		clients = append(clients, client)
 	}
-	if _, err := d.AttachTerminal(root, "local-limit", 80, 24); err == nil || !strings.Contains(err.Error(), "connections") {
+	if _, err := d.AttachTerminal(root, runningTerminalInfo("local-limit"), 80, 24); err == nil || !strings.Contains(err.Error(), "connections") {
 		t.Fatalf("connection over limit error = %v, want connection-limit refusal", err)
 	}
 	for _, client := range clients {
@@ -1094,7 +1140,7 @@ func TestPTYMasterRemainsNonblockingAcrossTerminalIOCTLS(t *testing.T) {
 func TestCreatedPTYRemainsNonblockingAcrossLocalAndBrowserResize(t *testing.T) {
 	withTempConfigDir(t)
 	d := newSystem(systemConfig{Shell: "/bin/cat"})
-	local, err := d.AttachTerminal(t.TempDir(), "nonblock-resize", 80, 24)
+	local, err := d.AttachTerminal(t.TempDir(), runningTerminalInfo("nonblock-resize"), 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1769,10 +1815,10 @@ func TestLocalTerminalClientRechecksPolicyOnReattach(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := newSystem(systemConfig{Shell: "/bin/cat"})
-	if _, err := d.AttachTerminal(t.TempDir(), "local-policy", 80, 24); err == nil {
+	if _, err := d.AttachTerminal(t.TempDir(), runningTerminalInfo("local-policy"), 80, 24); err == nil {
 		t.Fatal("local create outside allowedRoots succeeded")
 	}
-	client, err := d.AttachTerminal(allowed, "local-policy", 80, 24)
+	client, err := d.AttachTerminal(allowed, runningTerminalInfo("local-policy"), 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1781,7 +1827,7 @@ func TestLocalTerminalClientRechecksPolicyOnReattach(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "policy.json"), []byte(`{"terminalsDisabled":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.AttachTerminal(allowed, "local-policy", 80, 24); err == nil || !strings.Contains(err.Error(), "disabled") {
+	if _, err := d.AttachTerminal(allowed, runningTerminalInfo("local-policy"), 80, 24); err == nil || !strings.Contains(err.Error(), "disabled") {
 		t.Fatalf("policy-denied reattach error = %v", err)
 	}
 	if d.terminals["local-policy"] != client.session {

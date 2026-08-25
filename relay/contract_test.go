@@ -57,6 +57,10 @@ func TestControlPlaneDTOTagsArePinnedToLiteralPayloads(t *testing.T) {
 		assertLiteralJSON(t, `{"id":"terminal-1","project_id":"proj-1","project_name":"ormos","session_id":"session-1"}`,
 			TerminalSessionInfo{ID: "terminal-1", ProjectID: "proj-1", ProjectName: "ormos", SessionID: "session-1"})
 	})
+	t.Run("TerminalSessionInfo lifecycle", func(t *testing.T) {
+		assertLiteralJSON(t, `{"id":"record","project_id":"proj-1","project_name":"ormos","session_id":"session-1","state":"running","generation":3}`,
+			TerminalSessionInfo{ID: "record", ProjectID: "proj-1", ProjectName: "ormos", SessionID: "session-1", State: TerminalStateRunning, Generation: 3})
+	})
 	t.Run("PortEntry", func(t *testing.T) {
 		assertLiteralJSON(t, `{"id":"port-1","port":8080,"label":"web"}`,
 			PortEntry{ID: "port-1", Port: 8080, Label: "web"})

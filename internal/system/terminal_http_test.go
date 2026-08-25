@@ -9,10 +9,75 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nicodes/ormos/relay"
 )
+
+func TestTerminalExitReportRetriesExactGenerationAndCancels(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	var requests int
+	seen := make(chan int, 1)
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/system/terminal-sessions/retry-record-unique/exit" {
+			return testHTTPResponse(http.StatusNotFound, ""), nil
+		}
+		requests++
+		if requests == 1 {
+			return nil, errors.New("temporary")
+		}
+		var body struct {
+			Generation int `json:"generation"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		seen <- body.Generation
+		return testHTTPResponse(http.StatusNoContent, ""), nil
+	})}
+	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}}
+	d.reportTerminalExit("retry-record-unique", 17)
+	select {
+	case got := <-seen:
+		if got != 17 {
+			t.Fatalf("generation=%d", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("exit report did not retry")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	d.mu.Lock()
+	d.runCtx = ctx
+	d.mu.Unlock()
+	requests = 0
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/system/terminal-sessions/retry-record-unique/exit" {
+			return testHTTPResponse(http.StatusNotFound, ""), nil
+		}
+		requests++
+		startedOnce.Do(func() { close(started) })
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})}
+	d.reportTerminalExit("retry-record-unique", 18)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation test request did not start")
+	}
+	cancel()
+	count := requests
+	time.Sleep(100 * time.Millisecond)
+	if requests != count {
+		t.Fatalf("cancellation did not stop retries: %d -> %d", count, requests)
+	}
+}
 
 func TestTerminalSessionHTTPWireShape(t *testing.T) {
 	oldClient := httpClient
@@ -38,7 +103,7 @@ func TestTerminalSessionHTTPWireShape(t *testing.T) {
 			if len(body) != 2 || body["project_id"] != "project" || body["session_id"] != strings.Repeat("A", 24) {
 				t.Fatalf("POST body = %#v; want exact snake-case fields", body)
 			}
-			return testHTTPResponse(http.StatusOK, `{"id":"record"}`), nil
+			return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project","session_id":"AAAAAAAAAAAAAAAAAAAAAAAA","state":"running","generation":1}`), nil
 		default:
 			t.Fatalf("method = %s", req.Method)
 			return nil, nil
@@ -64,8 +129,8 @@ func TestTerminalSessionHTTPWireShape(t *testing.T) {
 		return len(p), nil
 	}
 	// Eighteen zero bytes encode as 24 'A' characters in raw base64url.
-	if id, err := d.createTerminalSession(context.Background(), "project"); err != nil || id != strings.Repeat("A", 24) {
-		t.Fatalf("create = %q, %v", id, err)
+	if info, err := d.createTerminalSession(context.Background(), "project"); err != nil || info.ID != "record" || info.SessionID != strings.Repeat("A", 24) {
+		t.Fatalf("create = %+v, %v", info, err)
 	}
 	if requests != 2 {
 		t.Fatalf("requests = %d, want GET + POST", requests)
@@ -90,12 +155,12 @@ func TestTerminalSessionCreateRetriesOnlyExplicitConflict(t *testing.T) {
 		if requests == 1 {
 			return testHTTPResponse(http.StatusConflict, `{"error":"duplicate"}`), nil
 		}
-		return testHTTPResponse(http.StatusOK, `{"id":"record"}`), nil
+		return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project","session_id":"session","state":"running","generation":1}`), nil
 	})}
 	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}}
-	id, err := d.createTerminalSession(context.Background(), "project")
-	if err != nil || id == "" || requests != 2 || randomCalls != 2 {
-		t.Fatalf("explicit conflict: id=%q err=%v requests=%d random=%d", id, err, requests, randomCalls)
+	info, err := d.createTerminalSession(context.Background(), "project")
+	if err != nil || info.ID == "" || requests != 2 || randomCalls != 2 {
+		t.Fatalf("explicit conflict: info=%+v err=%v requests=%d random=%d", info, err, requests, randomCalls)
 	}
 
 	for name, transport := range map[string]roundTripFunc{

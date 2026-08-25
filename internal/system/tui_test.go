@@ -37,8 +37,8 @@ func terminalDashboard(t *testing.T) model {
 		{ID: "project-a", Name: "alpha", RootDir: "/alpha", Ports: []relay.PortEntry{{ID: "port-a", Port: 3000}}},
 	}})
 	next, _ = next.(model).Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
-		{ID: "record-b", ProjectID: "project-a", SessionID: "z-tab"},
-		{ID: "record-a", ProjectID: "project-a", SessionID: "a-tab"},
+		{ID: "record-b", ProjectID: "project-a", SessionID: "z-tab", State: relay.TerminalStateRunning, Generation: 1},
+		{ID: "record-a", ProjectID: "project-a", SessionID: "a-tab", State: relay.TerminalStateRunning, Generation: 1},
 	}})
 	return next.(model)
 }
@@ -60,13 +60,13 @@ func TestTerminalRowsAndSanitizedLabels(t *testing.T) {
 
 	raw := "\x1b]0;owned\a"
 	next, _ := m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{
-		ID: "record", ProjectID: "project-a", SessionID: raw,
+		ID: "record", ProjectID: "project-a", SessionID: raw, State: relay.TerminalStateRunning, Generation: 1,
 	}}})
 	m = next.(model)
 	if m.terminals[0].info.SessionID != raw || m.terminals[0].label != "]0;owned" {
 		t.Fatalf("terminal = raw %q label %q", m.terminals[0].info.SessionID, m.terminals[0].label)
 	}
-	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{ProjectID: "project-a", SessionID: "\x00\a"}}})
+	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{ID: "record", ProjectID: "project-a", SessionID: "\x00\a", State: relay.TerminalStateRunning, Generation: 1}}})
 	if got := next.(model).terminals[0].label; got != "terminal" {
 		t.Fatalf("empty sanitized label = %q", got)
 	}
@@ -90,9 +90,9 @@ func TestCursorUsesDurableIdentityAcrossRefreshes(t *testing.T) {
 		t.Fatalf("project refresh selected %#v", r)
 	}
 	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
-		{ProjectID: "project-a", SessionID: "0-new"},
-		{ProjectID: "project-a", SessionID: "z-tab"},
-		{ProjectID: "project-a", SessionID: "zz-after"},
+		{ID: "new", ProjectID: "project-a", SessionID: "0-new", State: relay.TerminalStateRunning, Generation: 1},
+		{ID: "record-b", ProjectID: "project-a", SessionID: "z-tab", State: relay.TerminalStateRunning, Generation: 1},
+		{ID: "after", ProjectID: "project-a", SessionID: "zz-after", State: relay.TerminalStateRunning, Generation: 1},
 	}})
 	m = next.(model)
 	if r, _ := m.selectedRow(); r.kind != rowTerminal || r.itemID != "z-tab" {
@@ -100,8 +100,8 @@ func TestCursorUsesDurableIdentityAcrossRefreshes(t *testing.T) {
 	}
 
 	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
-		{ProjectID: "project-a", SessionID: "0-new"},
-		{ProjectID: "project-a", SessionID: "zz-after"},
+		{ID: "new", ProjectID: "project-a", SessionID: "0-new", State: relay.TerminalStateRunning, Generation: 1},
+		{ID: "after", ProjectID: "project-a", SessionID: "zz-after", State: relay.TerminalStateRunning, Generation: 1},
 	}})
 	m = next.(model)
 	if r, _ := m.selectedRow(); r.kind != rowAddTerminal || r.projectID != "project-a" {
@@ -119,10 +119,10 @@ func TestTerminalCreationPersistsBeforeAttach(t *testing.T) {
 	})
 	client := newFakeTerminalAttachment()
 	attached := 0
-	attachTerminalScreen = func(_ *system, root, key string, cols, rows int) (terminalAttachment, error) {
+	attachTerminalScreen = func(_ *system, root string, info relay.TerminalSessionInfo, cols, rows int) (terminalAttachment, error) {
 		attached++
-		if root != "/alpha" || !strings.HasPrefix(key, "project-a:") || cols != 80 || rows != 27 {
-			t.Fatalf("attach root=%q key=%q size=%dx%d", root, key, cols, rows)
+		if root != "/alpha" || info.ID != "record" || info.State != relay.TerminalStateRunning || info.Generation != 1 || cols != 80 || rows != 27 {
+			t.Fatalf("attach root=%q info=%+v size=%dx%d", root, info, cols, rows)
 		}
 		return client, nil
 	}
@@ -131,12 +131,12 @@ func TestTerminalCreationPersistsBeforeAttach(t *testing.T) {
 		if req.Method != http.MethodPost {
 			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
 		}
-		return testHTTPResponse(http.StatusOK, `{"id":"record"}`), nil
+		return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project-a","session_id":"AAAAAAAAAAAAAAAAAAAAAAAA","state":"running","generation":1}`), nil
 	})}
 	m.cursor = rowIndex(m.rows, rowAddTerminal, "project-a", "")
 	_, createCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	created, ok := createCmd().(terminalCreatedMsg)
-	if !ok || created.err != nil || created.projectID != "project-a" || created.sessionID == "" {
+	if !ok || created.err != nil || created.info.ID != "record" || created.info.SessionID == "" {
 		t.Fatalf("create command = %#v", created)
 	}
 	next, startCmd := m.Update(created)

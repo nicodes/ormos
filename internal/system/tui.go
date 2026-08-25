@@ -99,8 +99,9 @@ type terminalsMsg struct {
 // terminalCreatedMsg starts the interactive attachment only after persistence
 // has succeeded.
 type terminalCreatedMsg struct {
-	projectID, projectRoot, sessionID string
-	err                               error
+	projectRoot string
+	info        relay.TerminalSessionInfo
+	err         error
 }
 
 var terminalSessionsCommand = func(d *system) tea.Cmd {
@@ -294,8 +295,8 @@ func (m model) createTerminalCmd(p relay.ProjectInfo) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		sessionID, err := d.createTerminalSession(ctx, p.ID)
-		return terminalCreatedMsg{projectID: p.ID, projectRoot: p.RootDir, sessionID: sessionID, err: err}
+		info, err := d.createTerminalSession(ctx, p.ID)
+		return terminalCreatedMsg{projectRoot: p.RootDir, info: info, err: err}
 	}
 }
 
@@ -390,7 +391,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = ""
 		m.notice = "terminal created"
-		m, attach := m.startTerminal(msg.projectRoot, msg.projectID+":"+msg.sessionID, msg.sessionID)
+		m, attach := m.startTerminal(msg.projectRoot, msg.info, msg.info.SessionID)
 		return m, tea.Batch(
 			tea.DisableMouse,
 			m.terminalsCmd(),
@@ -536,7 +537,20 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case rowTerminal:
 				p := m.projects[r.projectIdx]
 				tab := m.terminals[r.terminalIdx]
-				m, attach := m.startTerminal(p.RootDir, p.ID+":"+tab.info.SessionID, tab.label)
+				if tab.info.State == relay.TerminalStateExited {
+					recordID := tab.info.ID
+					return m, func() tea.Msg {
+						ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+						defer cancel()
+						info, err := m.d.restartTerminalSession(ctx, recordID)
+						return terminalCreatedMsg{projectRoot: p.RootDir, info: info, err: err}
+					}
+				}
+				if tab.info.State != "" && tab.info.State != relay.TerminalStateRunning {
+					m.err = "terminal is closing"
+					return m, nil
+				}
+				m, attach := m.startTerminal(p.RootDir, tab.info, tab.label)
 				return m, tea.Batch(tea.DisableMouse, attach)
 			case rowAddTerminal:
 				m.notice = ""
@@ -580,6 +594,9 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				port := m.projects[r.projectIdx].Ports[r.portIdx]
 				m.notice = ""
 				return m, mutateCmd(fmt.Sprintf("removed :%d", port.Port), func(ctx context.Context) error { return m.d.deletePort(ctx, port.ID) })
+			case rowTerminal:
+				tab := m.terminals[r.terminalIdx]
+				return m, mutateCmd("deleted terminal", func(ctx context.Context) error { return m.d.deleteTerminalSession(ctx, tab.info.ID) })
 			}
 		}
 	}
@@ -835,7 +852,14 @@ func (m model) View() string {
 			summary := labelStyle.Render(portSummary(p, m.live))
 			b.WriteString(cursor + name + " " + dirStyle.Render(pad(p.RootDir, 32)) + " " + summary + "\n")
 		case rowTerminal:
-			label := m.terminals[r.terminalIdx].label
+			tab := m.terminals[r.terminalIdx]
+			label := tab.label
+			if tab.info.State == relay.TerminalStateExited {
+				label += " (exited)"
+			}
+			if tab.info.State == relay.TerminalStateClosing {
+				label += " (closing)"
+			}
 			if i == m.cursor {
 				label = selStyle.Render(label)
 			}

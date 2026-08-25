@@ -125,6 +125,7 @@ func (d *system) serveStream(stream net.Conn) {
 		d.logf("shutdown requested by relay; exiting")
 	case relay.KindEvent:
 		d.notifyEvent() // upstream data changed (web UI); TUI refetches
+		d.reconcileTerminalSessions()
 	default:
 		d.logf("unknown stream kind %q", header.Kind)
 	}
