@@ -6,7 +6,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +21,17 @@ import (
 	"github.com/coder/websocket"
 	"github.com/nicodes/ormos/relay"
 )
+
+var terminalSessionRandom = rand.Read
+
+const terminalSessionCreateAttempts = 8
+
+type relayHTTPError struct {
+	statusCode int
+	message    string
+}
+
+func (e *relayHTTPError) Error() string { return e.message }
 
 // PortStatus is one configured exposed port for this system, with whether it
 // is currently being served (a local process is listening on it).
@@ -428,9 +442,9 @@ func (d *system) relayDo(ctx context.Context, method, path string, body any) ([]
 			Error string `json:"error"`
 		}
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return nil, fmt.Errorf("%s", e.Error)
+			return nil, &relayHTTPError{statusCode: resp.StatusCode, message: e.Error}
 		}
-		return nil, fmt.Errorf("relay returned %s", resp.Status)
+		return nil, &relayHTTPError{statusCode: resp.StatusCode, message: fmt.Sprintf("relay returned %s", resp.Status)}
 	}
 	return data, nil
 }
@@ -467,6 +481,58 @@ func (d *system) fetchProjects(ctx context.Context) ([]relay.ProjectInfo, error)
 		return nil, err
 	}
 	return out.Projects, nil
+}
+
+// fetchTerminalSessions lists the persisted terminal tabs for this system.
+func (d *system) fetchTerminalSessions(ctx context.Context) ([]relay.TerminalSessionInfo, error) {
+	data, err := d.relayDo(ctx, http.MethodGet, "/system/terminal-sessions", nil)
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Sessions []relay.TerminalSessionInfo `json:"sessions"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	return out.Sessions, nil
+}
+
+// createTerminalSession persists a new terminal tab before any local PTY is
+// attached. A transport failure is deliberately not retried: the relay may
+// have committed the record before the connection failed. Only an explicit
+// duplicate response proves that generating a fresh id is safe.
+func (d *system) createTerminalSession(ctx context.Context, projectID string) (string, error) {
+	for range terminalSessionCreateAttempts {
+		sessionID, err := newTerminalSessionID()
+		if err != nil {
+			return "", fmt.Errorf("generate terminal session id: %w", err)
+		}
+		_, err = d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions", struct {
+			ProjectID string `json:"project_id"`
+			SessionID string `json:"session_id"`
+		}{ProjectID: projectID, SessionID: sessionID})
+		if err == nil {
+			return sessionID, nil
+		}
+		var httpErr *relayHTTPError
+		if !errors.As(err, &httpErr) || httpErr.statusCode != http.StatusConflict {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("could not allocate a unique terminal session id")
+}
+
+func newTerminalSessionID() (string, error) {
+	var raw [18]byte // 144 random bits; base64url encodes without punctuation or padding.
+	n, err := terminalSessionRandom(raw[:])
+	if err != nil {
+		return "", err
+	}
+	if n != len(raw) {
+		return "", io.ErrUnexpectedEOF
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
 }
 
 // createProject creates a project and returns nothing but an error.
