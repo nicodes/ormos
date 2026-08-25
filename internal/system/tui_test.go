@@ -4,6 +4,9 @@ package system
 
 import (
 	"errors"
+	"net/http"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode"
@@ -11,6 +14,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/nicodes/ormos/relay"
 )
 
@@ -22,6 +26,317 @@ func sized(t *testing.T, d *system, w, h int) model {
 	m, _ := newModel(d).Update(tea.WindowSizeMsg{Width: w, Height: h})
 	m, _ = m.(model).Update(tickMsg{})
 	return m.(model)
+}
+
+func terminalDashboard(t *testing.T) model {
+	t.Helper()
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	m := sized(t, d, 80, 30)
+	next, _ := m.Update(projectsMsg{projects: []relay.ProjectInfo{
+		{ID: "project-b", Name: "bravo", RootDir: "/bravo", Ports: []relay.PortEntry{{ID: "port-b", Port: 4000}}},
+		{ID: "project-a", Name: "alpha", RootDir: "/alpha", Ports: []relay.PortEntry{{ID: "port-a", Port: 3000}}},
+	}})
+	next, _ = next.(model).Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
+		{ID: "record-b", ProjectID: "project-a", SessionID: "z-tab"},
+		{ID: "record-a", ProjectID: "project-a", SessionID: "a-tab"},
+	}})
+	return next.(model)
+}
+
+func TestTerminalRowsAndSanitizedLabels(t *testing.T) {
+	m := terminalDashboard(t)
+	wantKinds := []rowKind{rowSystemName, rowProject, rowTerminal, rowTerminal, rowAddTerminal, rowPort, rowAddPort, rowProject, rowAddTerminal, rowPort, rowAddPort, rowAddProject}
+	if len(m.rows) != len(wantKinds) {
+		t.Fatalf("rows = %#v", m.rows)
+	}
+	for i, want := range wantKinds {
+		if m.rows[i].kind != want {
+			t.Errorf("row %d kind = %v, want %v", i, m.rows[i].kind, want)
+		}
+	}
+	if m.rows[2].itemID != "z-tab" || m.rows[3].itemID != "a-tab" {
+		t.Fatalf("terminal order = %q, %q; want relay created,id order", m.rows[2].itemID, m.rows[3].itemID)
+	}
+
+	raw := "\x1b]0;owned\a"
+	next, _ := m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{
+		ID: "record", ProjectID: "project-a", SessionID: raw,
+	}}})
+	m = next.(model)
+	if m.terminals[0].info.SessionID != raw || m.terminals[0].label != "]0;owned" {
+		t.Fatalf("terminal = raw %q label %q", m.terminals[0].info.SessionID, m.terminals[0].label)
+	}
+	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{ProjectID: "project-a", SessionID: "\x00\a"}}})
+	if got := next.(model).terminals[0].label; got != "terminal" {
+		t.Fatalf("empty sanitized label = %q", got)
+	}
+	if strings.Contains(next.(model).View(), "\x1b]") {
+		t.Fatal("terminal label escape reached the view")
+	}
+}
+
+func TestCursorUsesDurableIdentityAcrossRefreshes(t *testing.T) {
+	m := terminalDashboard(t)
+	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "z-tab")
+
+	// Project rename reverses sort order; terminal insertion sorts before the
+	// selected tab. Neither independent refresh may retarget the cursor.
+	next, _ := m.Update(projectsMsg{projects: []relay.ProjectInfo{
+		{ID: "project-a", Name: "zulu", RootDir: "/alpha"},
+		{ID: "project-b", Name: "able", RootDir: "/bravo"},
+	}})
+	m = next.(model)
+	if r, _ := m.selectedRow(); r.kind != rowTerminal || r.itemID != "z-tab" || r.projectID != "project-a" {
+		t.Fatalf("project refresh selected %#v", r)
+	}
+	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
+		{ProjectID: "project-a", SessionID: "0-new"},
+		{ProjectID: "project-a", SessionID: "z-tab"},
+		{ProjectID: "project-a", SessionID: "zz-after"},
+	}})
+	m = next.(model)
+	if r, _ := m.selectedRow(); r.kind != rowTerminal || r.itemID != "z-tab" {
+		t.Fatalf("terminal insertion selected %#v", r)
+	}
+
+	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
+		{ProjectID: "project-a", SessionID: "0-new"},
+		{ProjectID: "project-a", SessionID: "zz-after"},
+	}})
+	m = next.(model)
+	if r, _ := m.selectedRow(); r.kind != rowAddTerminal || r.projectID != "project-a" {
+		t.Fatalf("deleted selected terminal fell back to %#v", r)
+	}
+}
+
+func TestTerminalKeyboardSelectsCreateAndOpenCommands(t *testing.T) {
+	m := terminalDashboard(t)
+	oldExec := runTerminalExec
+	t.Cleanup(func() { runTerminalExec = oldExec })
+	var opened *terminalExecCommand
+	runTerminalExec = func(command tea.ExecCommand, _ tea.ExecCallback) tea.Cmd {
+		opened = command.(*terminalExecCommand)
+		return func() tea.Msg { return "exec" }
+	}
+
+	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if msg := cmd(); msg != "exec" || opened == nil {
+		t.Fatalf("terminal enter command = %#v, opened=%v", msg, opened)
+	}
+	if opened.projectRoot != "/alpha" || opened.terminalKey != "project-a:a-tab" {
+		t.Fatalf("selected terminal = root %q key %q", opened.projectRoot, opened.terminalKey)
+	}
+
+	oldClient, oldRandom := httpClient, terminalSessionRandom
+	t.Cleanup(func() { httpClient, terminalSessionRandom = oldClient, oldRandom })
+	terminalSessionRandom = func(p []byte) (int, error) { clear(p); return len(p), nil }
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost {
+			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"id":"record"}`), nil
+	})}
+	m.cursor = rowIndex(m.rows, rowAddTerminal, "project-a", "")
+	_, createCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	created, ok := createCmd().(terminalCreatedMsg)
+	if !ok || created.err != nil || created.projectID != "project-a" || created.sessionID == "" {
+		t.Fatalf("create command = %#v", created)
+	}
+	opened = nil
+	_, startCmd := m.Update(created)
+	if startCmd == nil {
+		t.Fatal("successful persistence did not schedule refresh + attach")
+	}
+	for _, batched := range startCmd().(tea.BatchMsg) {
+		_ = batched()
+	}
+	if opened == nil || opened.terminalKey != "project-a:"+created.sessionID {
+		t.Fatalf("created terminal opened %#v", opened)
+	}
+
+	opened = nil
+	next, refresh := m.Update(terminalCreatedMsg{err: errors.New("bad\x1b]0;owned\a")})
+	failed := next.(model)
+	if opened != nil || strings.Contains(failed.err, "\x1b") {
+		t.Fatalf("failed create attached=%v error=%q", opened != nil, failed.err)
+	}
+	next, _ = failed.Update(refresh())
+	if next.(model).err != failed.err {
+		t.Fatalf("successful re-list cleared create error: before %q after %q", failed.err, next.(model).err)
+	}
+}
+
+func TestTerminalLoadErrorSurvivesIndependentProjectRefresh(t *testing.T) {
+	m := terminalDashboard(t)
+	next, _ := m.Update(terminalsMsg{err: errors.New("terminal list failed\x1b]0;owned\a")})
+	m = next.(model)
+	next, _ = m.Update(projectsMsg{projects: m.projects})
+	m = next.(model)
+	if view := m.View(); !strings.Contains(view, "terminal list failed") || strings.Contains(view, "\x1b]0;owned") {
+		t.Fatalf("terminal load error was hidden or unsafe:\n%s", view)
+	}
+	next, _ = m.Update(terminalsMsg{terminals: nil})
+	if strings.Contains(next.(model).View(), "terminal list failed") {
+		t.Fatal("successful terminal refresh did not clear its own load error")
+	}
+}
+
+func TestSuccessfulTerminalReturnClearsPriorTerminalError(t *testing.T) {
+	m := terminalDashboard(t)
+	next, _ := m.Update(terminalFinishedMsg{err: errors.New("attach failed")})
+	m = next.(model)
+	if m.err != "attach failed" {
+		t.Fatalf("terminal error = %q", m.err)
+	}
+	next, _ = m.Update(terminalFinishedMsg{})
+	if next.(model).err != "" {
+		t.Fatalf("successful terminal return left stale error %q", next.(model).err)
+	}
+}
+
+func TestMouseSelectsOnlyPrimaryPressHits(t *testing.T) {
+	m := terminalDashboard(t)
+	target := rowIndex(m.rows, rowTerminal, "project-a", "z-tab")
+	targetY := -1
+	for y := 0; y < m.height; y++ {
+		if got, ok := m.rowAtScreenY(y); ok && got == target {
+			targetY = y
+		}
+	}
+	if targetY < 0 {
+		t.Fatal("target terminal was not visible")
+	}
+	for _, event := range []tea.MouseMsg{
+		{X: 2, Y: targetY, Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion},
+		{X: 2, Y: targetY, Button: tea.MouseButtonRight, Action: tea.MouseActionPress},
+		{X: 2, Y: targetY, Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease},
+		{X: 2, Y: m.height - 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress},
+		{X: m.width, Y: targetY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress},
+	} {
+		m.cursor = 0
+		next, _ := m.Update(event)
+		if next.(model).cursor != 0 {
+			t.Fatalf("event %#v selected row %d", event, next.(model).cursor)
+		}
+	}
+	next, _ := m.Update(tea.MouseMsg{X: 2, Y: targetY, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if next.(model).cursor != target {
+		t.Fatalf("primary press selected %d, want %d", next.(model).cursor, target)
+	}
+
+	// Force top clipping and verify coordinates still target the visible row,
+	// rather than the same absolute line in the un-clipped body.
+	m.height = 8
+	for y := 0; y < m.height; y++ {
+		if idx, ok := m.rowAtScreenY(y); ok {
+			m.cursor = 0
+			next, _ := m.Update(tea.MouseMsg{Y: y, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+			if next.(model).cursor != idx {
+				t.Fatalf("clipped y=%d selected %d, want %d", y, next.(model).cursor, idx)
+			}
+			return
+		}
+	}
+	t.Fatal("short viewport exposed no selectable row")
+}
+
+func TestMouseRowsMatchRenderedGeometry(t *testing.T) {
+	m := terminalDashboard(t)
+	for _, height := range []int{30, 8} {
+		m.height = height
+		visible := strings.Split(lastRows(m.View(), height), "\n")
+		for y := 0; y < min(height, len(visible)); y++ {
+			idx, ok := m.rowAtScreenY(y)
+			if !ok {
+				continue
+			}
+			line := ansi.Strip(visible[y])
+			r := m.rows[idx]
+			var want string
+			switch r.kind {
+			case rowSystemName:
+				want = "name"
+			case rowProject:
+				want = m.projects[r.projectIdx].Name
+			case rowTerminal:
+				want = m.terminals[r.terminalIdx].label
+			case rowAddTerminal:
+				want = "+ terminal"
+			case rowPort:
+				want = ":" + strconv.Itoa(m.projects[r.projectIdx].Ports[r.portIdx].Port)
+			case rowAddPort:
+				want = "+ port"
+			case rowAddProject:
+				want = "+ new project"
+			}
+			if !strings.Contains(line, want) {
+				t.Fatalf("height %d y=%d maps to row %d (%v), rendered %q does not contain %q", height, y, idx, r.kind, line, want)
+			}
+		}
+	}
+}
+
+func TestTerminalRefreshIsScheduledOnEveryDataPath(t *testing.T) {
+	m := terminalDashboard(t)
+	old := terminalSessionsCommand
+	t.Cleanup(func() { terminalSessionsCommand = old })
+	calls := 0
+	terminalSessionsCommand = func(*system) tea.Cmd {
+		calls++
+		return func() tea.Msg { return terminalsMsg{} }
+	}
+
+	paths := []struct {
+		name string
+		run  func() tea.Cmd
+	}{
+		{"Init", func() tea.Cmd { return m.Init() }},
+		{"event", func() tea.Cmd { _, cmd := m.Update(eventMsg{}); return cmd }},
+		{"mutation", func() tea.Cmd { _, cmd := m.Update(mutatedMsg{ok: "updated"}); return cmd }},
+		{"20th tick", func() tea.Cmd { m.ticks = 19; _, cmd := m.Update(tickMsg{}); return cmd }},
+		{"terminal completion", func() tea.Cmd { _, cmd := m.Update(terminalFinishedMsg{}); return cmd }},
+	}
+	for _, path := range paths {
+		t.Run(path.name, func(t *testing.T) {
+			before := calls
+			_ = path.run()
+			if calls != before+1 {
+				t.Fatalf("terminal refresh calls = %d, want 1", calls-before)
+			}
+		})
+	}
+
+	t.Run("terminal completion restores mouse", func(t *testing.T) {
+		_, cmd := m.Update(terminalFinishedMsg{})
+		wantMouse := reflect.TypeOf(tea.EnableMouseCellMotion())
+		msg := cmd()
+		if reflect.TypeOf(msg) == wantMouse {
+			return
+		}
+		if batch, ok := msg.(tea.BatchMsg); ok {
+			for _, batched := range batch {
+				if reflect.TypeOf(batched()) == wantMouse {
+					return
+				}
+			}
+		}
+		t.Fatal("terminal completion did not re-enable mouse cell motion")
+	})
+}
+
+func TestTerminalControlsSurviveNarrowClipping(t *testing.T) {
+	m := terminalDashboard(t)
+	m.width, m.height = 14, 30
+	m.cursor = rowIndex(m.rows, rowAddTerminal, "project-a", "")
+	view := m.View()
+	if !strings.Contains(view, "+ term") {
+		t.Fatalf("narrow view hid the terminal action:\n%s", view)
+	}
+	if !strings.Contains(lastRows(view, m.height), "─") {
+		t.Fatal("narrow view pushed the footer outside the viewport")
+	}
 }
 
 // In TUI mode the log ring is the only place the agent's own errors go: nothing

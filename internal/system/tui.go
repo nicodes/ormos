@@ -65,7 +65,7 @@ func hostName() string {
 func runTUI(ctx context.Context, d *system) {
 	go d.Run(ctx)
 
-	p := tea.NewProgram(newModel(d), tea.WithAltScreen())
+	p := tea.NewProgram(newModelContext(ctx, d), tea.WithAltScreen(), tea.WithMouseCellMotion())
 
 	// Quit the UI if the process is signalled.
 	go func() {
@@ -88,6 +88,32 @@ func tick() tea.Cmd {
 type projectsMsg struct {
 	projects []relay.ProjectInfo
 	err      error
+}
+
+// terminalsMsg carries an independent persisted-terminal refresh.
+type terminalsMsg struct {
+	terminals []relay.TerminalSessionInfo
+	err       error
+}
+
+// terminalCreatedMsg starts the interactive attachment only after persistence
+// has succeeded.
+type terminalCreatedMsg struct {
+	projectID, projectRoot, sessionID string
+	err                               error
+}
+
+type terminalFinishedMsg struct{ err error }
+
+var runTerminalExec = tea.Exec
+
+var terminalSessionsCommand = func(d *system) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		terminals, err := d.fetchTerminalSessions(ctx)
+		return terminalsMsg{terminals: terminals, err: err}
+	}
 }
 
 // mutatedMsg carries the result of a create/update/delete.
@@ -120,6 +146,8 @@ type rowKind int
 const (
 	rowSystemName rowKind = iota // the editable system name, under the SYSTEM header
 	rowProject
+	rowTerminal // a persisted terminal tab under a project
+	rowAddTerminal
 	rowPort       // a port under a project
 	rowAddPort    // the "+ port" action under a project
 	rowAddProject // the "+ new project" action at the end of the list
@@ -128,9 +156,17 @@ const (
 // row is one line in the flattened project/port list. rowProject/rowPort/
 // rowAddPort carry a projectIdx so project-scoped actions work from any of them.
 type row struct {
-	kind       rowKind
-	projectIdx int
-	portIdx    int
+	kind        rowKind
+	projectIdx  int
+	portIdx     int
+	terminalIdx int
+	projectID   string
+	itemID      string
+}
+
+type terminalTab struct {
+	info  relay.TerminalSessionInfo
+	label string
 }
 
 // wizField is one prompt in an input wizard.
@@ -158,12 +194,14 @@ type confirmPrompt struct {
 }
 
 type model struct {
-	d *system
+	d      *system
+	appCtx context.Context
 
-	projects []relay.ProjectInfo
-	rows     []row
-	cursor   int
-	live     map[int]bool // ports currently listening on the host
+	projects  []relay.ProjectInfo
+	terminals []terminalTab
+	rows      []row
+	cursor    int
+	live      map[int]bool // ports currently listening on the host
 
 	mode  uiMode
 	input textinput.Model
@@ -177,6 +215,8 @@ type model struct {
 	fingerprint string            // sealing-key fingerprint for out-of-band verification
 	notice      string            // last success line
 	err         string            // last error line
+	projectErr  string            // latest project-list error, independent of actions
+	terminalErr string            // latest terminal-list error, independent of actions
 	ticks       int
 
 	width, height int
@@ -191,11 +231,16 @@ type model struct {
 const activityLines = 6
 
 func newModel(d *system) model {
+	return newModelContext(context.Background(), d)
+}
+
+func newModelContext(ctx context.Context, d *system) model {
 	ti := textinput.New()
 	ti.Prompt = "› "
 	ti.CharLimit = 512
 	return model{
 		d:           d,
+		appCtx:      ctx,
 		status:      d.Snapshot(),
 		logs:        d.RecentLogs(activityLines),
 		input:       ti,
@@ -206,7 +251,7 @@ func newModel(d *system) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tick(), m.refreshCmd(), m.infoCmd(), m.waitEventCmd())
+	return tea.Batch(tick(), m.refreshCmd(), m.terminalsCmd(), m.infoCmd(), m.waitEventCmd())
 }
 
 // waitEventCmd blocks until the relay pushes a data-change nudge, then re-arms
@@ -241,6 +286,29 @@ func (m model) infoCmd() tea.Cmd {
 	}
 }
 
+func (m model) terminalsCmd() tea.Cmd {
+	return terminalSessionsCommand(m.d)
+}
+
+func (m model) createTerminalCmd(p relay.ProjectInfo) tea.Cmd {
+	d := m.d
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		sessionID, err := d.createTerminalSession(ctx, p.ID)
+		return terminalCreatedMsg{projectID: p.ID, projectRoot: p.RootDir, sessionID: sessionID, err: err}
+	}
+}
+
+func (m model) openTerminalCmd(projectRoot, terminalKey string) tea.Cmd {
+	cols, rows := m.width, m.height
+	if !relay.ValidTerminalSize(cols, rows) {
+		cols, rows = 80, 24
+	}
+	command := newTerminalExecCommand(m.appCtx, m.d, projectRoot, terminalKey, cols, rows)
+	return runTerminalExec(command, func(err error) tea.Msg { return terminalFinishedMsg{err: err} })
+}
+
 // mutateCmd runs a mutation with a timeout and reports the outcome.
 func mutateCmd(ok string, fn func(ctx context.Context) error) tea.Cmd {
 	return func() tea.Msg {
@@ -267,22 +335,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Fallback refresh (~10s) in case a pushed nudge was missed; the relay's
 		// realtime push is the primary path for prompt updates.
 		if m.ticks%20 == 0 {
-			return m, tea.Batch(tick(), m.refreshCmd(), m.infoCmd())
+			return m, tea.Batch(tick(), m.refreshCmd(), m.terminalsCmd(), m.infoCmd())
 		}
 		return m, tick()
 
 	case projectsMsg:
 		if msg.err != nil {
-			m.err = sanitize("load: " + msg.err.Error())
+			m.projectErr = sanitize("load: " + msg.err.Error())
 			return m, nil
 		}
 		// Clear it: every pane starts at once under `make dev`, so the first
 		// refresh usually loses a race with `go run ./api` still compiling. That
 		// "connection refused" used to stay on screen for the rest of the
 		// session even though the very next poll succeeded.
-		m.err = ""
+		m.projectErr = ""
 		m.projects = sanitizeProjects(msg.projects)
 		sort.SliceStable(m.projects, func(i, j int) bool { return m.projects[i].Name < m.projects[j].Name })
+		m.rebuildRows()
+		return m, nil
+
+	case terminalsMsg:
+		if msg.err != nil {
+			m.terminalErr = sanitize("load terminals: " + msg.err.Error())
+			return m, nil
+		}
+		m.terminalErr = ""
+		m.terminals = sanitizeTerminals(msg.terminals)
 		m.rebuildRows()
 		return m, nil
 
@@ -296,7 +374,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case eventMsg:
 		// Relay pushed a data-change nudge: refetch now and re-arm the waiter.
-		return m, tea.Batch(m.refreshCmd(), m.infoCmd(), m.waitEventCmd())
+		return m, tea.Batch(m.refreshCmd(), m.terminalsCmd(), m.infoCmd(), m.waitEventCmd())
 
 	case mutatedMsg:
 		if msg.err != nil {
@@ -310,7 +388,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = sanitize(msg.ok)
 		}
 		// Refresh both the project list and system info (a rename changes the header).
-		return m, tea.Batch(m.refreshCmd(), m.infoCmd())
+		return m, tea.Batch(m.refreshCmd(), m.terminalsCmd(), m.infoCmd())
+
+	case terminalCreatedMsg:
+		if msg.err != nil {
+			m.err = sanitizeRelayOutput(msg.err.Error())
+			return m, m.terminalsCmd()
+		}
+		m.err = ""
+		m.notice = "terminal created"
+		return m, tea.Batch(
+			m.terminalsCmd(),
+			m.openTerminalCmd(msg.projectRoot, msg.projectID+":"+msg.sessionID),
+		)
+
+	case terminalFinishedMsg:
+		if msg.err != nil {
+			m.err = sanitizeRelayOutput(msg.err.Error())
+		} else {
+			m.err = ""
+		}
+		// RestoreTerminal does not restore mouse reporting after tea.Exec.
+		return m, tea.Batch(tea.EnableMouseCellMotion, m.terminalsCmd())
+
+	case tea.MouseMsg:
+		mouse := tea.MouseEvent(msg)
+		if m.mode == modeNormal && mouse.Action == tea.MouseActionPress && mouse.Button == tea.MouseButtonLeft {
+			if cursor, ok := m.rowAtScreen(mouse.X, mouse.Y); ok {
+				m.cursor = cursor
+			}
+		}
+		return m, nil
 
 	case tea.KeyMsg:
 		switch m.mode {
@@ -382,7 +490,7 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			})
 		}
 	case "enter":
-		// The "+ new project" / "+ port" rows are actions: run them on enter.
+		// Action rows mutate; terminal rows enter the already-persisted tab.
 		if r, ok := m.selectedRow(); ok {
 			switch r.kind {
 			case rowSystemName:
@@ -422,6 +530,13 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 						return mutateCmd(fmt.Sprintf("added :%d", port), func(ctx context.Context) error { return m.d.addPort(ctx, id, port, v[1]) })
 					},
 				})
+			case rowTerminal:
+				p := m.projects[r.projectIdx]
+				tab := m.terminals[r.terminalIdx]
+				return m, m.openTerminalCmd(p.RootDir, p.ID+":"+tab.info.SessionID)
+			case rowAddTerminal:
+				m.notice = ""
+				return m, m.createTerminalCmd(m.projects[r.projectIdx])
 			}
 		}
 	case "L":
@@ -543,23 +658,55 @@ func (m *model) applyField(f wizField) {
 }
 
 func (m *model) rebuildRows() {
-	rows := make([]row, 0, len(m.projects)+2)
+	selected, hadSelection := m.selectedRow()
+	rows := make([]row, 0, len(m.projects)+len(m.terminals)+2)
 	rows = append(rows, row{kind: rowSystemName})
 	for pi := range m.projects {
-		rows = append(rows, row{kind: rowProject, projectIdx: pi})
-		for qi := range m.projects[pi].Ports {
-			rows = append(rows, row{kind: rowPort, projectIdx: pi, portIdx: qi})
+		projectID := m.projects[pi].ID
+		rows = append(rows, row{kind: rowProject, projectIdx: pi, projectID: projectID})
+		for ti := range m.terminals {
+			if m.terminals[ti].info.ProjectID == projectID {
+				rows = append(rows, row{kind: rowTerminal, projectIdx: pi, terminalIdx: ti,
+					projectID: projectID, itemID: m.terminals[ti].info.SessionID})
+			}
 		}
-		rows = append(rows, row{kind: rowAddPort, projectIdx: pi})
+		rows = append(rows, row{kind: rowAddTerminal, projectIdx: pi, projectID: projectID})
+		for qi := range m.projects[pi].Ports {
+			rows = append(rows, row{kind: rowPort, projectIdx: pi, portIdx: qi,
+				projectID: projectID, itemID: m.projects[pi].Ports[qi].ID})
+		}
+		rows = append(rows, row{kind: rowAddPort, projectIdx: pi, projectID: projectID})
 	}
 	rows = append(rows, row{kind: rowAddProject})
 	m.rows = rows
+	if hadSelection {
+		if idx := rowIndex(rows, selected.kind, selected.projectID, selected.itemID); idx >= 0 {
+			m.cursor = idx
+		} else if selected.kind == rowTerminal {
+			// A removed selected tab falls back to a useful action in the same
+			// project, or its project row if that action is unavailable.
+			if idx := rowIndex(rows, rowAddTerminal, selected.projectID, ""); idx >= 0 {
+				m.cursor = idx
+			} else if idx := rowIndex(rows, rowProject, selected.projectID, ""); idx >= 0 {
+				m.cursor = idx
+			}
+		}
+	}
 	if m.cursor >= len(rows) {
 		m.cursor = len(rows) - 1
 	}
 	if m.cursor < 0 {
 		m.cursor = 0
 	}
+}
+
+func rowIndex(rows []row, kind rowKind, projectID, itemID string) int {
+	for i, r := range rows {
+		if r.kind == kind && r.projectID == projectID && r.itemID == itemID {
+			return i
+		}
+	}
+	return -1
 }
 
 func (m model) selectedRow() (row, bool) {
@@ -680,6 +827,20 @@ func (m model) View() string {
 			}
 			summary := labelStyle.Render(portSummary(p, m.live))
 			b.WriteString(cursor + name + " " + dirStyle.Render(pad(p.RootDir, 32)) + " " + summary + "\n")
+		case rowTerminal:
+			label := m.terminals[r.terminalIdx].label
+			if i == m.cursor {
+				label = selStyle.Render(label)
+			}
+			b.WriteString(fmt.Sprintf("    %s terminal %s\n", cursor, label))
+		case rowAddTerminal:
+			label := "+ terminal"
+			if i == m.cursor {
+				label = selStyle.Render(label)
+			} else {
+				label = hintStyle.Render(label)
+			}
+			b.WriteString(fmt.Sprintf("    %s %s\n", cursor, label))
 		case rowPort:
 			p := m.projects[r.projectIdx].Ports[r.portIdx]
 			// Selected → pink; otherwise live ports render green. No leading dot.
@@ -733,6 +894,10 @@ func (m model) View() string {
 				hints += " · enter rename system"
 			case rowProject:
 				hints += " · r rename · e dir · d delete"
+			case rowTerminal:
+				hints += " · enter open (Ctrl-G detaches)"
+			case rowAddTerminal:
+				hints += " · enter new terminal (Ctrl-G detaches)"
 			case rowPort:
 				hints += " · r label · d delete"
 			case rowAddPort:
@@ -747,8 +912,16 @@ func (m model) View() string {
 	// Status line: last error or success notice, under the hints. Both are
 	// sanitised where they are ASSIGNED rather than here — one place per
 	// string, so there is no asymmetry for a future field to inherit.
-	if m.err != "" {
-		f.WriteString("\n" + errStyle.Render("✗ "+m.err))
+	displayErr := m.err
+	if displayErr == "" {
+		if m.terminalErr != "" {
+			displayErr = m.terminalErr
+		} else {
+			displayErr = m.projectErr
+		}
+	}
+	if displayErr != "" {
+		f.WriteString("\n" + errStyle.Render("✗ "+displayErr))
 	} else if m.notice != "" {
 		f.WriteString("\n" + noticeStyle.Render("✓ "+m.notice))
 	}
@@ -844,6 +1017,59 @@ func sanitizeProjects(in []relay.ProjectInfo) []relay.ProjectInfo {
 		out[i] = p
 	}
 	return out
+}
+
+// sanitizeTerminals retains the raw session id used in the PTY key while
+// assigning a safe, non-empty display label exactly once at the relay boundary.
+func sanitizeTerminals(in []relay.TerminalSessionInfo) []terminalTab {
+	out := make([]terminalTab, len(in))
+	for i, info := range in {
+		info.ProjectName = sanitize(info.ProjectName)
+		label := strings.TrimSpace(sanitize(info.SessionID))
+		if label == "" {
+			label = "terminal"
+		}
+		out[i] = terminalTab{info: info, label: label}
+	}
+	return out
+}
+
+// rowAtScreenY maps a mouse coordinate back to a durable model row. The body
+// starts with a fixed SYSTEM/header block; an over-tall Bubble Tea view keeps
+// its last height rows, so the same top-clipping offset is applied here.
+func (m model) rowAtScreenY(y int) (int, bool) {
+	if y < 0 || (m.height > 0 && y >= m.height) {
+		return 0, false
+	}
+	topClip := 0
+	if m.height > 0 {
+		topClip = max(0, lipgloss.Height(m.View())-m.height)
+	}
+	line := 3 - topClip // SYSTEM name row
+	if y == line {
+		return 0, true
+	}
+	line = 9 - topClip // first PROJECTS row
+	if len(m.projects) == 0 {
+		line++ // "no projects yet"
+	}
+	for i, r := range m.rows {
+		if r.kind == rowSystemName {
+			continue
+		}
+		if y == line {
+			return i, true
+		}
+		line++
+	}
+	return 0, false
+}
+
+func (m model) rowAtScreen(x, y int) (int, bool) {
+	if x < 0 || (m.width > 0 && x >= m.width) {
+		return 0, false
+	}
+	return m.rowAtScreenY(y)
 }
 
 // sanitize strips anything unprintable from text before it is painted into the
