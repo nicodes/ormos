@@ -30,13 +30,31 @@ type terminalAttachment interface {
 }
 
 type terminalScreen struct {
-	generation uint64
-	label      string
-	client     terminalAttachment
-	emulator   *midterm.Terminal
-	responses  bytes.Buffer
-	input      [][]byte
-	writing    bool
+	generation        uint64
+	label             string
+	client            terminalAttachment
+	emulator          *midterm.Terminal
+	responses         bytes.Buffer
+	input             [][]byte
+	writing           bool
+	applicationCursor bool
+	bracketedPaste    bool
+}
+
+type terminalModeWriter struct{ screen *terminalScreen }
+
+func (w terminalModeWriter) Write(sequence []byte) (int, error) {
+	switch string(sequence) {
+	case "\x1b[1h", "\x1b[?1h":
+		w.screen.applicationCursor = true
+	case "\x1b[1l", "\x1b[?1l":
+		w.screen.applicationCursor = false
+	case "\x1b[2004h", "\x1b[?2004h":
+		w.screen.bracketedPaste = true
+	case "\x1b[2004l", "\x1b[?2004l":
+		w.screen.bracketedPaste = false
+	}
+	return len(sequence), nil
 }
 
 type terminalAttachedMsg struct {
@@ -67,6 +85,9 @@ var attachTerminalScreen = func(d *system, projectRoot, terminalKey string, cols
 }
 
 func (m model) startTerminal(projectRoot, terminalKey, label string) (model, tea.Cmd) {
+	if m.term != nil && m.term.client != nil {
+		m.term.client.Detach()
+	}
 	m.termGeneration++
 	if clean := strings.TrimSpace(sanitize(label)); clean != "" {
 		label = clean
@@ -129,6 +150,7 @@ func (m model) updateTerminalAttached(msg terminalAttachedMsg) (tea.Model, tea.C
 	m.term.client = msg.client
 	m.term.emulator = midterm.NewTerminal(rows, cols)
 	m.term.emulator.ForwardResponses = &m.term.responses
+	m.term.emulator.ForwardRequests = terminalModeWriter{screen: m.term}
 	return m, m.waitTerminalOutputCmd()
 }
 
@@ -160,6 +182,10 @@ func (m model) updateTerminalOutput(msg terminalOutputMsg) (tea.Model, tea.Cmd) 
 	if err != nil {
 		return m.leaveTerminal(fmt.Errorf("render terminal output: %w", err))
 	}
+	cols, rows := terminalDimensions(m.width, m.height)
+	if m.term.emulator.Width != cols || m.term.emulator.Height != rows {
+		resizeTerminalEmulator(m.term.emulator, rows, cols)
+	}
 
 	commands := []tea.Cmd{m.waitTerminalOutputCmd()}
 	if m.term.responses.Len() > 0 {
@@ -181,7 +207,7 @@ func (m model) updateTerminalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.term == nil || m.term.client == nil {
 		return m, nil
 	}
-	input := terminalKeyBytes(msg)
+	input := terminalKeyBytes(msg, m.term.applicationCursor, m.term.bracketedPaste)
 	if len(input) == 0 {
 		return m, nil
 	}
@@ -271,8 +297,23 @@ func (m model) resizeTerminal() (tea.Model, tea.Cmd) {
 	if err := m.term.client.Resize(cols, rows); err != nil {
 		return m.leaveTerminal(fmt.Errorf("resize terminal: %w", err))
 	}
-	m.term.emulator.Resize(rows, cols)
+	resizeTerminalEmulator(m.term.emulator, rows, cols)
 	return m, nil
+}
+
+func resizeTerminalEmulator(emulator *midterm.Terminal, rows, cols int) {
+	emulator.Resize(rows, cols)
+	clampTerminalScreen(emulator.Screen, rows, cols)
+	if emulator.Alt != nil {
+		clampTerminalScreen(emulator.Alt, rows, cols)
+	}
+}
+
+func clampTerminalScreen(screen *midterm.Screen, rows, cols int) {
+	screen.Cursor.Y = min(max(screen.Cursor.Y, 0), rows-1)
+	screen.Cursor.X = min(max(screen.Cursor.X, 0), cols-1)
+	screen.SavedCursor.Y = min(max(screen.SavedCursor.Y, 0), rows-1)
+	screen.SavedCursor.X = min(max(screen.SavedCursor.X, 0), cols-1)
 }
 
 func (m model) leaveTerminal(err error) (tea.Model, tea.Cmd) {
@@ -317,9 +358,13 @@ func placeTerminalMessage(height, width int, content string) string {
 	return strings.Join(lines, "\n")
 }
 
-func terminalKeyBytes(msg tea.KeyMsg) []byte {
+func terminalKeyBytes(msg tea.KeyMsg, applicationCursor, bracketedPaste bool) []byte {
 	if msg.Type == tea.KeyRunes {
-		return withAlt(msg.Alt, []byte(string(msg.Runes)))
+		input := []byte(string(msg.Runes))
+		if msg.Paste && bracketedPaste {
+			input = append(append([]byte("\x1b[200~"), input...), []byte("\x1b[201~")...)
+		}
+		return withAlt(msg.Alt, input)
 	}
 	if msg.Type == tea.KeySpace {
 		return withAlt(msg.Alt, []byte{' '})
@@ -331,13 +376,13 @@ func terminalKeyBytes(msg tea.KeyMsg) []byte {
 	var sequence string
 	switch msg.Type {
 	case tea.KeyUp, tea.KeyDown, tea.KeyRight, tea.KeyLeft:
-		sequence = cursorSequence(msg.Type, modifier(msg.Alt, false, false))
+		sequence = cursorSequence(msg.Type, modifier(msg.Alt, false, false), applicationCursor)
 	case tea.KeyShiftUp, tea.KeyShiftDown, tea.KeyShiftRight, tea.KeyShiftLeft:
-		sequence = cursorSequence(msg.Type, modifier(msg.Alt, true, false))
+		sequence = cursorSequence(msg.Type, modifier(msg.Alt, true, false), applicationCursor)
 	case tea.KeyCtrlUp, tea.KeyCtrlDown, tea.KeyCtrlRight, tea.KeyCtrlLeft:
-		sequence = cursorSequence(msg.Type, modifier(msg.Alt, false, true))
+		sequence = cursorSequence(msg.Type, modifier(msg.Alt, false, true), applicationCursor)
 	case tea.KeyCtrlShiftUp, tea.KeyCtrlShiftDown, tea.KeyCtrlShiftRight, tea.KeyCtrlShiftLeft:
-		sequence = cursorSequence(msg.Type, modifier(msg.Alt, true, true))
+		sequence = cursorSequence(msg.Type, modifier(msg.Alt, true, true), applicationCursor)
 	case tea.KeyHome, tea.KeyEnd, tea.KeyShiftHome, tea.KeyShiftEnd, tea.KeyCtrlHome, tea.KeyCtrlEnd, tea.KeyCtrlShiftHome, tea.KeyCtrlShiftEnd:
 		sequence = homeEndSequence(msg.Type, msg.Alt)
 	case tea.KeyShiftTab:
@@ -381,7 +426,7 @@ func modifier(alt, shift, ctrl bool) int {
 	return value
 }
 
-func cursorSequence(key tea.KeyType, modifier int) string {
+func cursorSequence(key tea.KeyType, modifier int, application bool) string {
 	final := byte('A')
 	switch key {
 	case tea.KeyDown, tea.KeyShiftDown, tea.KeyCtrlDown, tea.KeyCtrlShiftDown:
@@ -392,6 +437,9 @@ func cursorSequence(key tea.KeyType, modifier int) string {
 		final = 'D'
 	}
 	if modifier == 1 {
+		if application {
+			return fmt.Sprintf("\x1bO%c", final)
+		}
 		return fmt.Sprintf("\x1b[%c", final)
 	}
 	return fmt.Sprintf("\x1b[1;%d%c", modifier, final)
