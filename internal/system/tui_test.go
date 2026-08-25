@@ -183,6 +183,19 @@ func TestTerminalLoadErrorSurvivesIndependentProjectRefresh(t *testing.T) {
 	}
 }
 
+func TestSuccessfulTerminalReturnClearsPriorTerminalError(t *testing.T) {
+	m := terminalDashboard(t)
+	next, _ := m.Update(terminalFinishedMsg{err: errors.New("attach failed")})
+	m = next.(model)
+	if m.err != "attach failed" {
+		t.Fatalf("terminal error = %q", m.err)
+	}
+	next, _ = m.Update(terminalFinishedMsg{})
+	if next.(model).err != "" {
+		t.Fatalf("successful terminal return left stale error %q", next.(model).err)
+	}
+}
+
 func TestMouseSelectsOnlyPrimaryPressHits(t *testing.T) {
 	m := terminalDashboard(t)
 	target := rowIndex(m.rows, rowTerminal, "project-a", "z-tab")

@@ -405,6 +405,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case terminalFinishedMsg:
 		if msg.err != nil {
 			m.err = sanitizeRelayOutput(msg.err.Error())
+		} else {
+			m.err = ""
 		}
 		// RestoreTerminal does not restore mouse reporting after tea.Exec.
 		return m, tea.Batch(tea.EnableMouseCellMotion, m.terminalsCmd())
