@@ -72,12 +72,22 @@ func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
 	}
 }
 
-func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
+func TestCurrentAgentAdvertisesOnlyV3(t *testing.T) {
 	if StreamFenceVersionLegacyV0 != "" {
 		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
 	}
-	if StreamFenceVersion != StreamFenceVersionV2 {
-		t.Fatalf("advertised stream-fence version = %q, want v2 %q", StreamFenceVersion, StreamFenceVersionV2)
+	if StreamFenceVersion != StreamFenceVersionV3 {
+		t.Fatalf("advertised stream-fence version = %q, want v3 %q", StreamFenceVersion, StreamFenceVersionV3)
+	}
+}
+
+func TestLifecycleStreamHeaderWireFields(t *testing.T) {
+	data, err := json.Marshal(StreamHeader{Kind: KindTerminal, SessionID: "project:session", TerminalRecordID: "record", TerminalGeneration: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), `{"kind":"terminal","session_id":"project:session","terminal_record_id":"record","terminal_generation":7}`; got != want {
+		t.Fatalf("header = %s, want %s", got, want)
 	}
 }
 

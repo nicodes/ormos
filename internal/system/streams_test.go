@@ -29,6 +29,10 @@ import (
 )
 
 func fencedHeader(h relay.StreamHeader) relay.StreamHeader {
+	if h.Kind == relay.KindTerminal && h.TerminalRecordID == "" {
+		h.TerminalRecordID = h.SessionID
+		h.TerminalGeneration = 1
+	}
 	h.ActionFence = strings.Repeat("a", 40)
 	h.NotAfterMilli = time.Now().Add(5 * time.Second).UnixMilli()
 	return h
@@ -467,6 +471,11 @@ func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testin
 	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/system/terminal-sessions" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"sessions":[]}`)
+			return
+		}
 		ws, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			serverErr <- err
@@ -1434,6 +1443,11 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 	withTempConfigDir(t)
 	headers := make(chan http.Header, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/system/terminal-sessions" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"sessions":[{"id":"advertised-key","state":"running","generation":1}]}`)
+			return
+		}
 		select {
 		case headers <- r.Header.Clone():
 		default:

@@ -7,12 +7,73 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func TestReconnectRunsTerminalReconciliation(t *testing.T) {
+	withTempConfigDir(t)
+	hold := make(chan struct{})
+	terminalLists := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/system/connect" {
+			ws, err := websocket.Accept(w, r, nil)
+			if err == nil {
+				<-hold
+				_ = ws.Close(websocket.StatusNormalClosure, "")
+			}
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/system/terminal-sessions/reset":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/system/terminal-sessions":
+			terminalLists++
+			if terminalLists == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = io.WriteString(w, `{"sessions":[{"id":"keep","state":"running","generation":4}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	d := newSystem(systemConfig{RelayURL: "ws" + strings.TrimPrefix(server.URL, "http"), Shell: "/bin/sh"})
+	d.pollPortsFn = func(context.Context) {}
+	d.terminals["keep"] = &terminalSession{id: "keep", recordID: "keep", generation: 4, owner: d, done: make(chan struct{})}
+	d.terminals["stale"] = &terminalSession{id: "stale", recordID: "stale", generation: 2, owner: d, done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); d.Run(ctx) }()
+
+	deadline := time.After(2 * time.Second)
+	for {
+		d.terminalMu.Lock()
+		_, keep := d.terminals["keep"]
+		_, stale := d.terminals["stale"]
+		d.terminalMu.Unlock()
+		if keep && !stale {
+			close(hold)
+			cancel()
+			<-done
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("reconnect reconciliation state keep=%v stale=%v", keep, stale)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)

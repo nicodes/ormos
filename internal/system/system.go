@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
 	"time"
@@ -24,7 +25,14 @@ import (
 
 var terminalSessionRandom = rand.Read
 
-const terminalSessionCreateAttempts = 8
+const (
+	terminalSessionCreateAttempts = 8
+)
+
+var (
+	terminalExitReportBackoff    = 500 * time.Millisecond
+	terminalExitReportMaxBackoff = 30 * time.Second
+)
 
 type relayHTTPError struct {
 	statusCode int
@@ -46,18 +54,25 @@ type PortStatus struct {
 type system struct {
 	cfg systemConfig
 
-	mu         sync.Mutex
-	connected  bool
-	sessions   int
-	logs       []string     // ring buffer of recent log lines
-	ports      []PortStatus // configured ports across this system's projects
-	listening  []int        // host's currently-listening loopback ports (cached)
-	echoStderr bool
-	echoWriter io.Writer
-	cancel     context.CancelFunc // stops the whole agent (relay-requested shutdown)
-	events     chan struct{}      // relay→TUI "data changed" nudges (coalesced)
-	terminalMu sync.Mutex
-	terminals  map[string]*terminalSession
+	mu               sync.Mutex
+	connected        bool
+	sessions         int
+	logs             []string     // ring buffer of recent log lines
+	ports            []PortStatus // configured ports across this system's projects
+	listening        []int        // host's currently-listening loopback ports (cached)
+	echoStderr       bool
+	echoWriter       io.Writer
+	cancel           context.CancelFunc // stops the whole agent (relay-requested shutdown)
+	events           chan struct{}      // relay→TUI "data changed" nudges (coalesced)
+	terminalMu       sync.Mutex
+	lifecycleMu      sync.Mutex
+	terminals        map[string]*terminalSession
+	reconcileStateMu sync.Mutex
+	reconcileRunning bool
+	reconcileAgain   bool
+	resetMu          sync.Mutex
+	resetDone        bool
+	runCtx           context.Context
 
 	policy  policy   // local restrictions the agent enforces itself
 	audit   *auditor // append-only record of relay-requested actions
@@ -77,6 +92,8 @@ type system struct {
 	proxyDialContext     func(context.Context, string, string) (net.Conn, error)
 	shutdownAckSlots     chan struct{}
 	actionNow            func() time.Time
+	connectAndServeFn    func(context.Context) (bool, error)
+	pollPortsFn          func(context.Context)
 }
 
 // setCancel lets the agent shut itself down when the relay asks it to.
@@ -84,6 +101,16 @@ func (d *system) setCancel(cancel context.CancelFunc) {
 	d.mu.Lock()
 	d.cancel = cancel
 	d.mu.Unlock()
+}
+
+func (d *system) lifecycleContext() context.Context {
+	d.mu.Lock()
+	ctx := d.runCtx
+	d.mu.Unlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 // shutdownCancel returns the root cancellation installed by Run. Looking it up
@@ -498,29 +525,178 @@ func (d *system) fetchTerminalSessions(ctx context.Context) ([]relay.TerminalSes
 	return out.Sessions, nil
 }
 
+func (d *system) resetTerminalSessions(ctx context.Context) error {
+	_, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions/reset", nil)
+	return err
+}
+
+func (d *system) reportTerminalExit(recordID string, generation int) {
+	if recordID == "" || generation <= 0 || d.cfg.RelayURL == "" {
+		return
+	}
+	go func() {
+		ctx := d.lifecycleContext()
+		backoff := terminalExitReportBackoff
+		for {
+			requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			_, err := d.relayDo(requestCtx, http.MethodPost, "/system/terminal-sessions/"+url.PathEscape(recordID)+"/exit", struct {
+				Generation int `json:"generation"`
+			}{generation})
+			cancel()
+			if err == nil {
+				return
+			}
+			var he *relayHTTPError
+			if errors.As(err, &he) && (he.statusCode == http.StatusNotFound || he.statusCode == http.StatusConflict) {
+				return
+			}
+			if errors.As(err, &he) && he.statusCode >= 400 && he.statusCode < 500 &&
+				he.statusCode != http.StatusRequestTimeout && he.statusCode != http.StatusTooManyRequests {
+				d.logf("terminal exit report: %v", err)
+				return
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if backoff < terminalExitReportMaxBackoff {
+				backoff *= 2
+				if backoff > terminalExitReportMaxBackoff {
+					backoff = terminalExitReportMaxBackoff
+				}
+			}
+		}
+	}()
+}
+
+// reconcileTerminalSessions is level-triggered: the durable list is authoritative,
+// and the lock serializes overlapping event-triggered fetches.
+func (d *system) reconcileTerminalSessions() {
+	d.reconcileStateMu.Lock()
+	if d.reconcileRunning {
+		d.reconcileAgain = true
+		d.reconcileStateMu.Unlock()
+		return
+	}
+	d.reconcileRunning = true
+	d.reconcileStateMu.Unlock()
+	go func() {
+		backoff := 100 * time.Millisecond
+		for {
+			select {
+			case <-d.lifecycleContext().Done():
+				return
+			default:
+			}
+			d.lifecycleMu.Lock()
+			ctx, cancel := context.WithTimeout(d.lifecycleContext(), 8*time.Second)
+			rows, err := d.fetchTerminalSessions(ctx)
+			cancel()
+			doomed := make([]*terminalSession, 0)
+			if err == nil {
+				valid := make(map[string]relay.TerminalSessionInfo, len(rows))
+				for _, row := range rows {
+					valid[row.ID] = row
+				}
+				d.terminalMu.Lock()
+				for id, s := range d.terminals {
+					row, ok := valid[id]
+					if !ok || row.State != relay.TerminalStateRunning || row.Generation != s.generation {
+						doomed = append(doomed, s)
+					}
+				}
+				d.terminalMu.Unlock()
+			}
+			d.lifecycleMu.Unlock()
+			for _, s := range doomed {
+				s.close()
+			}
+			if err != nil {
+				timer := time.NewTimer(backoff)
+				select {
+				case <-d.lifecycleContext().Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				if backoff < 2*time.Second {
+					backoff *= 2
+					if backoff > 2*time.Second {
+						backoff = 2 * time.Second
+					}
+				}
+			} else {
+				backoff = 100 * time.Millisecond
+			}
+			d.reconcileStateMu.Lock()
+			again := d.reconcileAgain || err != nil
+			d.reconcileAgain = false
+			if !again {
+				d.reconcileRunning = false
+				d.reconcileStateMu.Unlock()
+				return
+			}
+			d.reconcileStateMu.Unlock()
+		}
+	}()
+}
+
 // createTerminalSession persists a new terminal tab before any local PTY is
 // attached. A transport failure is deliberately not retried: the relay may
 // have committed the record before the connection failed. Only an explicit
 // duplicate response proves that generating a fresh id is safe.
-func (d *system) createTerminalSession(ctx context.Context, projectID string) (string, error) {
+func (d *system) createTerminalSession(ctx context.Context, projectID string) (relay.TerminalSessionInfo, error) {
 	for range terminalSessionCreateAttempts {
 		sessionID, err := newTerminalSessionID()
 		if err != nil {
-			return "", fmt.Errorf("generate terminal session id: %w", err)
+			return relay.TerminalSessionInfo{}, fmt.Errorf("generate terminal session id: %w", err)
 		}
-		_, err = d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions", struct {
+		data, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions", struct {
 			ProjectID string `json:"project_id"`
 			SessionID string `json:"session_id"`
 		}{ProjectID: projectID, SessionID: sessionID})
 		if err == nil {
-			return sessionID, nil
+			var info relay.TerminalSessionInfo
+			if err := json.Unmarshal(data, &info); err != nil {
+				return relay.TerminalSessionInfo{}, fmt.Errorf("decode terminal session: %w", err)
+			}
+			if info.ID == "" || info.State != relay.TerminalStateRunning || info.Generation <= 0 || info.SessionID == "" {
+				return relay.TerminalSessionInfo{}, fmt.Errorf("create returned invalid terminal session")
+			}
+			return info, nil
 		}
 		var httpErr *relayHTTPError
 		if !errors.As(err, &httpErr) || httpErr.statusCode != http.StatusConflict {
-			return "", err
+			return relay.TerminalSessionInfo{}, err
 		}
 	}
-	return "", fmt.Errorf("could not allocate a unique terminal session id")
+	return relay.TerminalSessionInfo{}, fmt.Errorf("could not allocate a unique terminal session id")
+}
+
+func (d *system) restartTerminalSession(ctx context.Context, recordID string) (relay.TerminalSessionInfo, error) {
+	data, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions/"+url.PathEscape(recordID)+"/restart", nil)
+	if err != nil {
+		return relay.TerminalSessionInfo{}, err
+	}
+	var info relay.TerminalSessionInfo
+	if err := json.Unmarshal(data, &info); err == nil && info.ID != "" {
+		return info, nil
+	}
+	var out struct {
+		Session relay.TerminalSessionInfo `json:"session"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return relay.TerminalSessionInfo{}, err
+	}
+	return out.Session, nil
+}
+
+func (d *system) deleteTerminalSession(ctx context.Context, recordID string) error {
+	_, err := d.relayDo(ctx, http.MethodDelete, "/system/terminal-sessions/"+url.PathEscape(recordID), nil)
+	return err
 }
 
 func newTerminalSessionID() (string, error) {
@@ -578,20 +754,57 @@ func (d *system) deletePort(ctx context.Context, portID string) error {
 // Run connects to the relay and serves the tunnel, reconnecting with backoff
 // until ctx is cancelled.
 func (d *system) Run(ctx context.Context) {
+	d.mu.Lock()
+	d.runCtx = ctx
+	d.mu.Unlock()
 	// Reaching here with a cleartext remote relay means the operator opted in
 	// via ORMOS_INSECURE=1 (runSystem refuses it otherwise) — say so loudly,
 	// every reconnect.
 	if insecureRemoteRelay(d.cfg.RelayURL) {
 		d.logf("WARNING: %s is a remote cleartext relay; the pairing token is sent unencrypted (allowed by ORMOS_INSECURE=1) — use wss://", d.cfg.RelayURL)
 	}
-	go d.pollPorts(ctx)
+	if d.pollPortsFn != nil {
+		go d.pollPortsFn(ctx)
+	} else {
+		go d.pollPorts(ctx)
+	}
 	backoff := minBackoff
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		d.resetMu.Lock()
+		resetDone := d.resetDone
+		d.resetMu.Unlock()
+		if !resetDone {
+			resetCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			err := d.resetTerminalSessions(resetCtx)
+			cancel()
+			if err != nil {
+				d.logf("terminal lifecycle reset failed: %v (retry in %s)", err, backoff)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+			d.resetMu.Lock()
+			d.resetDone = true
+			d.resetMu.Unlock()
+		}
 		began := time.Now()
-		connected, err := d.connectAndServe(ctx)
+		connect := d.connectAndServe
+		if d.connectAndServeFn != nil {
+			connect = d.connectAndServeFn
+		}
+		connected, err := connect(ctx)
 		if ctx.Err() != nil {
 			return
 		}
@@ -689,6 +902,9 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 
 	d.setConnected(true)
 	d.logf("tunnel established")
+	// Reconcile while the tunnel is established, before accepting streams, so a
+	// missed lifecycle nudge is repaired immediately on every reconnect.
+	d.reconcileTerminalSessions()
 	defer func() {
 		d.setConnected(false)
 		d.logf("tunnel closed")

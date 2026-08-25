@@ -4,6 +4,7 @@ package system
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -207,12 +208,14 @@ func (r *replayRing) snapshot() []byte {
 // terminalSession owns the PTY independently of any one tunnel stream. A
 // browser disconnect only replaces conn; the shell and buffered output remain.
 type terminalSession struct {
-	id    string
-	owner *system
-	cwd   string // the directory policy was evaluated against
-	ptmx  *os.File
-	cmd   *exec.Cmd
-	pgid  int // the shell's process group id (it leads it: pty.Start sets Setsid)
+	id         string
+	recordID   string
+	generation int
+	owner      *system
+	cwd        string // the directory policy was evaluated against
+	ptmx       *os.File
+	cmd        *exec.Cmd
+	pgid       int // the shell's process group id (it leads it: pty.Start sets Setsid)
 
 	mu                sync.Mutex
 	inputMu           sync.Mutex
@@ -471,11 +474,19 @@ func (c *TerminalClient) Detach() { c.session.detach(c.conn) }
 // AttachTerminal creates or reattaches a local terminal client. projectRoot is
 // passed through terminal so the same path resolution, policy checks and action
 // fence check run on every local create and reattach as on a browser request.
-func (d *system) AttachTerminal(projectRoot, sessionID string, cols, rows int) (*TerminalClient, error) {
+
+func (d *system) AttachTerminal(projectRoot string, info relay.TerminalSessionInfo, cols, rows int) (*TerminalClient, error) {
+	if info.State != relay.TerminalStateRunning {
+		return nil, fmt.Errorf("terminal session is %s", info.State)
+	}
+	if info.ID == "" || info.Generation <= 0 {
+		return nil, fmt.Errorf("invalid terminal session record")
+	}
+	sessionID, recordID, generation := info.SessionID, info.ID, info.Generation
 	if sessionID == "" {
 		return nil, fmt.Errorf("missing session id")
 	}
-	header := relay.StreamHeader{Kind: relay.KindTerminal, Cwd: projectRoot, SessionID: sessionID, Cols: cols, Rows: rows}
+	header := relay.StreamHeader{Kind: relay.KindTerminal, Cwd: projectRoot, SessionID: sessionID, TerminalRecordID: recordID, TerminalGeneration: generation, Cols: cols, Rows: rows}
 	s, err := d.terminal(header, d.actionTime().Add(terminalLocalActionTO))
 	if err != nil {
 		return nil, err
@@ -600,6 +611,10 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 		d.logf("terminal refused: missing session id")
 		return
 	}
+	if h.TerminalRecordID == "" || h.TerminalGeneration <= 0 {
+		d.logf("terminal refused: missing terminal record or generation")
+		return
+	}
 	// The handshake gets its own deadline, covering the read of the hello, the
 	// write of the reply and the agreement between them — a peer that never
 	// READS stalls the reply just as effectively as one that never writes. It
@@ -658,7 +673,9 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 	if !relay.ValidTerminalSize(h.Cols, h.Rows) {
 		return nil, fmt.Errorf("invalid terminal size")
 	}
-
+	if h.TerminalRecordID != "" && h.TerminalGeneration <= 0 {
+		return nil, fmt.Errorf("invalid terminal generation")
+	}
 	// Resolve the directory first: local policy is decided on the path this
 	// machine would actually use, not the string the relay sent. Relay input
 	// gets ~ expansion only — never environment expansion (expandRelayCwd).
@@ -692,9 +709,19 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		return nil, fmt.Errorf("%s", reason)
 	}
 
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
 	d.terminalMu.Lock()
 	defer d.terminalMu.Unlock()
-	if s := d.terminals[h.SessionID]; s != nil {
+	key := h.SessionID
+	if h.TerminalRecordID != "" {
+		key = h.TerminalRecordID
+	}
+	if s := d.terminals[key]; s != nil {
+		if h.TerminalRecordID != "" && s.generation > 0 && (s.recordID != h.TerminalRecordID || s.generation != h.TerminalGeneration) {
+			go s.close()
+			return nil, fmt.Errorf("terminal generation mismatch; existing session is closing")
+		}
 		// The check above covered the REQUESTED directory; the session being
 		// reattached to may be rooted somewhere else entirely, and a relay that
 		// learns its id inherits whatever it was opened on. Re-decide against
@@ -714,6 +741,27 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		}
 		d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: true})
 		return s, nil
+	}
+	if h.TerminalRecordID != "" && d.cfg.RelayURL != "" {
+		ctx, cancel := context.WithTimeout(d.lifecycleContext(), terminalLocalActionTO)
+		rows, err := d.fetchTerminalSessions(ctx)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("validate terminal record: %w", err)
+		}
+		found := false
+		for _, row := range rows {
+			if row.ID == h.TerminalRecordID {
+				found = true
+				if row.State != relay.TerminalStateRunning || row.Generation != h.TerminalGeneration {
+					return nil, fmt.Errorf("terminal record is not the requested running generation")
+				}
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("terminal record not found")
+		}
 	}
 	if len(d.terminals) >= maxTerminalSessions {
 		return nil, fmt.Errorf("terminal session limit reached (%d)", maxTerminalSessions)
@@ -766,8 +814,12 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		_, _ = cmd.Process.Wait()
 		return nil, fmt.Errorf("set pty size: %w", err)
 	}
-	s := &terminalSession{id: h.SessionID, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
-	d.terminals[h.SessionID] = s
+	s := &terminalSession{id: key, recordID: h.TerminalRecordID, generation: h.TerminalGeneration, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
+	if s.recordID == "" {
+		s.recordID = key
+		s.generation = 1
+	}
+	d.terminals[key] = s
 	d.addSession(1)
 	d.logf("terminal session started (%s)", d.cfg.Shell)
 	go s.readPTY()
@@ -1653,6 +1705,7 @@ func (s *terminalSession) close() {
 			s.owner.terminalMu.Unlock()
 			s.owner.addSession(-1)
 			s.owner.logf("terminal session ended")
+			s.owner.reportTerminalExit(s.recordID, s.generation)
 		}
 	})
 }

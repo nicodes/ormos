@@ -44,7 +44,15 @@ type TerminalSessionInfo struct {
 	ProjectID   string `json:"project_id"`
 	ProjectName string `json:"project_name"`
 	SessionID   string `json:"session_id"`
+	State       string `json:"state,omitempty"`
+	Generation  int    `json:"generation,omitempty"`
 }
+
+const (
+	TerminalStateRunning = "running"
+	TerminalStateClosing = "closing"
+	TerminalStateExited  = "exited"
+)
 
 // PortEntry is one exposed port with its record id.
 type PortEntry struct {
