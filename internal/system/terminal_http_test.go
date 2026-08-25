@@ -77,6 +77,7 @@ func TestTerminalExitReportRetriesExactGenerationAndCancels(t *testing.T) {
 	if requests != count {
 		t.Fatalf("cancellation did not stop retries: %d -> %d", count, requests)
 	}
+	d.waitExitReports()
 }
 
 func TestTerminalSessionHTTPWireShape(t *testing.T) {

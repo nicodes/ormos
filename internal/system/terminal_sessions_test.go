@@ -71,6 +71,34 @@ func TestLifecycleTerminalValidationControlsPTYCreation(t *testing.T) {
 	}
 }
 
+func TestLifecycleGenerationMismatchSchedulesExactStalePTYClose(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	stale := &terminalSession{id: "record", recordID: "record", generation: 1, owner: d, done: make(chan struct{})}
+	d.terminals["record"] = stale
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 2, Cols: 80, Rows: 24})
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil || !strings.Contains(err.Error(), "generation mismatch") {
+		t.Fatalf("mismatch error=%v", err)
+	}
+	deadline := time.After(time.Second)
+	for {
+		d.terminalMu.Lock()
+		_, present := d.terminals["record"]
+		d.terminalMu.Unlock()
+		stale.mu.Lock()
+		closed := stale.closed
+		stale.mu.Unlock()
+		if !present && closed {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("stale PTY was not closed: present=%v closed=%v", present, closed)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
 // sealedPair builds both ends of one sealed connection over a net.Pipe, the way
 // handleTerminal does after the client hello: the agent seals with
 // AgentToClient, the browser opens with the same key.

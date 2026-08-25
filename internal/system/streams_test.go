@@ -1079,6 +1079,75 @@ func TestTerminalHandshakeDeadlineDropsASilentPeer(t *testing.T) {
 	}
 }
 
+func TestTerminalLifecycleHeaderBoundaryPrecedesHandshake(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		record     string
+		generation int
+	}{
+		{"missing record", "", 1},
+		{"missing generation", "record", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &system{terminals: make(map[string]*terminalSession), audit: newAuditor()}
+			agent, client := net.Pipe()
+			defer client.Close()
+			done := make(chan struct{})
+			go func() { d.serveStream(agent); close(done) }()
+			h := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "boundary", TerminalRecordID: tc.record, TerminalGeneration: tc.generation, Cols: 80, Rows: 24, ActionFence: strings.Repeat("a", 40), NotAfterMilli: time.Now().Add(time.Second).UnixMilli()}
+			if err := relay.WriteHeader(client, h); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("lifecycle boundary waited for handshake")
+			}
+			if len(d.terminals) != 0 {
+				t.Fatal("boundary refusal created a PTY")
+			}
+		})
+	}
+
+	withTempConfigDir(t)
+	key, err := relay.GenerateAgentKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &system{key: key, cfg: systemConfig{Shell: "/bin/cat"}, terminals: make(map[string]*terminalSession), audit: newAuditor()}
+	reached := make(chan struct{})
+	d.beforeTerminalAction = func() { close(reached) }
+	agent, client := net.Pipe()
+	defer client.Close()
+	go d.serveStream(agent)
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "boundary-valid", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	if err := relay.WriteHeader(client, h); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := relay.GenerateAgentKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.WriteClientHello(client, clientKey.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := relay.ReadServerHello(client); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("valid lifecycle control did not reach terminal creation")
+	}
+	d.terminalMu.Lock()
+	s := d.terminals["record"]
+	d.terminalMu.Unlock()
+	if s == nil {
+		t.Fatal("valid lifecycle control did not create PTY")
+	}
+	s.close()
+}
+
 // The other half, and the one that fails as a user-visible disconnect rather
 // than as a red test: the deadline must be CLEARED once the handshake is done.
 // Leaving it armed kills every terminal, busy or not, terminalHandshakeTO after
