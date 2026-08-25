@@ -103,10 +103,6 @@ type terminalCreatedMsg struct {
 	err                               error
 }
 
-type terminalFinishedMsg struct{ err error }
-
-var runTerminalExec = tea.Exec
-
 var terminalSessionsCommand = func(d *system) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -139,6 +135,7 @@ const (
 	modeNormal uiMode = iota
 	modeInput
 	modeConfirm
+	modeTerminal
 )
 
 type rowKind int
@@ -203,10 +200,12 @@ type model struct {
 	cursor    int
 	live      map[int]bool // ports currently listening on the host
 
-	mode  uiMode
-	input textinput.Model
-	wiz   *wizard
-	conf  *confirmPrompt
+	mode           uiMode
+	input          textinput.Model
+	wiz            *wizard
+	conf           *confirmPrompt
+	term           *terminalScreen
+	termGeneration uint64
 
 	status      Status
 	logs        []string          // tail of the agent's log ring, for the ACTIVITY pane
@@ -300,15 +299,6 @@ func (m model) createTerminalCmd(p relay.ProjectInfo) tea.Cmd {
 	}
 }
 
-func (m model) openTerminalCmd(projectRoot, terminalKey string) tea.Cmd {
-	cols, rows := m.width, m.height
-	if !relay.ValidTerminalSize(cols, rows) {
-		cols, rows = 80, 24
-	}
-	command := newTerminalExecCommand(m.appCtx, m.d, projectRoot, terminalKey, cols, rows)
-	return runTerminalExec(command, func(err error) tea.Msg { return terminalFinishedMsg{err: err} })
-}
-
 // mutateCmd runs a mutation with a timeout and reports the outcome.
 func mutateCmd(ok string, fn func(ctx context.Context) error) tea.Cmd {
 	return func() tea.Msg {
@@ -325,6 +315,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.input.Width = msg.Width - 6
+		if m.mode == modeTerminal {
+			return m.resizeTerminal()
+		}
 		return m, nil
 
 	case tickMsg:
@@ -397,21 +390,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.err = ""
 		m.notice = "terminal created"
+		m, attach := m.startTerminal(msg.projectRoot, msg.projectID+":"+msg.sessionID, msg.sessionID)
 		return m, tea.Batch(
+			tea.DisableMouse,
 			m.terminalsCmd(),
-			m.openTerminalCmd(msg.projectRoot, msg.projectID+":"+msg.sessionID),
+			attach,
 		)
 
+	case terminalAttachedMsg:
+		return m.updateTerminalAttached(msg)
+
+	case terminalOutputMsg:
+		return m.updateTerminalOutput(msg)
+
+	case terminalInputWrittenMsg:
+		return m.updateTerminalInputWritten(msg)
+
 	case terminalFinishedMsg:
-		if msg.err != nil {
-			m.err = sanitizeRelayOutput(msg.err.Error())
-		} else {
-			m.err = ""
-		}
-		// RestoreTerminal does not restore mouse reporting after tea.Exec.
-		return m, tea.Batch(tea.EnableMouseCellMotion, m.terminalsCmd())
+		return m.updateTerminalFinished(msg)
 
 	case tea.MouseMsg:
+		if m.mode == modeTerminal {
+			return m, nil
+		}
 		mouse := tea.MouseEvent(msg)
 		if m.mode == modeNormal && mouse.Action == tea.MouseActionPress && mouse.Button == tea.MouseButtonLeft {
 			if cursor, ok := m.rowAtScreen(mouse.X, mouse.Y); ok {
@@ -426,6 +427,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateInput(msg)
 		case modeConfirm:
 			return m.updateConfirm(msg)
+		case modeTerminal:
+			return m.updateTerminalKey(msg)
 		default:
 			return m.updateNormal(msg)
 		}
@@ -533,7 +536,8 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case rowTerminal:
 				p := m.projects[r.projectIdx]
 				tab := m.terminals[r.terminalIdx]
-				return m, m.openTerminalCmd(p.RootDir, p.ID+":"+tab.info.SessionID)
+				m, attach := m.startTerminal(p.RootDir, p.ID+":"+tab.info.SessionID, tab.label)
+				return m, tea.Batch(tea.DisableMouse, attach)
 			case rowAddTerminal:
 				m.notice = ""
 				return m, m.createTerminalCmd(m.projects[r.projectIdx])
@@ -751,6 +755,9 @@ func divider(width int) string {
 }
 
 func (m model) View() string {
+	if m.mode == modeTerminal {
+		return m.terminalView()
+	}
 	s := m.status
 	state := offStyle.Render("● offline")
 	if s.Connected {
@@ -895,9 +902,9 @@ func (m model) View() string {
 			case rowProject:
 				hints += " · r rename · e dir · d delete"
 			case rowTerminal:
-				hints += " · enter open (Ctrl-G detaches)"
+				hints += " · enter open in TUI (Ctrl-G detaches)"
 			case rowAddTerminal:
-				hints += " · enter new terminal (Ctrl-G detaches)"
+				hints += " · enter new terminal in TUI (Ctrl-G detaches)"
 			case rowPort:
 				hints += " · r label · d delete"
 			case rowAddPort:

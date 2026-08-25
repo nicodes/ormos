@@ -5,7 +5,6 @@ package system
 import (
 	"errors"
 	"net/http"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -110,27 +109,23 @@ func TestCursorUsesDurableIdentityAcrossRefreshes(t *testing.T) {
 	}
 }
 
-func TestTerminalKeyboardSelectsCreateAndOpenCommands(t *testing.T) {
+func TestTerminalCreationPersistsBeforeAttach(t *testing.T) {
 	m := terminalDashboard(t)
-	oldExec := runTerminalExec
-	t.Cleanup(func() { runTerminalExec = oldExec })
-	var opened *terminalExecCommand
-	runTerminalExec = func(command tea.ExecCommand, _ tea.ExecCallback) tea.Cmd {
-		opened = command.(*terminalExecCommand)
-		return func() tea.Msg { return "exec" }
-	}
-
-	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	if msg := cmd(); msg != "exec" || opened == nil {
-		t.Fatalf("terminal enter command = %#v, opened=%v", msg, opened)
-	}
-	if opened.projectRoot != "/alpha" || opened.terminalKey != "project-a:a-tab" {
-		t.Fatalf("selected terminal = root %q key %q", opened.projectRoot, opened.terminalKey)
-	}
-
 	oldClient, oldRandom := httpClient, terminalSessionRandom
-	t.Cleanup(func() { httpClient, terminalSessionRandom = oldClient, oldRandom })
+	oldAttach := attachTerminalScreen
+	t.Cleanup(func() {
+		httpClient, terminalSessionRandom = oldClient, oldRandom
+		attachTerminalScreen = oldAttach
+	})
+	client := newFakeTerminalAttachment()
+	attached := 0
+	attachTerminalScreen = func(_ *system, root, key string, cols, rows int) (terminalAttachment, error) {
+		attached++
+		if root != "/alpha" || !strings.HasPrefix(key, "project-a:") || cols != 80 || rows != 27 {
+			t.Fatalf("attach root=%q key=%q size=%dx%d", root, key, cols, rows)
+		}
+		return client, nil
+	}
 	terminalSessionRandom = func(p []byte) (int, error) { clear(p); return len(p), nil }
 	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		if req.Method != http.MethodPost {
@@ -144,23 +139,24 @@ func TestTerminalKeyboardSelectsCreateAndOpenCommands(t *testing.T) {
 	if !ok || created.err != nil || created.projectID != "project-a" || created.sessionID == "" {
 		t.Fatalf("create command = %#v", created)
 	}
-	opened = nil
-	_, startCmd := m.Update(created)
+	next, startCmd := m.Update(created)
 	if startCmd == nil {
 		t.Fatal("successful persistence did not schedule refresh + attach")
+	}
+	if next.(model).mode != modeTerminal {
+		t.Fatal("successful persistence did not enter terminal mode")
 	}
 	for _, batched := range startCmd().(tea.BatchMsg) {
 		_ = batched()
 	}
-	if opened == nil || opened.terminalKey != "project-a:"+created.sessionID {
-		t.Fatalf("created terminal opened %#v", opened)
+	if attached != 1 {
+		t.Fatalf("attach calls = %d", attached)
 	}
 
-	opened = nil
 	next, refresh := m.Update(terminalCreatedMsg{err: errors.New("bad\x1b]0;owned\a")})
 	failed := next.(model)
-	if opened != nil || strings.Contains(failed.err, "\x1b") {
-		t.Fatalf("failed create attached=%v error=%q", opened != nil, failed.err)
+	if attached != 1 || strings.Contains(failed.err, "\x1b") {
+		t.Fatalf("failed create attach calls=%d error=%q", attached, failed.err)
 	}
 	next, _ = failed.Update(refresh())
 	if next.(model).err != failed.err {
@@ -180,19 +176,6 @@ func TestTerminalLoadErrorSurvivesIndependentProjectRefresh(t *testing.T) {
 	next, _ = m.Update(terminalsMsg{terminals: nil})
 	if strings.Contains(next.(model).View(), "terminal list failed") {
 		t.Fatal("successful terminal refresh did not clear its own load error")
-	}
-}
-
-func TestSuccessfulTerminalReturnClearsPriorTerminalError(t *testing.T) {
-	m := terminalDashboard(t)
-	next, _ := m.Update(terminalFinishedMsg{err: errors.New("attach failed")})
-	m = next.(model)
-	if m.err != "attach failed" {
-		t.Fatalf("terminal error = %q", m.err)
-	}
-	next, _ = m.Update(terminalFinishedMsg{})
-	if next.(model).err != "" {
-		t.Fatalf("successful terminal return left stale error %q", next.(model).err)
 	}
 }
 
@@ -296,7 +279,6 @@ func TestTerminalRefreshIsScheduledOnEveryDataPath(t *testing.T) {
 		{"event", func() tea.Cmd { _, cmd := m.Update(eventMsg{}); return cmd }},
 		{"mutation", func() tea.Cmd { _, cmd := m.Update(mutatedMsg{ok: "updated"}); return cmd }},
 		{"20th tick", func() tea.Cmd { m.ticks = 19; _, cmd := m.Update(tickMsg{}); return cmd }},
-		{"terminal completion", func() tea.Cmd { _, cmd := m.Update(terminalFinishedMsg{}); return cmd }},
 	}
 	for _, path := range paths {
 		t.Run(path.name, func(t *testing.T) {
@@ -307,23 +289,6 @@ func TestTerminalRefreshIsScheduledOnEveryDataPath(t *testing.T) {
 			}
 		})
 	}
-
-	t.Run("terminal completion restores mouse", func(t *testing.T) {
-		_, cmd := m.Update(terminalFinishedMsg{})
-		wantMouse := reflect.TypeOf(tea.EnableMouseCellMotion())
-		msg := cmd()
-		if reflect.TypeOf(msg) == wantMouse {
-			return
-		}
-		if batch, ok := msg.(tea.BatchMsg); ok {
-			for _, batched := range batch {
-				if reflect.TypeOf(batched()) == wantMouse {
-					return
-				}
-			}
-		}
-		t.Fatal("terminal completion did not re-enable mouse cell motion")
-	})
 }
 
 func TestTerminalControlsSurviveNarrowClipping(t *testing.T) {
