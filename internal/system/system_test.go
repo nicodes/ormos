@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	"github.com/nicodes/ormos/relay"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -65,6 +66,7 @@ func TestReconnectRunsTerminalReconciliation(t *testing.T) {
 			close(hold)
 			cancel()
 			<-done
+			d.waitExitReports()
 			return
 		}
 		select {
@@ -73,6 +75,78 @@ func TestReconnectRunsTerminalReconciliation(t *testing.T) {
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
+}
+
+func TestInitialReconnectReconciliationBlocksStreamAcceptance(t *testing.T) {
+	withTempConfigDir(t)
+	listStarted, releaseList, closeTunnel := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/system/terminal-sessions/reset":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/system/terminal-sessions":
+			close(listStarted)
+			<-releaseList
+			_, _ = io.WriteString(w, `{"sessions":[{"id":"keep","state":"running","generation":4}]}`)
+		case r.URL.Path == "/system/connect":
+			ws, err := websocket.Accept(w, r, nil)
+			if err != nil {
+				return
+			}
+			sess, err := relay.ClientSession(relay.NetConn(context.Background(), ws))
+			if err != nil {
+				return
+			}
+			stream, err := sess.Open()
+			if err != nil {
+				return
+			}
+			_ = relay.WriteHeader(stream, relay.StreamHeader{Kind: relay.KindEvent})
+			<-closeTunnel
+			_ = stream.Close()
+			_ = sess.Close()
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	d := newSystem(systemConfig{RelayURL: "ws" + strings.TrimPrefix(server.URL, "http"), Shell: "/bin/sh"})
+	d.pollPortsFn = func(context.Context) {}
+	d.terminals["keep"] = &terminalSession{id: "keep", recordID: "keep", generation: 4, owner: d, done: make(chan struct{})}
+	d.terminals["stale"] = &terminalSession{id: "stale", recordID: "stale", generation: 2, owner: d, done: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); d.Run(ctx) }()
+	select {
+	case <-listStarted:
+	case <-time.After(time.Second):
+		t.Fatal("initial list fetch did not start")
+	}
+	// The event stream is already opened by the relay, but cannot be accepted
+	// until the blocked authoritative snapshot is released.
+	select {
+	case <-d.Events():
+		t.Fatal("event accepted before initial reconciliation completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseList)
+	select {
+	case <-d.Events():
+	case <-time.After(time.Second):
+		t.Fatal("event was not accepted after reconciliation")
+	}
+	d.terminalMu.Lock()
+	_, keep := d.terminals["keep"]
+	_, stale := d.terminals["stale"]
+	d.terminalMu.Unlock()
+	if !keep || stale {
+		t.Fatalf("reconciliation state keep=%v stale=%v", keep, stale)
+	}
+	close(closeTunnel)
+	cancel()
+	<-done
+	d.waitExitReports()
 }
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {

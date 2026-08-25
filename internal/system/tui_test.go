@@ -164,6 +164,37 @@ func TestTerminalCreationPersistsBeforeAttach(t *testing.T) {
 	}
 }
 
+func TestExitedTerminalEnterRestartsBeforeAttach(t *testing.T) {
+	m := terminalDashboard(t)
+	next, _ := m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{ID: "record", ProjectID: "project-a", SessionID: "a-tab", State: relay.TerminalStateExited, Generation: 3}}})
+	m = next.(model)
+	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")
+	oldClient, oldAttach := httpClient, attachTerminalScreen
+	t.Cleanup(func() { httpClient, attachTerminalScreen = oldClient, oldAttach })
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Path != "/system/terminal-sessions/record/restart" {
+			t.Fatalf("restart request=%s %s", req.Method, req.URL.Path)
+		}
+		return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project-a","session_id":"a-tab","state":"running","generation":4}`), nil
+	})}
+	_, restartCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	created, ok := restartCmd().(terminalCreatedMsg)
+	if !ok || created.info.ID != "record" || created.info.Generation != 4 {
+		t.Fatalf("restart result=%#v", created)
+	}
+	client := newFakeTerminalAttachment()
+	attachTerminalScreen = func(_ *system, _ string, info relay.TerminalSessionInfo, _, _ int) (terminalAttachment, error) {
+		if info.ID != "record" || info.Generation != 4 {
+			t.Fatalf("attach info=%+v", info)
+		}
+		return client, nil
+	}
+	updated, _ := m.Update(created)
+	if updated.(model).mode != modeTerminal {
+		t.Fatal("restarted terminal did not enter terminal mode")
+	}
+}
+
 func TestTerminalLoadErrorSurvivesIndependentProjectRefresh(t *testing.T) {
 	m := terminalDashboard(t)
 	next, _ := m.Update(terminalsMsg{err: errors.New("terminal list failed\x1b]0;owned\a")})
