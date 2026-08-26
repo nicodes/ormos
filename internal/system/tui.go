@@ -609,7 +609,9 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, mutateCmd(fmt.Sprintf("removed :%d", port.Port), func(ctx context.Context) error { return m.d.deletePort(ctx, port.ID) })
 			case rowTerminal:
 				tab := m.terminals[r.terminalIdx]
-				return m, mutateCmd("terminal deleted", func(ctx context.Context) error { return m.d.deleteTerminalSession(ctx, tab.info.ID) })
+				return m, mutateCmd("terminal deleted", func(ctx context.Context) error {
+					return m.d.deleteTerminalSession(ctx, tab.info.ID, tab.info.Generation)
+				})
 			}
 		}
 	}
