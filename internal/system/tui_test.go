@@ -3,11 +3,13 @@
 package system
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -16,6 +18,45 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/nicodes/ormos/relay"
 )
+
+func TestTUIWaitsForRunShutdownBeforeReturning(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	d.resetDone = true
+	d.pollPortsFn = func(context.Context) {}
+	runStarted := make(chan struct{})
+	runStopped := make(chan struct{})
+	d.connectAndServeFn = func(ctx context.Context) (bool, error) {
+		close(runStarted)
+		<-ctx.Done()
+		close(runStopped)
+		return false, ctx.Err()
+	}
+	oldProgram := runTUIProgram
+	t.Cleanup(func() { runTUIProgram = oldProgram })
+	runTUIProgram = func(context.Context, *system) {
+		select {
+		case <-runStarted:
+		case <-time.After(time.Second):
+			t.Fatal("Run did not reach connect before the UI returned")
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		runTUI(context.Background(), d)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("TUI returned without joining Run shutdown")
+	}
+	select {
+	case <-runStopped:
+	default:
+		t.Fatal("TUI returned before Run shutdown completed")
+	}
+}
 
 // sized builds a model and drives it through a resize and a tick, which is the
 // state every real render is in: a View at width 0 exercises none of the
@@ -192,6 +233,61 @@ func TestExitedTerminalEnterRestartsBeforeAttach(t *testing.T) {
 	updated, _ := m.Update(created)
 	if updated.(model).mode != modeTerminal {
 		t.Fatal("restarted terminal did not enter terminal mode")
+	}
+}
+
+func TestTerminalStateLabelsAndNoticesMatchActions(t *testing.T) {
+	m := terminalDashboard(t)
+	for _, tc := range []struct {
+		state string
+		want  string
+		avoid string
+	}{
+		{relay.TerminalStateExited, "enter restart", "open in TUI"},
+		{relay.TerminalStateClosing, "d delete", "enter open in TUI"},
+		{"future-state", "terminal unavailable", "enter open in TUI"},
+	} {
+		next, _ := m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{
+			ID: "record", ProjectID: "project-a", SessionID: "a-tab", State: tc.state, Generation: 3,
+		}}})
+		viewModel := next.(model)
+		viewModel.cursor = rowIndex(viewModel.rows, rowTerminal, "project-a", "a-tab")
+		view := viewModel.View()
+		if !strings.Contains(view, tc.want) || strings.Contains(view, tc.avoid) {
+			t.Fatalf("state=%s view lacks truthful footer: %q", tc.state, view)
+		}
+	}
+	m.notice = ""
+	next, _ := m.Update(terminalCreatedMsg{info: relay.TerminalSessionInfo{ID: "record", SessionID: "a-tab", State: relay.TerminalStateRunning, Generation: 4}, restarted: true, err: nil})
+	if got := next.(model).notice; got != "terminal restarted" {
+		t.Fatalf("restart notice=%q", got)
+	}
+}
+
+func TestTerminalDeleteNoticeReportsCompletion(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodDelete && req.URL.Path == "/system/terminal-sessions/record-a":
+			return testHTTPResponse(http.StatusNoContent, ""), nil
+		case req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions":
+			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, ""), nil
+		}
+	})}
+	m := terminalDashboard(t)
+	m.d.cfg.RelayURL = "ws://relay.test"
+	m.d.resetDone = true
+	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	if cmd == nil {
+		t.Fatal("terminal delete did not return a mutation command")
+	}
+	next, _ := m.Update(cmd())
+	if got := next.(model).notice; got != "terminal deleted" {
+		t.Fatalf("terminal delete notice=%q, want completed wording", got)
 	}
 }
 

@@ -62,18 +62,26 @@ func hostName() string {
 
 // runTUI starts the system tunnel and renders a Bubble Tea dashboard that also
 // lets the operator manage this system's projects and ports.
-func runTUI(ctx context.Context, d *system) {
-	go d.Run(ctx)
-
+var runTUIProgram = func(ctx context.Context, d *system) {
 	p := tea.NewProgram(newModelContext(ctx, d), tea.WithAltScreen(), tea.WithMouseCellMotion())
-
-	// Quit the UI if the process is signalled.
 	go func() {
 		<-ctx.Done()
 		p.Quit()
 	}()
-
 	_, _ = p.Run()
+}
+
+func runTUI(ctx context.Context, d *system) {
+	uiCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		d.Run(uiCtx)
+		close(runDone)
+	}()
+
+	runTUIProgram(uiCtx, d)
+	cancel()
+	<-runDone
 }
 
 // ---- messages & tick ------------------------------------------------------
@@ -101,6 +109,7 @@ type terminalsMsg struct {
 type terminalCreatedMsg struct {
 	projectRoot string
 	info        relay.TerminalSessionInfo
+	restarted   bool
 	err         error
 }
 
@@ -390,7 +399,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.terminalsCmd()
 		}
 		m.err = ""
-		m.notice = "terminal created"
+		if msg.restarted {
+			m.notice = "terminal restarted"
+		} else {
+			m.notice = "terminal created"
+		}
 		m, attach := m.startTerminal(msg.projectRoot, msg.info, msg.info.SessionID)
 		return m, tea.Batch(
 			tea.DisableMouse,
@@ -542,12 +555,12 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					return m, func() tea.Msg {
 						ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 						defer cancel()
-						info, err := m.d.restartTerminalSession(ctx, recordID)
-						return terminalCreatedMsg{projectRoot: p.RootDir, info: info, err: err}
+						info, err := m.d.restartTerminalSession(ctx, recordID, p.ID, tab.info.SessionID, tab.info.Generation)
+						return terminalCreatedMsg{projectRoot: p.RootDir, info: info, restarted: true, err: err}
 					}
 				}
 				if tab.info.State != "" && tab.info.State != relay.TerminalStateRunning {
-					m.err = "terminal is closing"
+					m.err = "terminal unavailable"
 					return m, nil
 				}
 				m, attach := m.startTerminal(p.RootDir, tab.info, tab.label)
@@ -596,7 +609,7 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, mutateCmd(fmt.Sprintf("removed :%d", port.Port), func(ctx context.Context) error { return m.d.deletePort(ctx, port.ID) })
 			case rowTerminal:
 				tab := m.terminals[r.terminalIdx]
-				return m, mutateCmd("deleted terminal", func(ctx context.Context) error { return m.d.deleteTerminalSession(ctx, tab.info.ID) })
+				return m, mutateCmd("terminal deleted", func(ctx context.Context) error { return m.d.deleteTerminalSession(ctx, tab.info.ID) })
 			}
 		}
 	}
@@ -926,7 +939,17 @@ func (m model) View() string {
 			case rowProject:
 				hints += " · r rename · e dir · d delete"
 			case rowTerminal:
-				hints += " · enter open in TUI (Ctrl-G detaches)"
+				tab := m.terminals[r.terminalIdx]
+				switch tab.info.State {
+				case relay.TerminalStateExited:
+					hints += " · enter restart"
+				case relay.TerminalStateClosing:
+					hints += " · d delete"
+				case "", relay.TerminalStateRunning:
+					hints += " · enter open in TUI (Ctrl-G detaches) · d delete"
+				default:
+					hints += " · terminal unavailable · d delete"
+				}
 			case rowAddTerminal:
 				hints += " · enter new terminal in TUI (Ctrl-G detaches)"
 			case rowPort:

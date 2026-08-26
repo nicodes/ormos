@@ -515,6 +515,7 @@ func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testin
 		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
 		PairingToken: "test-pairing-token",
 	})
+	d.resetDone = true
 	cancelInvoked := make(chan struct{})
 	d.setCancel(func() {
 		close(cancelInvoked)
@@ -1139,9 +1140,16 @@ func TestTerminalLifecycleHeaderBoundaryPrecedesHandshake(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("valid lifecycle control did not reach terminal creation")
 	}
-	d.terminalMu.Lock()
-	s := d.terminals["record"]
-	d.terminalMu.Unlock()
+	var s *terminalSession
+	deadline := time.Now().Add(time.Second)
+	for s == nil && time.Now().Before(deadline) {
+		d.terminalMu.Lock()
+		s = d.terminals["record"]
+		d.terminalMu.Unlock()
+		if s == nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
 	if s == nil {
 		t.Fatal("valid lifecycle control did not create PTY")
 	}
@@ -1534,6 +1542,7 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 		PairingToken: "test-pairing-token",
 		Shell:        "/bin/sh",
 	})
+	d.resetDone = true
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// The tunnel dying immediately is expected: the dial published the key, and

@@ -208,14 +208,15 @@ func (r *replayRing) snapshot() []byte {
 // terminalSession owns the PTY independently of any one tunnel stream. A
 // browser disconnect only replaces conn; the shell and buffered output remain.
 type terminalSession struct {
-	id         string
-	recordID   string
-	generation int
-	owner      *system
-	cwd        string // the directory policy was evaluated against
-	ptmx       *os.File
-	cmd        *exec.Cmd
-	pgid       int // the shell's process group id (it leads it: pty.Start sets Setsid)
+	id                string
+	recordID          string
+	generation        int
+	admissionSequence uint64
+	owner             *system
+	cwd               string // the directory policy was evaluated against
+	ptmx              *os.File
+	cmd               *exec.Cmd
+	pgid              int // the shell's process group id (it leads it: pty.Start sets Setsid)
 
 	mu                sync.Mutex
 	inputMu           sync.Mutex
@@ -238,6 +239,15 @@ type terminalSession struct {
 	expires           *time.Timer
 	done              chan struct{}
 	closeOnce         sync.Once
+}
+
+type terminalAdmissionState struct {
+	key        string
+	generation int
+	sequence   uint64
+	done       chan struct{}
+	starting   bool
+	canceled   bool
 }
 
 // terminalInput is one accepted browser or local request. The scheduler writes
@@ -669,7 +679,27 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 	s.attach(newSealedConn(stream, sealed))
 }
 
+type terminalAdmissionRetryError struct{ reason string }
+
+func (e *terminalAdmissionRetryError) Error() string { return e.reason }
+
 func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*terminalSession, error) {
+	for {
+		s, err := d.terminalAttempt(h, actionDeadline)
+		var retry *terminalAdmissionRetryError
+		if !errors.As(err, &retry) {
+			return s, err
+		}
+		if !actionDeadline.IsZero() && !time.Now().Before(actionDeadline) {
+			return nil, retry
+		}
+	}
+}
+
+func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time) (*terminalSession, error) {
+	if err := d.terminalLifecycleReady(); err != nil {
+		return nil, err
+	}
 	if !relay.ValidTerminalSize(h.Cols, h.Rows) {
 		return nil, fmt.Errorf("invalid terminal size")
 	}
@@ -709,38 +739,49 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		return nil, fmt.Errorf("%s", reason)
 	}
 
-	d.lifecycleMu.Lock()
-	defer d.lifecycleMu.Unlock()
-	d.terminalMu.Lock()
-	defer d.terminalMu.Unlock()
 	key := h.SessionID
 	if h.TerminalRecordID != "" {
 		key = h.TerminalRecordID
 	}
-	if s := d.terminals[key]; s != nil {
-		if h.TerminalRecordID != "" && s.generation > 0 && (s.recordID != h.TerminalRecordID || s.generation != h.TerminalGeneration) {
-			go s.close()
-			return nil, fmt.Errorf("terminal generation mismatch; existing session is closing")
-		}
-		// The check above covered the REQUESTED directory; the session being
-		// reattached to may be rooted somewhere else entirely, and a relay that
-		// learns its id inherits whatever it was opened on. Re-decide against
-		// the session's own cwd, or the reattach path is a way around a policy
-		// that tightened since the shell was spawned.
-		if ok, reason := p.terminalAllowed(s.cwd); !ok {
-			d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: false})
-			d.logf("terminal reattach refused: %s", reason)
-			return nil, fmt.Errorf("%s", reason)
-		}
-		if d.beforeTerminalAction != nil {
-			d.beforeTerminalAction()
-		}
-		if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
-			d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: false})
+	releaseAdmission, wait, startPTY, admissionState := d.claimTerminalAdmission(key, h.TerminalGeneration)
+	if wait != nil {
+		if err := waitForTerminalAdmission(wait, actionDeadline); err != nil {
 			return nil, err
 		}
-		d.audit.record(auditEntry{Event: "terminal-reattach", Detail: s.cwd, Allowed: true})
-		return s, nil
+		return nil, &terminalAdmissionRetryError{reason: "terminal admission became available"}
+	}
+	defer releaseAdmission()
+	d.terminalMu.Lock()
+	existing := d.terminals[key]
+	d.terminalMu.Unlock()
+	var stale *terminalSession
+	if existing != nil {
+		if h.TerminalRecordID != "" && existing.generation > 0 && (existing.recordID != h.TerminalRecordID || existing.generation != h.TerminalGeneration) {
+			if h.TerminalGeneration > 0 && h.TerminalGeneration <= existing.generation {
+				return nil, fmt.Errorf("terminal generation mismatch; newer session is already mapped")
+			}
+			stale = existing
+		} else {
+			// The check above covered the REQUESTED directory; the session being
+			// reattached to may be rooted somewhere else entirely, and a relay that
+			// learns its id inherits whatever it was opened on. Re-decide against
+			// the session's own cwd, or the reattach path is a way around a policy
+			// that tightened since the shell was spawned.
+			if ok, reason := p.terminalAllowed(existing.cwd); !ok {
+				d.audit.record(auditEntry{Event: "terminal-reattach", Detail: existing.cwd, Allowed: false})
+				d.logf("terminal reattach refused: %s", reason)
+				return nil, fmt.Errorf("%s", reason)
+			}
+			if d.beforeTerminalAction != nil {
+				d.beforeTerminalAction()
+			}
+			if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
+				d.audit.record(auditEntry{Event: "terminal-reattach", Detail: existing.cwd, Allowed: false})
+				return nil, err
+			}
+			d.audit.record(auditEntry{Event: "terminal-reattach", Detail: existing.cwd, Allowed: true})
+			return existing, nil
+		}
 	}
 	if h.TerminalRecordID != "" && d.cfg.RelayURL != "" {
 		ctx, cancel := context.WithTimeout(d.lifecycleContext(), terminalLocalActionTO)
@@ -763,8 +804,63 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 			return nil, fmt.Errorf("terminal record not found")
 		}
 	}
-	if len(d.terminals) >= maxTerminalSessions {
-		return nil, fmt.Errorf("terminal session limit reached (%d)", maxTerminalSessions)
+	if stale != nil {
+		// Validate the requested durable generation before destroying the local
+		// one. A delayed old stream must not kill a newer authoritative PTY.
+		d.terminalMu.Lock()
+		stillMapped := d.terminals[key] == stale
+		d.terminalMu.Unlock()
+		if stillMapped {
+			stale.close()
+		}
+	}
+	d.terminalMu.Lock()
+	if d.terminalFences == nil {
+		d.terminalFences = make(map[string]int)
+	}
+	if current := d.terminals[key]; current != nil && current.generation > 0 && h.TerminalGeneration > current.generation {
+		stale = current
+	}
+	d.terminalMu.Unlock()
+	if stale != nil {
+		stale.close()
+	}
+	d.terminalMu.Lock()
+	if d.terminalFences == nil {
+		d.terminalFences = make(map[string]int)
+	}
+	if h.TerminalGeneration > d.terminalFences[key] {
+		if _, known := d.terminalFences[key]; !known && len(d.terminalFences) >= terminalFenceLimit {
+			d.terminalMu.Unlock()
+			return nil, fmt.Errorf("terminal generation fence limit reached")
+		}
+		d.terminalFences[key] = h.TerminalGeneration
+	}
+	if h.TerminalGeneration > 0 && h.TerminalGeneration < d.terminalFences[key] {
+		d.terminalMu.Unlock()
+		return nil, fmt.Errorf("terminal generation is superseded")
+	}
+	d.terminalMu.Unlock()
+	if d.beforeTerminalAdmission != nil {
+		d.beforeTerminalAdmission()
+	}
+	for {
+		d.terminalMu.Lock()
+		current := d.terminals[key]
+		if current != nil && h.TerminalGeneration > current.generation {
+			d.terminalMu.Unlock()
+			current.close()
+			continue
+		}
+		tooMany := len(d.terminals)+d.terminalStarting >= maxTerminalSessions
+		if !tooMany {
+			d.terminalStarting++
+		}
+		d.terminalMu.Unlock()
+		if tooMany {
+			return nil, fmt.Errorf("terminal session limit reached (%d)", maxTerminalSessions)
+		}
+		break
 	}
 	cmd := exec.Command(d.cfg.Shell)
 	cmd.Env = append(scrubbedEnv(), "TERM=xterm-256color")
@@ -775,12 +871,21 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		d.beforeTerminalAction()
 	}
 	if err := relay.ValidateStreamFenceDeadline(actionDeadline, d.actionTime()); err != nil {
+		d.releaseTerminalStarting()
 		d.audit.record(auditEntry{Event: "terminal", Detail: cwd, Allowed: false})
 		return nil, err
 	}
 	d.audit.record(auditEntry{Event: "terminal", Detail: cwd, Allowed: true})
+	if !startPTY() {
+		d.releaseTerminalStarting()
+		return nil, &terminalAdmissionRetryError{reason: "terminal generation was superseded before PTY start"}
+	}
+	if d.beforePTYStart != nil {
+		d.beforePTYStart()
+	}
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
+		d.releaseTerminalStarting()
 		return nil, fmt.Errorf("start pty: %w", err)
 	}
 	// pty.Start's master is not uniformly pollable: creack/pty opens it through
@@ -793,6 +898,7 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		_ = ptmx.Close()
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		d.releaseTerminalStarting()
 		return nil, fmt.Errorf("normalise pty master: %w", err)
 	}
 	// pty.Start runs the shell with Setsid, so it leads a new session and its
@@ -804,6 +910,7 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		_ = ptmx.Close()
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		d.releaseTerminalStarting()
 		return nil, fmt.Errorf("read shell process group: %w", err)
 	}
 	// Unconditional: the header's dimensions were validated at the top of this
@@ -812,20 +919,147 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 		_ = ptmx.Close()
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+		d.releaseTerminalStarting()
 		return nil, fmt.Errorf("set pty size: %w", err)
 	}
-	s := &terminalSession{id: key, recordID: h.TerminalRecordID, generation: h.TerminalGeneration, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
+	s := &terminalSession{id: key, recordID: h.TerminalRecordID, generation: h.TerminalGeneration, admissionSequence: admissionState.sequence, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
 	if s.recordID == "" {
 		s.recordID = key
 		s.generation = 1
 	}
-	d.terminals[key] = s
-	d.addSession(1)
+	for {
+		if !d.beginTerminalPublish(admissionState) {
+			s.close()
+			d.releaseTerminalStarting()
+			return nil, &terminalAdmissionRetryError{reason: "terminal generation was superseded before publish"}
+		}
+		// Another request may have advanced the generation while this PTY was
+		// starting. The map check is re-done after every close, never replaced
+		// under the lock, and the lower mapped generation is retired outside it.
+		if h.TerminalGeneration > 0 && d.terminalFences[key] != h.TerminalGeneration {
+			d.finishTerminalPublish()
+			s.close()
+			d.releaseTerminalStarting()
+			return nil, fmt.Errorf("terminal generation is superseded")
+		}
+		current := d.terminals[key]
+		if current == nil {
+			// Publish the count before the map entry. Reconcile/close can only
+			// observe the entry after this increment, so it cannot decrement a
+			// session that has not yet been counted.
+			d.addSession(1)
+			d.terminals[key] = s
+			d.terminalStarting--
+			d.finishTerminalPublish()
+			break
+		}
+		if h.TerminalGeneration > current.generation {
+			d.finishTerminalPublish()
+			current.close()
+			continue
+		}
+		d.finishTerminalPublish()
+		s.close()
+		d.releaseTerminalStarting()
+		return current, nil
+	}
 	d.logf("terminal session started (%s)", d.cfg.Shell)
 	go s.readPTY()
 	go s.pollActivity()
 	s.startInput()
 	return s, nil
+}
+
+func (d *system) claimTerminalAdmission(key string, generation int) (func(), <-chan struct{}, func() bool, *terminalAdmissionState) {
+	d.terminalAdmissionMu.Lock()
+	defer d.terminalAdmissionMu.Unlock()
+	if d.terminalAdmissions == nil {
+		d.terminalAdmissions = make(map[string]*terminalAdmissionState)
+	}
+	if current := d.terminalAdmissions[key]; current != nil {
+		if generation <= current.generation || current.starting {
+			if d.beforeTerminalAdmissionWait != nil {
+				d.beforeTerminalAdmissionWait()
+			}
+			return func() {}, current.done, nil, nil
+		}
+		current.canceled = true
+		close(current.done)
+	}
+	sequence := d.admissionSequence.Add(1)
+	if d.beforeTerminalAdmissionInstall != nil {
+		d.beforeTerminalAdmissionInstall()
+	}
+	state := &terminalAdmissionState{key: key, generation: generation, sequence: sequence, done: make(chan struct{})}
+	d.terminalAdmissions[key] = state
+	return func() {
+			d.terminalAdmissionMu.Lock()
+			if d.terminalAdmissions[key] == state {
+				delete(d.terminalAdmissions, key)
+				close(state.done)
+			}
+			d.terminalAdmissionMu.Unlock()
+		}, nil, func() bool {
+			d.terminalAdmissionMu.Lock()
+			defer d.terminalAdmissionMu.Unlock()
+			if d.terminalAdmissions[key] != state || state.canceled {
+				return false
+			}
+			state.starting = true
+			return true
+		}, state
+}
+
+func waitForTerminalAdmission(done <-chan struct{}, deadline time.Time) error {
+	if deadline.IsZero() {
+		<-done
+		return nil
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("terminal admission deadline exceeded")
+	}
+}
+
+func (d *system) beginTerminalPublish(state *terminalAdmissionState) bool {
+	d.terminalAdmissionMu.Lock()
+	if d.terminalAdmissions[state.key] != state {
+		d.terminalAdmissionMu.Unlock()
+		return false
+	}
+	if state.canceled {
+		d.terminalAdmissionMu.Unlock()
+		return false
+	}
+	d.terminalMu.Lock()
+	return true
+}
+
+func (d *system) finishTerminalPublish() {
+	d.terminalMu.Unlock()
+	d.terminalAdmissionMu.Unlock()
+}
+
+func (d *system) invalidateTerminalAdmissions(cutoff uint64) {
+	d.terminalAdmissionMu.Lock()
+	for key, state := range d.terminalAdmissions {
+		if state.sequence <= cutoff {
+			state.canceled = true
+			close(state.done)
+			delete(d.terminalAdmissions, key)
+		}
+	}
+	d.terminalAdmissionMu.Unlock()
+}
+
+func (d *system) releaseTerminalStarting() {
+	d.terminalMu.Lock()
+	d.terminalStarting--
+	d.terminalMu.Unlock()
 }
 
 // enforcePolicy ends any live terminal the current policy would no longer
@@ -1696,16 +1930,22 @@ func (s *terminalSession) close() {
 			conn.kill()
 		}
 		s.killProcessGroup()
+		if s.owner != nil && s.owner.afterTerminalProcessTeardown != nil {
+			s.owner.afterTerminalProcessTeardown()
+		}
 
 		if s.owner != nil {
 			s.owner.terminalMu.Lock()
-			if s.owner.terminals[s.id] == s {
+			mapped := s.owner.terminals[s.id] == s
+			if mapped {
 				delete(s.owner.terminals, s.id)
 			}
 			s.owner.terminalMu.Unlock()
-			s.owner.addSession(-1)
-			s.owner.logf("terminal session ended")
-			s.owner.reportTerminalExit(s.recordID, s.generation)
+			if mapped {
+				s.owner.addSession(-1)
+				s.owner.logf("terminal session ended")
+				s.owner.reportTerminalExit(s.recordID, s.generation)
+			}
 		}
 	})
 }

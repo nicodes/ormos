@@ -129,6 +129,17 @@ so whoever read it can decrypt captured traffic from past sessions and the only
 real remedy is regenerating the key. For `config.json` the pairing token in it
 is a bearer credential, so the remedy is signing out and pairing again.
 
+The state-directory lock only coordinates stock agents on this host that use the
+same directory. Copying `config.json` and its pairing token to another host is a
+bearer-token compromise, not something this local lock can protect against. The
+corresponding backend deployment must also reject a lifecycle reset while the
+current tunnel is registered; this local lock is not a substitute for that
+remote safeguard.
+
+The agent also retains a bounded generation fence for up to 1,024 terminal
+record IDs per process lifetime; exceeding that ceiling fails closed and requires
+an agent restart.
+
 Owner bits are left as they are, so a key deliberately made `0400` stays `0400`.
 
 An optional policy can limit what the relay may ask this machine to do:

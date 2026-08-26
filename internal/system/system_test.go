@@ -5,9 +5,15 @@ package system
 import (
 	"bytes"
 	"context"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +80,269 @@ func TestReconnectRunsTerminalReconciliation(t *testing.T) {
 			t.Fatalf("reconnect reconciliation state keep=%v stale=%v", keep, stale)
 		case <-time.After(10 * time.Millisecond):
 		}
+	}
+}
+
+func TestTerminalLifecycleResetGatesCreatePTYAndConnect(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	resetStarted, releaseReset, resetOK := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/system/terminal-sessions/reset" {
+			close(resetStarted)
+			<-releaseReset
+			close(resetOK)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	httpClient = server.Client()
+	d := newSystem(systemConfig{RelayURL: "ws" + strings.TrimPrefix(server.URL, "http"), Shell: "/bin/sh"})
+	connected := make(chan struct{})
+	d.connectAndServeFn = func(ctx context.Context) (bool, error) {
+		close(connected)
+		<-ctx.Done()
+		return false, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.pollPortsFn = func(context.Context) {}
+	done := make(chan struct{})
+	go func() { defer close(done); d.Run(ctx) }()
+	select {
+	case <-resetStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reset did not start")
+	}
+	if _, err := d.createTerminalSession(context.Background(), "project"); err == nil || !strings.Contains(err.Error(), "reset pending") {
+		t.Fatalf("create during held reset = %v", err)
+	}
+	d.resetMu.Lock()
+	d.resetErr = errors.New("reset unavailable")
+	d.resetMu.Unlock()
+	if _, err := d.createTerminalSession(context.Background(), "project"); err == nil || !strings.Contains(err.Error(), "reset failed; retrying") {
+		t.Fatalf("create after failed reset = %v", err)
+	}
+	d.resetMu.Lock()
+	d.resetErr = nil
+	d.resetMu.Unlock()
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "pending", Cols: 80, Rows: 24})
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil || !strings.Contains(err.Error(), "reset pending") {
+		t.Fatalf("PTY start during held reset = %v", err)
+	}
+	d.terminalMu.Lock()
+	if len(d.terminals) != 0 {
+		t.Fatal("reset-gated terminal inserted a session")
+	}
+	d.terminalMu.Unlock()
+	select {
+	case <-connected:
+		t.Fatal("connect started before reset returned 2xx")
+	default:
+	}
+	close(releaseReset)
+	select {
+	case <-resetOK:
+	case <-time.After(time.Second):
+		t.Fatal("reset did not complete")
+	}
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("connect did not start after reset succeeded")
+	}
+	cancel()
+	<-done
+}
+
+func TestConfiguredStartupLocksBeforeAgentActions(t *testing.T) {
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	file := filepath.Join(filepath.Dir(source), "run.go")
+	fset := token.NewFileSet()
+	parsed, err := parser.ParseFile(fset, file, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var startup *ast.FuncDecl
+	for _, decl := range parsed.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "runSystem" {
+			startup = fn
+			break
+		}
+	}
+	if startup == nil {
+		t.Fatal("runSystem not found")
+	}
+	positions := map[string]token.Pos{}
+	ast.Inspect(startup.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		switch fn := call.Fun.(type) {
+		case *ast.Ident:
+			if _, wanted := map[string]bool{"acquireStateDirLock": true, "tokenValid": true, "performLogin": true, "newSystem": true, "runTUI": true}[fn.Name]; wanted && positions[fn.Name] == token.NoPos {
+				positions[fn.Name] = call.Pos()
+			}
+		case *ast.SelectorExpr:
+			if fn.Sel.Name == "Run" && positions["Run"] == token.NoPos {
+				positions["Run"] = call.Pos()
+			}
+		}
+		return true
+	})
+	lockPos := positions["acquireStateDirLock"]
+	if lockPos == token.NoPos {
+		t.Fatal("runSystem does not acquire the state lock")
+	}
+	for _, action := range []string{"tokenValid", "performLogin", "newSystem", "runTUI", "Run"} {
+		if positions[action] == token.NoPos {
+			t.Fatalf("runSystem action %s not found", action)
+		}
+		if lockPos >= positions[action] {
+			t.Fatalf("state lock acquisition moved after startup action %s", action)
+		}
+	}
+}
+
+func TestProjectDeletionSynchronouslyReconcilesLocalTerminals(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	var paths []string
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		paths = append(paths, req.Method+" "+req.URL.Path)
+		if req.Method == http.MethodDelete && req.URL.Path == "/system/projects/project" {
+			return testHTTPResponse(http.StatusNoContent, ""), nil
+		}
+		if req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions" {
+			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+		}
+		return testHTTPResponse(http.StatusNotFound, ""), nil
+	})}
+	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, terminals: make(map[string]*terminalSession)}
+	s := &terminalSession{id: "record", recordID: "record", generation: 1, owner: d, done: make(chan struct{})}
+	d.terminals["record"] = s
+	if err := d.deleteProject(context.Background(), "project"); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if !closed {
+		t.Fatal("project deletion returned before local terminal teardown")
+	}
+	d.waitExitReports()
+	d.terminalMu.Lock()
+	_, mapped := d.terminals["record"]
+	d.terminalMu.Unlock()
+	if mapped || len(paths) < 2 || paths[0] != "DELETE /system/projects/project" || paths[1] != "GET /system/terminal-sessions" {
+		t.Fatalf("delete paths=%v mapped=%v, want DELETE then synchronous reconciliation", paths, mapped)
+	}
+}
+
+func TestTerminalDeletionSynchronouslyReconcilesLocalSession(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	var paths []string
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		paths = append(paths, req.Method+" "+req.URL.Path)
+		if req.Method == http.MethodDelete && req.URL.Path == "/system/terminal-sessions/record" {
+			return testHTTPResponse(http.StatusNoContent, ""), nil
+		}
+		if req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions" {
+			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+		}
+		return testHTTPResponse(http.StatusNotFound, ""), nil
+	})}
+	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, terminals: make(map[string]*terminalSession)}
+	s := &terminalSession{id: "record", recordID: "record", generation: 1, owner: d, done: make(chan struct{})}
+	d.terminals["record"] = s
+	if err := d.deleteTerminalSession(context.Background(), "record"); err != nil {
+		t.Fatal(err)
+	}
+	d.waitExitReports()
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	d.terminalMu.Lock()
+	_, mapped := d.terminals["record"]
+	d.terminalMu.Unlock()
+	if !closed || mapped || len(paths) < 2 || paths[0] != "DELETE /system/terminal-sessions/record" || paths[1] != "GET /system/terminal-sessions" {
+		t.Fatalf("delete paths=%v closed=%v mapped=%v", paths, closed, mapped)
+	}
+}
+
+func TestReconcileDoesNotHoldTerminalMapLockAcrossRelayFetch(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	fetchStarted, releaseFetch := make(chan struct{}), make(chan struct{})
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodGet || req.URL.Path != "/system/terminal-sessions" {
+			return testHTTPResponse(http.StatusNotFound, ""), nil
+		}
+		close(fetchStarted)
+		<-releaseFetch
+		return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+	})}
+	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}}
+	done := make(chan error, 1)
+	go func() { done <- d.reconcileSnapshot(context.Background()) }()
+	select {
+	case <-fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile fetch did not start")
+	}
+	mapLockFree := make(chan struct{})
+	go func() {
+		d.terminalMu.Lock()
+		d.terminalMu.Unlock()
+		close(mapLockFree)
+	}()
+	select {
+	case <-mapLockFree:
+	case <-time.After(time.Second):
+		t.Fatal("reconcile held terminalMu across relay HTTP")
+	}
+	close(releaseFetch)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReconcileSkipsSessionReplacedDuringFetch(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	fetchStarted, releaseFetch := make(chan struct{}), make(chan struct{})
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		close(fetchStarted)
+		<-releaseFetch
+		return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+	})}
+	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, terminals: make(map[string]*terminalSession)}
+	old := &terminalSession{id: "record", recordID: "record", generation: 1, owner: d, done: make(chan struct{})}
+	replacement := &terminalSession{id: "record", recordID: "record", generation: 2, admissionSequence: 1, owner: d, done: make(chan struct{})}
+	d.terminals["record"] = old
+	done := make(chan error, 1)
+	go func() { done <- d.reconcileSnapshot(context.Background()) }()
+	<-fetchStarted
+	d.terminalMu.Lock()
+	d.terminals["record"] = replacement
+	d.terminalMu.Unlock()
+	close(releaseFetch)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	replacement.mu.Lock()
+	closed := replacement.closed
+	replacement.mu.Unlock()
+	if closed {
+		t.Fatal("reconcile closed a replacement that was not in its fetched snapshot")
 	}
 }
 
