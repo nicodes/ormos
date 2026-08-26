@@ -3,11 +3,13 @@
 package system
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -16,6 +18,45 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/nicodes/ormos/relay"
 )
+
+func TestTUIWaitsForRunShutdownBeforeReturning(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{})
+	d.resetDone = true
+	d.pollPortsFn = func(context.Context) {}
+	runStarted := make(chan struct{})
+	runStopped := make(chan struct{})
+	d.connectAndServeFn = func(ctx context.Context) (bool, error) {
+		close(runStarted)
+		<-ctx.Done()
+		close(runStopped)
+		return false, ctx.Err()
+	}
+	oldProgram := runTUIProgram
+	t.Cleanup(func() { runTUIProgram = oldProgram })
+	runTUIProgram = func(context.Context, *system) {
+		select {
+		case <-runStarted:
+		case <-time.After(time.Second):
+			t.Fatal("Run did not reach connect before the UI returned")
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		runTUI(context.Background(), d)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("TUI returned without joining Run shutdown")
+	}
+	select {
+	case <-runStopped:
+	default:
+		t.Fatal("TUI returned before Run shutdown completed")
+	}
+}
 
 // sized builds a model and drives it through a resize and a tick, which is the
 // state every real render is in: a View at width 0 exercises none of the
@@ -37,8 +78,8 @@ func terminalDashboard(t *testing.T) model {
 		{ID: "project-a", Name: "alpha", RootDir: "/alpha", Ports: []relay.PortEntry{{ID: "port-a", Port: 3000}}},
 	}})
 	next, _ = next.(model).Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
-		{ID: "record-b", ProjectID: "project-a", SessionID: "z-tab"},
-		{ID: "record-a", ProjectID: "project-a", SessionID: "a-tab"},
+		{ID: "record-b", ProjectID: "project-a", SessionID: "z-tab", State: relay.TerminalStateRunning, Generation: 1},
+		{ID: "record-a", ProjectID: "project-a", SessionID: "a-tab", State: relay.TerminalStateRunning, Generation: 1},
 	}})
 	return next.(model)
 }
@@ -60,13 +101,13 @@ func TestTerminalRowsAndSanitizedLabels(t *testing.T) {
 
 	raw := "\x1b]0;owned\a"
 	next, _ := m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{
-		ID: "record", ProjectID: "project-a", SessionID: raw,
+		ID: "record", ProjectID: "project-a", SessionID: raw, State: relay.TerminalStateRunning, Generation: 1,
 	}}})
 	m = next.(model)
 	if m.terminals[0].info.SessionID != raw || m.terminals[0].label != "]0;owned" {
 		t.Fatalf("terminal = raw %q label %q", m.terminals[0].info.SessionID, m.terminals[0].label)
 	}
-	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{ProjectID: "project-a", SessionID: "\x00\a"}}})
+	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{ID: "record", ProjectID: "project-a", SessionID: "\x00\a", State: relay.TerminalStateRunning, Generation: 1}}})
 	if got := next.(model).terminals[0].label; got != "terminal" {
 		t.Fatalf("empty sanitized label = %q", got)
 	}
@@ -90,9 +131,9 @@ func TestCursorUsesDurableIdentityAcrossRefreshes(t *testing.T) {
 		t.Fatalf("project refresh selected %#v", r)
 	}
 	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
-		{ProjectID: "project-a", SessionID: "0-new"},
-		{ProjectID: "project-a", SessionID: "z-tab"},
-		{ProjectID: "project-a", SessionID: "zz-after"},
+		{ID: "new", ProjectID: "project-a", SessionID: "0-new", State: relay.TerminalStateRunning, Generation: 1},
+		{ID: "record-b", ProjectID: "project-a", SessionID: "z-tab", State: relay.TerminalStateRunning, Generation: 1},
+		{ID: "after", ProjectID: "project-a", SessionID: "zz-after", State: relay.TerminalStateRunning, Generation: 1},
 	}})
 	m = next.(model)
 	if r, _ := m.selectedRow(); r.kind != rowTerminal || r.itemID != "z-tab" {
@@ -100,8 +141,8 @@ func TestCursorUsesDurableIdentityAcrossRefreshes(t *testing.T) {
 	}
 
 	next, _ = m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{
-		{ProjectID: "project-a", SessionID: "0-new"},
-		{ProjectID: "project-a", SessionID: "zz-after"},
+		{ID: "new", ProjectID: "project-a", SessionID: "0-new", State: relay.TerminalStateRunning, Generation: 1},
+		{ID: "after", ProjectID: "project-a", SessionID: "zz-after", State: relay.TerminalStateRunning, Generation: 1},
 	}})
 	m = next.(model)
 	if r, _ := m.selectedRow(); r.kind != rowAddTerminal || r.projectID != "project-a" {
@@ -119,10 +160,10 @@ func TestTerminalCreationPersistsBeforeAttach(t *testing.T) {
 	})
 	client := newFakeTerminalAttachment()
 	attached := 0
-	attachTerminalScreen = func(_ *system, root, key string, cols, rows int) (terminalAttachment, error) {
+	attachTerminalScreen = func(_ *system, root string, info relay.TerminalSessionInfo, cols, rows int) (terminalAttachment, error) {
 		attached++
-		if root != "/alpha" || !strings.HasPrefix(key, "project-a:") || cols != 80 || rows != 27 {
-			t.Fatalf("attach root=%q key=%q size=%dx%d", root, key, cols, rows)
+		if root != "/alpha" || info.ID != "record" || info.State != relay.TerminalStateRunning || info.Generation != 1 || cols != 80 || rows != 27 {
+			t.Fatalf("attach root=%q info=%+v size=%dx%d", root, info, cols, rows)
 		}
 		return client, nil
 	}
@@ -131,12 +172,12 @@ func TestTerminalCreationPersistsBeforeAttach(t *testing.T) {
 		if req.Method != http.MethodPost {
 			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
 		}
-		return testHTTPResponse(http.StatusOK, `{"id":"record"}`), nil
+		return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project-a","session_id":"AAAAAAAAAAAAAAAAAAAAAAAA","state":"running","generation":1}`), nil
 	})}
 	m.cursor = rowIndex(m.rows, rowAddTerminal, "project-a", "")
 	_, createCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	created, ok := createCmd().(terminalCreatedMsg)
-	if !ok || created.err != nil || created.projectID != "project-a" || created.sessionID == "" {
+	if !ok || created.err != nil || created.info.ID != "record" || created.info.SessionID == "" {
 		t.Fatalf("create command = %#v", created)
 	}
 	next, startCmd := m.Update(created)
@@ -161,6 +202,92 @@ func TestTerminalCreationPersistsBeforeAttach(t *testing.T) {
 	next, _ = failed.Update(refresh())
 	if next.(model).err != failed.err {
 		t.Fatalf("successful re-list cleared create error: before %q after %q", failed.err, next.(model).err)
+	}
+}
+
+func TestExitedTerminalEnterRestartsBeforeAttach(t *testing.T) {
+	m := terminalDashboard(t)
+	next, _ := m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{ID: "record", ProjectID: "project-a", SessionID: "a-tab", State: relay.TerminalStateExited, Generation: 3}}})
+	m = next.(model)
+	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")
+	oldClient, oldAttach := httpClient, attachTerminalScreen
+	t.Cleanup(func() { httpClient, attachTerminalScreen = oldClient, oldAttach })
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodPost || req.URL.Path != "/system/terminal-sessions/record/restart" {
+			t.Fatalf("restart request=%s %s", req.Method, req.URL.Path)
+		}
+		return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project-a","session_id":"a-tab","state":"running","generation":4}`), nil
+	})}
+	_, restartCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	created, ok := restartCmd().(terminalCreatedMsg)
+	if !ok || created.info.ID != "record" || created.info.Generation != 4 {
+		t.Fatalf("restart result=%#v", created)
+	}
+	client := newFakeTerminalAttachment()
+	attachTerminalScreen = func(_ *system, _ string, info relay.TerminalSessionInfo, _, _ int) (terminalAttachment, error) {
+		if info.ID != "record" || info.Generation != 4 {
+			t.Fatalf("attach info=%+v", info)
+		}
+		return client, nil
+	}
+	updated, _ := m.Update(created)
+	if updated.(model).mode != modeTerminal {
+		t.Fatal("restarted terminal did not enter terminal mode")
+	}
+}
+
+func TestTerminalStateLabelsAndNoticesMatchActions(t *testing.T) {
+	m := terminalDashboard(t)
+	for _, tc := range []struct {
+		state string
+		want  string
+		avoid string
+	}{
+		{relay.TerminalStateExited, "enter restart", "open in TUI"},
+		{relay.TerminalStateClosing, "d delete", "enter open in TUI"},
+		{"future-state", "terminal unavailable", "enter open in TUI"},
+	} {
+		next, _ := m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{
+			ID: "record", ProjectID: "project-a", SessionID: "a-tab", State: tc.state, Generation: 3,
+		}}})
+		viewModel := next.(model)
+		viewModel.cursor = rowIndex(viewModel.rows, rowTerminal, "project-a", "a-tab")
+		view := viewModel.View()
+		if !strings.Contains(view, tc.want) || strings.Contains(view, tc.avoid) {
+			t.Fatalf("state=%s view lacks truthful footer: %q", tc.state, view)
+		}
+	}
+	m.notice = ""
+	next, _ := m.Update(terminalCreatedMsg{info: relay.TerminalSessionInfo{ID: "record", SessionID: "a-tab", State: relay.TerminalStateRunning, Generation: 4}, restarted: true, err: nil})
+	if got := next.(model).notice; got != "terminal restarted" {
+		t.Fatalf("restart notice=%q", got)
+	}
+}
+
+func TestTerminalDeleteNoticeReportsCompletion(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodDelete && req.URL.Path == "/system/terminal-sessions/record-a":
+			return testHTTPResponse(http.StatusNoContent, ""), nil
+		case req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions":
+			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, ""), nil
+		}
+	})}
+	m := terminalDashboard(t)
+	m.d.cfg.RelayURL = "ws://relay.test"
+	m.d.resetDone = true
+	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	if cmd == nil {
+		t.Fatal("terminal delete did not return a mutation command")
+	}
+	next, _ := m.Update(cmd())
+	if got := next.(model).notice; got != "terminal deleted" {
+		t.Fatalf("terminal delete notice=%q, want completed wording", got)
 	}
 }
 

@@ -72,11 +72,12 @@ const (
 	// LegacyV0 is a backend capability sentinel for header absence, never a
 	// value an agent may send. Explicit "0" is unsupported. Version 1 introduced
 	// agent-enforced action fences; version 2 adds the terminal shutdown
-	// acknowledgment. This agent advertises only the current v2 capability.
+	// acknowledgment; version 3 adds lifecycle-aware terminal records.
 	StreamFenceVersionLegacyV0 = ""
 	StreamFenceVersionV1       = "1"
 	StreamFenceVersionV2       = "2"
-	StreamFenceVersion         = StreamFenceVersionV2
+	StreamFenceVersionV3       = "3"
+	StreamFenceVersion         = StreamFenceVersionV3
 )
 
 // ValidTerminalSize reports whether a terminal's dimensions are within bounds.
@@ -113,14 +114,16 @@ const (
 // (yamux client) opens a stream and writes this; the system (yamux server)
 // reads it to decide how to handle the stream.
 type StreamHeader struct {
-	Kind          StreamKind `json:"kind"`
-	Port          int        `json:"port,omitempty"`            // for KindProxy: local TCP port to dial
-	Cols          int        `json:"cols,omitempty"`            // for KindTerminal: initial columns
-	Rows          int        `json:"rows,omitempty"`            // for KindTerminal: initial rows
-	Cwd           string     `json:"cwd,omitempty"`             // for KindTerminal: working directory
-	SessionID     string     `json:"session_id,omitempty"`      // for KindTerminal: stable tab identity
-	ActionFence   string     `json:"action_fence,omitempty"`    // opaque durable side-effect capability
-	NotAfterMilli int64      `json:"not_after_milli,omitempty"` // agent refuses the action at/after this instant
+	Kind               StreamKind `json:"kind"`
+	Port               int        `json:"port,omitempty"`       // for KindProxy: local TCP port to dial
+	Cols               int        `json:"cols,omitempty"`       // for KindTerminal: initial columns
+	Rows               int        `json:"rows,omitempty"`       // for KindTerminal: initial rows
+	Cwd                string     `json:"cwd,omitempty"`        // for KindTerminal: working directory
+	SessionID          string     `json:"session_id,omitempty"` // for KindTerminal: stable tab identity
+	TerminalRecordID   string     `json:"terminal_record_id,omitempty"`
+	TerminalGeneration int        `json:"terminal_generation,omitempty"`
+	ActionFence        string     `json:"action_fence,omitempty"`    // opaque durable side-effect capability
+	NotAfterMilli      int64      `json:"not_after_milli,omitempty"` // agent refuses the action at/after this instant
 }
 
 const maxActionFenceFuture = time.Minute

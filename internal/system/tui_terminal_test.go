@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/nicodes/ormos/relay"
 )
 
 type fakeTerminalAttachment struct {
@@ -67,9 +68,9 @@ func openTestTerminal(t *testing.T) (model, *fakeTerminalAttachment, tea.Cmd) {
 	client := newFakeTerminalAttachment()
 	oldAttach := attachTerminalScreen
 	t.Cleanup(func() { attachTerminalScreen = oldAttach })
-	attachTerminalScreen = func(_ *system, root, key string, cols, rows int) (terminalAttachment, error) {
-		if root != "/alpha" || key != "project-a:a-tab" || cols != 80 || rows != 27 {
-			t.Fatalf("attach root=%q key=%q size=%dx%d", root, key, cols, rows)
+	attachTerminalScreen = func(_ *system, root string, info relay.TerminalSessionInfo, cols, rows int) (terminalAttachment, error) {
+		if root != "/alpha" || info.SessionID != "a-tab" || info.State != relay.TerminalStateRunning || info.Generation != 1 || cols != 80 || rows != 27 {
+			t.Fatalf("attach root=%q info=%+v size=%dx%d", root, info, cols, rows)
 		}
 		return client, nil
 	}
@@ -194,7 +195,9 @@ func TestTerminalScreenIgnoresStaleAttachAfterDetach(t *testing.T) {
 	client := newFakeTerminalAttachment()
 	oldAttach := attachTerminalScreen
 	t.Cleanup(func() { attachTerminalScreen = oldAttach })
-	attachTerminalScreen = func(*system, string, string, int, int) (terminalAttachment, error) { return client, nil }
+	attachTerminalScreen = func(*system, string, relay.TerminalSessionInfo, int, int) (terminalAttachment, error) {
+		return client, nil
+	}
 	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")
 	next, command := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(model)
@@ -215,7 +218,7 @@ func TestTerminalScreenIgnoresStaleAttachAfterDetach(t *testing.T) {
 func TestTerminalScreenDetachesSupersededClient(t *testing.T) {
 	m, client, _ := openTestTerminal(t)
 	next, command := m.Update(terminalCreatedMsg{
-		projectID: "project-a", projectRoot: "/alpha", sessionID: "new-tab",
+		projectRoot: "/alpha", info: relay.TerminalSessionInfo{ID: "new-record", ProjectID: "project-a", SessionID: "new-tab", State: relay.TerminalStateRunning, Generation: 1},
 	})
 	m = next.(model)
 	_, _, detached := client.snapshot()
@@ -228,7 +231,7 @@ func TestTerminalScreenAttachFailureReturnsSafely(t *testing.T) {
 	m := terminalDashboard(t)
 	oldAttach := attachTerminalScreen
 	t.Cleanup(func() { attachTerminalScreen = oldAttach })
-	attachTerminalScreen = func(*system, string, string, int, int) (terminalAttachment, error) {
+	attachTerminalScreen = func(*system, string, relay.TerminalSessionInfo, int, int) (terminalAttachment, error) {
 		return nil, errors.New("denied\x1b]0;owned\a")
 	}
 	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")

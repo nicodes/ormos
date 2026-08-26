@@ -80,11 +80,15 @@ type terminalFinishedMsg struct {
 	err        error
 }
 
-var attachTerminalScreen = func(d *system, projectRoot, terminalKey string, cols, rows int) (terminalAttachment, error) {
-	return d.AttachTerminal(projectRoot, terminalKey, cols, rows)
+var attachTerminalScreen = func(d *system, projectRoot string, info relay.TerminalSessionInfo, cols, rows int) (terminalAttachment, error) {
+	return d.AttachTerminal(projectRoot, info, cols, rows)
 }
 
-func (m model) startTerminal(projectRoot, terminalKey, label string) (model, tea.Cmd) {
+func (m model) startTerminal(projectRoot string, info relay.TerminalSessionInfo, label string) (model, tea.Cmd) {
+	if info.State != relay.TerminalStateRunning || info.ID == "" || info.Generation <= 0 {
+		m.err = "terminal is not running"
+		return m, nil
+	}
 	if m.term != nil && m.term.client != nil {
 		m.term.client.Detach()
 	}
@@ -94,27 +98,25 @@ func (m model) startTerminal(projectRoot, terminalKey, label string) (model, tea
 	} else {
 		label = "terminal"
 	}
-	m.mode = modeTerminal
-	m.err = ""
+	m.mode, m.err = modeTerminal, ""
 	m.term = &terminalScreen{generation: m.termGeneration, label: label}
-
-	generation := m.termGeneration
+	uiGeneration := m.termGeneration
 	cols, rows := terminalDimensions(m.width, m.height)
 	ctx, d := m.appCtx, m.d
 	return m, func() tea.Msg {
 		if err := ctx.Err(); err != nil {
-			return terminalAttachedMsg{generation: generation, err: err}
+			return terminalAttachedMsg{generation: uiGeneration, err: err}
 		}
-		client, err := attachTerminalScreen(d, projectRoot, terminalKey, cols, rows)
+		client, err := attachTerminalScreen(d, projectRoot, info, cols, rows)
 		if err == nil {
 			select {
 			case <-ctx.Done():
 				client.Detach()
-				return terminalAttachedMsg{generation: generation, err: ctx.Err()}
+				return terminalAttachedMsg{generation: uiGeneration, err: ctx.Err()}
 			default:
 			}
 		}
-		return terminalAttachedMsg{generation: generation, client: client, cols: cols, rows: rows, err: err}
+		return terminalAttachedMsg{generation: uiGeneration, client: client, cols: cols, rows: rows, err: err}
 	}
 }
 

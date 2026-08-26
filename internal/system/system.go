@@ -14,8 +14,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -24,7 +26,16 @@ import (
 
 var terminalSessionRandom = rand.Read
 
-const terminalSessionCreateAttempts = 8
+const (
+	terminalSessionCreateAttempts = 8
+	terminalFenceLimit            = 1024
+)
+
+var (
+	terminalExitReportBackoff    = 500 * time.Millisecond
+	terminalExitReportMaxBackoff = 30 * time.Second
+	terminalExitReportShutdownTO = 5 * time.Second
+)
 
 type relayHTTPError struct {
 	statusCode int
@@ -46,18 +57,47 @@ type PortStatus struct {
 type system struct {
 	cfg systemConfig
 
-	mu         sync.Mutex
-	connected  bool
-	sessions   int
-	logs       []string     // ring buffer of recent log lines
-	ports      []PortStatus // configured ports across this system's projects
-	listening  []int        // host's currently-listening loopback ports (cached)
-	echoStderr bool
-	echoWriter io.Writer
-	cancel     context.CancelFunc // stops the whole agent (relay-requested shutdown)
-	events     chan struct{}      // relay→TUI "data changed" nudges (coalesced)
-	terminalMu sync.Mutex
-	terminals  map[string]*terminalSession
+	mu               sync.Mutex
+	connected        bool
+	sessions         int
+	logs             []string     // ring buffer of recent log lines
+	ports            []PortStatus // configured ports across this system's projects
+	listening        []int        // host's currently-listening loopback ports (cached)
+	echoStderr       bool
+	echoWriter       io.Writer
+	cancel           context.CancelFunc // stops the whole agent (relay-requested shutdown)
+	events           chan struct{}      // relay→TUI "data changed" nudges (coalesced)
+	terminalMu       sync.Mutex
+	terminals        map[string]*terminalSession
+	terminalStarting int
+	// terminalFences intentionally retain the highest generation seen for each
+	// record. A delayed stream must not become valid again after close/delete;
+	// the relay's durable record list is the authority for deciding whether a
+	// new generation may be admitted, while this monotonic fence protects the
+	// interval between that decision and PTY insertion.
+	terminalFences      map[string]int
+	terminalAdmissionMu sync.Mutex
+	terminalAdmissions  map[string]*terminalAdmissionState
+	admissionSequence   atomic.Uint64
+	shuttingDown        bool
+	activeAdmissions    int
+	admissionsIdle      chan struct{}
+	exitReportsClosed   bool
+	publishedTerminals  map[*terminalSession]struct{}
+	publishedClose      sync.WaitGroup
+	reconcileStateMu    sync.Mutex
+	reconcileRunning    bool
+	reconcileAgain      bool
+	reconcileDone       chan struct{}
+	reconcileCancel     context.CancelFunc
+	resetMu             sync.Mutex
+	resetDone           bool
+	resetErr            error
+	runCtx              context.Context
+	exitReportCtx       context.Context
+	exitReportCancel    context.CancelFunc
+	exitReportReady     chan struct{}
+	exitReports         sync.WaitGroup
 
 	policy  policy   // local restrictions the agent enforces itself
 	audit   *auditor // append-only record of relay-requested actions
@@ -70,13 +110,26 @@ type system struct {
 
 	// Test seams for parking execution at the external-action boundaries. They
 	// remain nil in production. proxyDialContext defaults to net.Dialer.
-	beforeShutdownAction func()
-	beforeProxyDial      func()
-	afterProxyDial       func()
-	beforeTerminalAction func()
-	proxyDialContext     func(context.Context, string, string) (net.Conn, error)
-	shutdownAckSlots     chan struct{}
-	actionNow            func() time.Time
+	beforeShutdownAction               func()
+	beforeProxyDial                    func()
+	afterProxyDial                     func()
+	beforeTerminalAction               func()
+	beforeTerminalAdmission            func()
+	beforePTYStart                     func()
+	beforeTerminalAdmissionWait        func()
+	beforeTerminalAdmissionInstall     func()
+	beforeReconcileAdmissionCutoff     func()
+	afterTerminalProcessTeardown       func()
+	beforeTerminalExitReport           func()
+	afterShutdownAdmissionInvalidation func()
+	beforeExitReportContext            func()
+	beforeExitReportContextPublish     func()
+	beforeExitReportContextWait        func()
+	proxyDialContext                   func(context.Context, string, string) (net.Conn, error)
+	shutdownAckSlots                   chan struct{}
+	actionNow                          func() time.Time
+	connectAndServeFn                  func(context.Context) (bool, error)
+	pollPortsFn                        func(context.Context)
 }
 
 // setCancel lets the agent shut itself down when the relay asks it to.
@@ -84,6 +137,51 @@ func (d *system) setCancel(cancel context.CancelFunc) {
 	d.mu.Lock()
 	d.cancel = cancel
 	d.mu.Unlock()
+}
+
+func (d *system) lifecycleContext() context.Context {
+	d.mu.Lock()
+	ctx := d.runCtx
+	d.mu.Unlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func (d *system) exitReportContextState() (context.Context, bool) {
+	d.mu.Lock()
+	ctx := d.exitReportCtx
+	shutdownCtx := ctx != nil
+	if ctx == nil {
+		ctx = d.runCtx
+	}
+	d.mu.Unlock()
+	if ctx == nil {
+		return context.Background(), shutdownCtx
+	}
+	return ctx, shutdownCtx
+}
+
+func (d *system) waitForExitReportContext() bool {
+	if d.beforeExitReportContextWait != nil {
+		d.beforeExitReportContextWait()
+	}
+	d.mu.Lock()
+	ready := d.exitReportReady
+	if ready == nil {
+		ready = make(chan struct{})
+		d.exitReportReady = ready
+	}
+	d.mu.Unlock()
+	timer := time.NewTimer(terminalExitReportShutdownTO + time.Duration(maxTerminalSessions)*terminalKillGrace)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // shutdownCancel returns the root cancellation installed by Run. Looking it up
@@ -414,6 +512,10 @@ func (d *system) proxyPortAllowed(port int) bool {
 // relayDo performs a pairing-token-authenticated request to the relay and, for
 // non-2xx responses, returns an error carrying the relay's {"error":...} message.
 func (d *system) relayDo(ctx context.Context, method, path string, body any) ([]byte, error) {
+	return d.relayDoWithClient(ctx, httpClient, method, path, body)
+}
+
+func (d *system) relayDoWithClient(ctx context.Context, client *http.Client, method, path string, body any) ([]byte, error) {
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -431,7 +533,7 @@ func (d *system) relayDo(ctx context.Context, method, path string, body any) ([]
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -498,29 +600,370 @@ func (d *system) fetchTerminalSessions(ctx context.Context) ([]relay.TerminalSes
 	return out.Sessions, nil
 }
 
+func (d *system) resetTerminalSessions(ctx context.Context) error {
+	_, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions/reset", nil)
+	return err
+}
+
+// terminalLifecycleReady is deliberately checked by both persistence and PTY
+// creation. Run performs the reset before opening the tunnel, but the TUI can
+// issue a command while that first reset is still pending.
+func (d *system) terminalLifecycleReady() error {
+	if d.shutdownStarted() {
+		return errors.New("terminal lifecycle is shutting down")
+	}
+	if d.cfg.RelayURL == "" {
+		return nil
+	}
+	d.resetMu.Lock()
+	defer d.resetMu.Unlock()
+	if d.resetDone {
+		return nil
+	}
+	if d.resetErr != nil {
+		return fmt.Errorf("terminal lifecycle reset failed; retrying: %w", d.resetErr)
+	}
+	return errors.New("terminal lifecycle reset pending")
+}
+
+func (d *system) shutdownStarted() bool {
+	d.terminalAdmissionMu.Lock()
+	started := d.shuttingDown
+	d.terminalAdmissionMu.Unlock()
+	return started
+}
+
+func (d *system) reportTerminalExit(recordID string, generation int) {
+	if recordID == "" || generation <= 0 || d.cfg.RelayURL == "" {
+		return
+	}
+	d.terminalAdmissionMu.Lock()
+	if d.exitReportsClosed {
+		d.terminalAdmissionMu.Unlock()
+		return
+	}
+	d.exitReports.Add(1)
+	d.terminalAdmissionMu.Unlock()
+	client := httpClient
+	go func() {
+		defer d.exitReports.Done()
+		backoff := terminalExitReportBackoff
+		for {
+			ctx, shutdownCtx := d.exitReportContextState()
+			if ctx.Err() != nil {
+				if shutdownCtx {
+					return
+				}
+				if d.shutdownStarted() {
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				if !d.waitForExitReportContext() {
+					return
+				}
+				continue
+			}
+			requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			_, err := d.relayDoWithClient(requestCtx, client, http.MethodPost, "/system/terminal-sessions/"+url.PathEscape(recordID)+"/exit", struct {
+				Generation int `json:"generation"`
+			}{generation})
+			cancel()
+			if err == nil {
+				return
+			}
+			var he *relayHTTPError
+			if errors.As(err, &he) && (he.statusCode == http.StatusNotFound || he.statusCode == http.StatusConflict) {
+				return
+			}
+			if errors.As(err, &he) && he.statusCode >= 400 && he.statusCode < 500 &&
+				he.statusCode != http.StatusRequestTimeout && he.statusCode != http.StatusTooManyRequests {
+				d.logf("terminal exit report: %v", err)
+				return
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				if shutdownCtx {
+					return
+				}
+				if d.shutdownStarted() {
+					continue
+				}
+				if !d.waitForExitReportContext() {
+					return
+				}
+				continue
+			case <-timer.C:
+			}
+			if backoff < terminalExitReportMaxBackoff {
+				backoff *= 2
+				if backoff > terminalExitReportMaxBackoff {
+					backoff = terminalExitReportMaxBackoff
+				}
+			}
+		}
+	}()
+}
+
+func (d *system) waitExitReports() { d.exitReports.Wait() }
+
+func (d *system) finishShutdown() {
+	d.terminalAdmissionMu.Lock()
+	if d.shuttingDown {
+		d.terminalAdmissionMu.Unlock()
+		return
+	}
+	d.shuttingDown = true
+	if d.beforeExitReportContextPublish != nil {
+		d.beforeExitReportContextPublish()
+	}
+	// Publish a usable background shutdown context immediately. A report worker
+	// can already be observing runCtx cancellation before this lock is reached;
+	// the ready channel lets it synchronize without dropping the report. The
+	// shutdown deadline is started after terminal teardown below, not here.
+	d.mu.Lock()
+	d.exitReportCtx, d.exitReportCancel = context.WithCancel(context.Background())
+	if d.exitReportReady == nil {
+		d.exitReportReady = make(chan struct{})
+	}
+	close(d.exitReportReady)
+	d.mu.Unlock()
+	for key, state := range d.terminalAdmissions {
+		state.canceled = true
+		close(state.done)
+		delete(d.terminalAdmissions, key)
+	}
+	idle := d.admissionsIdle
+	if d.activeAdmissions == 0 {
+		idle = nil
+	}
+	d.terminalAdmissionMu.Unlock()
+	if d.afterShutdownAdmissionInvalidation != nil {
+		d.afterShutdownAdmissionInvalidation()
+	}
+	if idle != nil {
+		<-idle
+	}
+
+	d.terminalMu.Lock()
+	sessions := make([]*terminalSession, 0, len(d.terminals))
+	for _, s := range d.terminals {
+		sessions = append(sessions, s)
+	}
+	d.terminalMu.Unlock()
+	for _, s := range sessions {
+		s.close()
+	}
+	// No admission can register after shuttingDown and the admission activity
+	// drain above. Waiting is therefore safe: there is no Add concurrent with
+	// Wait, and it also covers a published session removed from terminals before
+	// it reached reportTerminalExit.
+	d.publishedClose.Wait()
+	if d.beforeExitReportContext != nil {
+		d.beforeExitReportContext()
+	}
+	// Start the bounded report window only after all published close operations
+	// have completed, so slow process teardown cannot consume report time.
+	d.mu.Lock()
+	reportCancel := d.exitReportCancel
+	d.mu.Unlock()
+	reportDeadline := time.AfterFunc(terminalExitReportShutdownTO, reportCancel)
+	d.terminalAdmissionMu.Lock()
+	d.exitReportsClosed = true
+	d.terminalAdmissionMu.Unlock()
+	d.waitExitReports()
+	d.mu.Lock()
+	cancel := d.exitReportCancel
+	d.exitReportCancel = nil
+	d.mu.Unlock()
+	reportDeadline.Stop()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (d *system) reconcileSnapshot(ctx context.Context) error {
+	if d.beforeReconcileAdmissionCutoff != nil {
+		d.beforeReconcileAdmissionCutoff()
+	}
+	d.terminalAdmissionMu.Lock()
+	cutoff := d.admissionSequence.Load()
+	d.terminalAdmissionMu.Unlock()
+	rows, err := d.fetchTerminalSessions(ctx)
+	if err != nil {
+		return err
+	}
+	d.invalidateTerminalAdmissions(cutoff)
+	valid := make(map[string]relay.TerminalSessionInfo, len(rows))
+	for _, row := range rows {
+		valid[row.ID] = row
+	}
+	d.terminalMu.Lock()
+	after := make(map[string]*terminalSession, len(d.terminals))
+	for id, s := range d.terminals {
+		after[id] = s
+	}
+	d.terminalMu.Unlock()
+	for id, s := range after {
+		if s.admissionSequence > cutoff {
+			continue
+		}
+		d.terminalMu.Lock()
+		if d.terminals[id] != s {
+			d.terminalMu.Unlock()
+			continue
+		}
+		row, ok := valid[id]
+		if ok && row.State == relay.TerminalStateRunning && row.Generation == s.generation {
+			d.terminalMu.Unlock()
+			continue
+		}
+		d.terminalMu.Unlock()
+		s.close()
+	}
+	return nil
+}
+
+// reconcileTerminalSessions is level-triggered: the durable list is authoritative,
+// and the returned signal closes when the current worker exits.
+func (d *system) reconcileTerminalSessions() <-chan struct{} {
+	d.reconcileStateMu.Lock()
+	if d.reconcileRunning {
+		d.reconcileAgain = true
+		done := d.reconcileDone
+		d.reconcileStateMu.Unlock()
+		return done
+	}
+	d.reconcileRunning = true
+	d.reconcileDone = make(chan struct{})
+	done := d.reconcileDone
+	workerCtx, cancel := context.WithCancel(d.lifecycleContext())
+	d.reconcileCancel = cancel
+	d.reconcileStateMu.Unlock()
+	go func() {
+		defer func() {
+			cancel()
+			d.reconcileStateMu.Lock()
+			d.reconcileRunning = false
+			d.reconcileCancel = nil
+			close(done)
+			d.reconcileDone = nil
+			d.reconcileStateMu.Unlock()
+		}()
+		backoff := 100 * time.Millisecond
+		for {
+			ctx, timeout := context.WithTimeout(workerCtx, 8*time.Second)
+			err := d.reconcileSnapshot(ctx)
+			timeout()
+			if err != nil {
+				timer := time.NewTimer(backoff)
+				select {
+				case <-workerCtx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				if backoff < 2*time.Second {
+					backoff *= 2
+					if backoff > 2*time.Second {
+						backoff = 2 * time.Second
+					}
+				}
+			} else {
+				backoff = 100 * time.Millisecond
+			}
+			d.reconcileStateMu.Lock()
+			again := d.reconcileAgain || err != nil
+			d.reconcileAgain = false
+			if !again {
+				d.reconcileStateMu.Unlock()
+				return
+			}
+			d.reconcileStateMu.Unlock()
+		}
+	}()
+	return done
+}
+
+func (d *system) reconcileTerminalSessionsSync(ctx context.Context) error {
+	d.reconcileStateMu.Lock()
+	if d.reconcileRunning {
+		cancel := d.reconcileCancel
+		done := d.reconcileDone
+		if cancel != nil {
+			cancel()
+		}
+		d.reconcileStateMu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	} else {
+		d.reconcileStateMu.Unlock()
+	}
+	return d.reconcileSnapshot(ctx)
+}
+
 // createTerminalSession persists a new terminal tab before any local PTY is
 // attached. A transport failure is deliberately not retried: the relay may
 // have committed the record before the connection failed. Only an explicit
 // duplicate response proves that generating a fresh id is safe.
-func (d *system) createTerminalSession(ctx context.Context, projectID string) (string, error) {
+func (d *system) createTerminalSession(ctx context.Context, projectID string) (relay.TerminalSessionInfo, error) {
+	if err := d.terminalLifecycleReady(); err != nil {
+		return relay.TerminalSessionInfo{}, err
+	}
 	for range terminalSessionCreateAttempts {
 		sessionID, err := newTerminalSessionID()
 		if err != nil {
-			return "", fmt.Errorf("generate terminal session id: %w", err)
+			return relay.TerminalSessionInfo{}, fmt.Errorf("generate terminal session id: %w", err)
 		}
-		_, err = d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions", struct {
+		data, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions", struct {
 			ProjectID string `json:"project_id"`
 			SessionID string `json:"session_id"`
 		}{ProjectID: projectID, SessionID: sessionID})
 		if err == nil {
-			return sessionID, nil
+			var info relay.TerminalSessionInfo
+			if err := json.Unmarshal(data, &info); err != nil {
+				return relay.TerminalSessionInfo{}, fmt.Errorf("decode terminal session: %w", err)
+			}
+			if info.ID == "" || info.ProjectID != projectID || info.SessionID != sessionID || info.State != relay.TerminalStateRunning || info.Generation <= 0 {
+				return relay.TerminalSessionInfo{}, fmt.Errorf("create returned invalid terminal session")
+			}
+			return info, nil
 		}
 		var httpErr *relayHTTPError
 		if !errors.As(err, &httpErr) || httpErr.statusCode != http.StatusConflict {
-			return "", err
+			return relay.TerminalSessionInfo{}, err
 		}
 	}
-	return "", fmt.Errorf("could not allocate a unique terminal session id")
+	return relay.TerminalSessionInfo{}, fmt.Errorf("could not allocate a unique terminal session id")
+}
+
+func (d *system) restartTerminalSession(ctx context.Context, recordID, projectID, sessionID string, previousGeneration int) (relay.TerminalSessionInfo, error) {
+	if err := d.terminalLifecycleReady(); err != nil {
+		return relay.TerminalSessionInfo{}, err
+	}
+	data, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions/"+url.PathEscape(recordID)+"/restart", map[string]int{"generation": previousGeneration})
+	if err != nil {
+		return relay.TerminalSessionInfo{}, err
+	}
+	var info relay.TerminalSessionInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return relay.TerminalSessionInfo{}, err
+	}
+	if info.ID == "" || info.ID != recordID || info.ProjectID != projectID || info.SessionID != sessionID || info.State != relay.TerminalStateRunning || info.Generation <= previousGeneration {
+		return relay.TerminalSessionInfo{}, fmt.Errorf("restart returned invalid terminal session")
+	}
+	return info, nil
+}
+
+func (d *system) deleteTerminalSession(ctx context.Context, recordID string, generation int) error {
+	if _, err := d.relayDo(ctx, http.MethodDelete, "/system/terminal-sessions/"+url.PathEscape(recordID), map[string]int{"generation": generation}); err != nil {
+		return err
+	}
+	return d.reconcileTerminalSessionsSync(ctx)
 }
 
 func newTerminalSessionID() (string, error) {
@@ -551,8 +994,13 @@ func (d *system) updateProject(ctx context.Context, projectID, name, rootDir str
 
 // deleteProject deletes a project (and, via cascade, its ports).
 func (d *system) deleteProject(ctx context.Context, projectID string) error {
-	_, err := d.relayDo(ctx, http.MethodDelete, "/system/projects/"+projectID, nil)
-	return err
+	if _, err := d.relayDo(ctx, http.MethodDelete, "/system/projects/"+projectID, nil); err != nil {
+		return err
+	}
+	// Project deletion cascades terminal records in the relay. Reconcile now,
+	// rather than waiting for a later event or poll, so local PTYs disappear
+	// before the TUI reports deletion complete.
+	return d.reconcileTerminalSessionsSync(ctx)
 }
 
 // addPort adds an exposed port to a project.
@@ -578,20 +1026,62 @@ func (d *system) deletePort(ctx context.Context, portID string) error {
 // Run connects to the relay and serves the tunnel, reconnecting with backoff
 // until ctx is cancelled.
 func (d *system) Run(ctx context.Context) {
+	defer d.finishShutdown()
+	d.mu.Lock()
+	d.runCtx = ctx
+	d.mu.Unlock()
 	// Reaching here with a cleartext remote relay means the operator opted in
 	// via ORMOS_INSECURE=1 (runSystem refuses it otherwise) — say so loudly,
 	// every reconnect.
 	if insecureRemoteRelay(d.cfg.RelayURL) {
 		d.logf("WARNING: %s is a remote cleartext relay; the pairing token is sent unencrypted (allowed by ORMOS_INSECURE=1) — use wss://", d.cfg.RelayURL)
 	}
-	go d.pollPorts(ctx)
+	if d.pollPortsFn != nil {
+		go d.pollPortsFn(ctx)
+	} else {
+		go d.pollPorts(ctx)
+	}
 	backoff := minBackoff
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		d.resetMu.Lock()
+		resetDone := d.resetDone
+		d.resetMu.Unlock()
+		if !resetDone {
+			resetCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			err := d.resetTerminalSessions(resetCtx)
+			cancel()
+			if err != nil {
+				d.resetMu.Lock()
+				d.resetErr = err
+				d.resetMu.Unlock()
+				d.logf("terminal lifecycle reset failed: %v (retry in %s)", err, backoff)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+					if backoff > maxBackoff {
+						backoff = maxBackoff
+					}
+				}
+				continue
+			}
+			d.resetMu.Lock()
+			d.resetDone = true
+			d.resetErr = nil
+			d.resetMu.Unlock()
+		}
 		began := time.Now()
-		connected, err := d.connectAndServe(ctx)
+		connect := d.connectAndServe
+		if d.connectAndServeFn != nil {
+			connect = d.connectAndServeFn
+		}
+		connected, err := connect(ctx)
 		if ctx.Err() != nil {
 			return
 		}
@@ -689,6 +1179,12 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 
 	d.setConnected(true)
 	d.logf("tunnel established")
+	// Reconcile while the tunnel is established, before accepting streams, so a
+	// missed lifecycle nudge is repaired immediately on every reconnect.
+	if err := d.reconcileTerminalSessionsSync(ctx); err != nil {
+		d.setConnected(false)
+		return true, fmt.Errorf("terminal reconciliation: %w", err)
+	}
 	defer func() {
 		d.setConnected(false)
 		d.logf("tunnel closed")
