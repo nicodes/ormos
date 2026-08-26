@@ -4,6 +4,8 @@ package system
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -47,6 +49,7 @@ func TestLifecycleTerminalValidationControlsPTYCreation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			withTempConfigDir(t)
 			d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/cat"})
+			d.resetDone = true
 			httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 				row := `{"id":"record","session_id":"session","state":"` + tc.state + `","generation":` + fmt.Sprint(tc.generation) + `}`
 				if tc.name == "missing record" {
@@ -71,31 +74,739 @@ func TestLifecycleTerminalValidationControlsPTYCreation(t *testing.T) {
 	}
 }
 
+func TestConcurrentSameGenerationTerminalCallsShareOnePTY(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/cat"})
+	var starts atomic.Int32
+	d.beforePTYStart = func() { starts.Add(1) }
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "same-session", Cols: 80, Rows: 24})
+	results := make(chan *terminalSession, 2)
+	errs := make(chan error, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			s, err := d.terminal(h, acceptedFenceDeadline(t, h))
+			results <- s
+			errs <- err
+		}()
+	}
+	group.Wait()
+	close(results)
+	close(errs)
+	var sessions []*terminalSession
+	for s := range results {
+		sessions = append(sessions, s)
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent same-generation terminal error: %v", err)
+		}
+	}
+	if len(sessions) != 2 || sessions[0] == nil || sessions[0] != sessions[1] || starts.Load() != 1 {
+		t.Fatalf("sessions=%p/%p PTY starts=%d, want one shared session and one start", sessions[0], sessions[1], starts.Load())
+	}
+	sessions[0].close()
+	if got := d.Snapshot().Sessions; got != 0 {
+		t.Fatalf("session count after concurrent close=%d, want 0", got)
+	}
+}
+
+func TestCrossKeyAdmissionDoesNotBlockOnHeldHTTP(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	firstFetchStarted, releaseFirst := make(chan struct{}), make(chan struct{})
+	var fetches atomic.Int32
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method != http.MethodGet || req.URL.Path != "/system/terminal-sessions" {
+			return testHTTPResponse(http.StatusNotFound, ""), nil
+		}
+		fetch := fetches.Add(1)
+		if fetch == 1 {
+			close(firstFetchStarted)
+			<-releaseFirst
+			return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+		}
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"other","session_id":"other-tab","state":"running","generation":1}]}`), nil
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
+	d.resetDone = true
+	first := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	second := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "other-tab", TerminalRecordID: "other", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := d.terminal(first, acceptedFenceDeadline(t, first))
+		firstDone <- err
+	}()
+	<-firstFetchStarted
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := d.terminal(second, acceptedFenceDeadline(t, second))
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("cross-key admission was blocked by another key: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cross-key admission remained blocked by held HTTP")
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	d.terminalMu.Lock()
+	sessions := make([]*terminalSession, 0, len(d.terminals))
+	for _, s := range d.terminals {
+		sessions = append(sessions, s)
+	}
+	d.terminalMu.Unlock()
+	for _, s := range sessions {
+		s.close()
+	}
+}
+
+func TestAdmissionPublishedDuringReconcileFetchSurvivesSnapshot(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	fetchStarted, releaseFetch := make(chan struct{}), make(chan struct{})
+	var requests atomic.Int32
+	var reports atomic.Int32
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions" {
+			if requests.Add(1) == 1 {
+				close(fetchStarted)
+				<-releaseFetch
+				return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+			}
+			return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+		}
+		if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/exit") {
+			reports.Add(1)
+		}
+		return testHTTPResponse(http.StatusNoContent, ""), nil
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
+	d.resetDone = true
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- d.reconcileSnapshot(context.Background()) }()
+	<-fetchStarted
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err != nil {
+		t.Fatalf("terminal admission during reconcile fetch failed: %v", err)
+	}
+	close(releaseFetch)
+	if err := <-reconcileDone; err != nil {
+		t.Fatal(err)
+	}
+	if got := d.Snapshot().Sessions; got != 1 {
+		t.Fatalf("snapshot closed post-cutoff admission; sessions=%d", got)
+	}
+	if got := reports.Load(); got != 0 {
+		t.Fatalf("snapshot reported a post-cutoff admission exit: %d", got)
+	}
+	d.terminalMu.Lock()
+	current := d.terminals["record"]
+	d.terminalMu.Unlock()
+	if current != nil {
+		current.close()
+	}
+	d.waitExitReports()
+}
+
+func TestAdmissionInstallLinearizesBeforeReconcileCutoff(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	fetchStarted := make(chan struct{})
+	cutoffAttempt := make(chan struct{})
+	var requests atomic.Int32
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions" {
+			if requests.Add(1) == 1 {
+				close(fetchStarted)
+				return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+			}
+			return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"record","state":"running","generation":1}]}`), nil
+		}
+		return testHTTPResponse(http.StatusNotFound, ""), nil
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
+	d.resetDone = true
+	var installOnce sync.Once
+	reconcileDone := make(chan error, 1)
+	d.beforeTerminalAction = func() { <-fetchStarted }
+	d.beforeReconcileAdmissionCutoff = func() { close(cutoffAttempt) }
+	d.beforeTerminalAdmissionInstall = func() {
+		installOnce.Do(func() {
+			go func() { reconcileDone <- d.reconcileSnapshot(context.Background()) }()
+			select {
+			case <-cutoffAttempt:
+			case <-time.After(time.Second):
+				panic("reconcile did not reach cutoff gate")
+			}
+			select {
+			case <-fetchStarted:
+				panic("reconcile captured cutoff before admission installation")
+			case <-time.After(25 * time.Millisecond):
+			}
+		})
+	}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", Cols: 80, Rows: 24})
+	h.TerminalRecordID = ""
+	h.TerminalGeneration = 0
+	terminalDone := make(chan error, 1)
+	go func() { _, err := d.terminal(h, acceptedFenceDeadline(t, h)); terminalDone <- err }()
+	if err := <-terminalDone; err != nil {
+		t.Fatalf("terminal admission failed: %v", err)
+	}
+	if err := <-reconcileDone; err != nil {
+		t.Fatal(err)
+	}
+	d.terminalMu.Lock()
+	current := d.terminals["tab"]
+	d.terminalMu.Unlock()
+	if current != nil {
+		current.close()
+	}
+	d.waitExitReports()
+}
+
+func TestReconcileInvalidatesAdmissionBeforePTYStart(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
+	d.resetDone = true
+	entered, release := make(chan struct{}), make(chan struct{})
+	var starts atomic.Int32
+	d.beforePTYStart = func() { starts.Add(1) }
+	var actions atomic.Int32
+	d.beforeTerminalAction = func() {
+		if actions.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	result := make(chan error, 1)
+	go func() { _, err := d.terminal(h, acceptedFenceDeadline(t, h)); result <- err }()
+	<-entered
+	if err := d.reconcileSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatalf("pre-start invalidation retry failed: %v", err)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("pre-start invalidation reached PTY start %d times, want one retry", got)
+	}
+	if got := d.Snapshot().Sessions; got != 1 {
+		t.Fatalf("pre-start invalidation retry left %d sessions, want one", got)
+	}
+	d.terminalMu.Lock()
+	current := d.terminals["record"]
+	d.terminalMu.Unlock()
+	if current != nil {
+		current.close()
+	}
+}
+
+func TestReconcileInvalidatesAdmissionBeforePublish(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
+	d.resetDone = true
+	entered, release := make(chan struct{}), make(chan struct{})
+	var starts atomic.Int32
+	d.beforePTYStart = func() {
+		if starts.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	result := make(chan error, 1)
+	go func() { _, err := d.terminal(h, acceptedFenceDeadline(t, h)); result <- err }()
+	<-entered
+	if err := d.reconcileSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatalf("pre-publish invalidation retry failed: %v", err)
+	}
+	if got := starts.Load(); got != 2 {
+		t.Fatalf("pre-publish invalidation started %d PTYs, want stale candidate plus one retry", got)
+	}
+	if got := d.Snapshot().Sessions; got != 1 {
+		t.Fatalf("pre-publish invalidation left %d sessions, want retried session", got)
+	}
+	d.terminalMu.Lock()
+	current := d.terminals["record"]
+	d.terminalMu.Unlock()
+	if current != nil {
+		current.close()
+	}
+}
+
+func TestTerminalAdmissionWaiterDoesNotDeadlockReconciliation(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	entered, release := make(chan struct{}), make(chan struct{})
+	waiterWaiting := make(chan struct{})
+	var actions atomic.Int32
+	d.beforeTerminalAction = func() {
+		if actions.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+	d.beforeTerminalAdmissionWait = func() { close(waiterWaiting) }
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	firstDone := make(chan error, 1)
+	go func() { _, err := d.terminal(h, acceptedFenceDeadline(t, h)); firstDone <- err }()
+	<-entered
+	waiterDone := make(chan error, 1)
+	go func() { _, err := d.terminal(h, acceptedFenceDeadline(t, h)); waiterDone <- err }()
+	select {
+	case <-waiterWaiting:
+	case <-time.After(time.Second):
+		t.Fatal("admission waiter did not reach its wait gate")
+	}
+	reconcileDone := make(chan error, 1)
+	go func() { reconcileDone <- d.reconcileSnapshot(context.Background()) }()
+	close(release)
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader admission did not complete")
+	}
+	select {
+	case <-waiterDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admission waiter deadlocked behind reconciliation")
+	}
+	select {
+	case <-reconcileDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconciliation deadlocked behind admission waiter")
+	}
+	d.terminalMu.Lock()
+	current := d.terminals["record"]
+	d.terminalMu.Unlock()
+	if current != nil {
+		current.close()
+	}
+}
+
 func TestLifecycleGenerationMismatchSchedulesExactStalePTYClose(t *testing.T) {
 	withTempConfigDir(t)
 	d := newSystem(systemConfig{Shell: "/bin/cat"})
 	stale := &terminalSession{id: "record", recordID: "record", generation: 1, owner: d, done: make(chan struct{})}
 	d.terminals["record"] = stale
 	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 2, Cols: 80, Rows: 24})
-	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil || !strings.Contains(err.Error(), "generation mismatch") {
-		t.Fatalf("mismatch error=%v", err)
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err != nil {
+		t.Fatalf("new generation did not replace stale session: %v", err)
 	}
 	deadline := time.After(time.Second)
 	for {
 		d.terminalMu.Lock()
-		_, present := d.terminals["record"]
+		current := d.terminals["record"]
 		d.terminalMu.Unlock()
 		stale.mu.Lock()
 		closed := stale.closed
 		stale.mu.Unlock()
-		if !present && closed {
+		if closed && (current == nil || current.generation == 2) {
 			return
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("stale PTY was not closed: present=%v closed=%v", present, closed)
+			t.Fatalf("stale PTY was not closed: current=%v closed=%v", current != nil, closed)
 		case <-time.After(time.Millisecond):
 		}
+	}
+}
+
+func TestOlderHeaderCannotCloseNewerMappedGenerationWithoutRelay(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	newer := &terminalSession{id: "record", recordID: "record", generation: 2, owner: d, done: make(chan struct{})}
+	d.terminals["record"] = newer
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil {
+		t.Fatal("older header was accepted without relay authority")
+	}
+	newer.mu.Lock()
+	closed := newer.closed
+	newer.mu.Unlock()
+	if closed {
+		t.Fatal("older header closed newer mapped generation without relay")
+	}
+}
+
+func TestReconcileClosesExactMappedGenerationAndReportsIt(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	var lists int
+	reported := make(chan int, 1)
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch {
+		case req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions":
+			lists++
+			if lists == 1 {
+				return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+			}
+			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+		case req.Method == http.MethodPost && req.URL.Path == "/system/terminal-sessions/record/exit":
+			var body struct {
+				Generation int `json:"generation"`
+			}
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				return nil, err
+			}
+			reported <- body.Generation
+			return testHTTPResponse(http.StatusNoContent, ""), nil
+		default:
+			return testHTTPResponse(http.StatusNotFound, ""), nil
+		}
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
+	d.resetDone = true
+	client, err := d.AttachTerminal(t.TempDir(), relay.TerminalSessionInfo{ID: "record", SessionID: "tab", State: relay.TerminalStateRunning, Generation: 1}, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := client.session
+	client.Detach()
+	if err := d.reconcileSnapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		d.terminalMu.Lock()
+		mapped := d.terminals["record"]
+		d.terminalMu.Unlock()
+		s.mu.Lock()
+		closed := s.closed
+		s.mu.Unlock()
+		if mapped == nil && closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("authoritative reconcile left generation mapped=%v closed=%v", mapped != nil, closed)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	d.waitExitReports()
+	select {
+	case generation := <-reported:
+		if generation != 1 {
+			t.Fatalf("exit report generation=%d, want exact mapped generation 1", generation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconcile close did not report exact generation")
+	}
+}
+
+func TestTerminalGenerationFenceRejectsDelayedOlderAdmission(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	d.terminalFences = map[string]int{"record": 2}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil || !strings.Contains(err.Error(), "superseded") {
+		t.Fatalf("older generation was admitted: %v", err)
+	}
+	d.terminalMu.Lock()
+	defer d.terminalMu.Unlock()
+	if len(d.terminals) != 0 || d.terminalStarting != 0 {
+		t.Fatalf("superseded generation changed admission state: terminals=%d starting=%d", len(d.terminals), d.terminalStarting)
+	}
+}
+
+func TestTerminalGenerationFenceRechecksBeforeInsert(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	d.beforeTerminalAction = func() {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+	first := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	second := first
+	second.TerminalGeneration = 2
+	firstDone := make(chan error, 1)
+	go func() { _, err := d.terminal(first, acceptedFenceDeadline(t, first)); firstDone <- err }()
+	<-entered
+	if _, err := d.terminal(second, acceptedFenceDeadline(t, second)); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-firstDone; err == nil || (!strings.Contains(err.Error(), "superseded") && !strings.Contains(err.Error(), "newer session")) {
+		t.Fatalf("older candidate result=%v, want insert-time fence rejection", err)
+	}
+	d.terminalMu.Lock()
+	current := d.terminals["record"]
+	starting := d.terminalStarting
+	d.terminalMu.Unlock()
+	if current == nil || current.generation != 2 || starting != 0 {
+		t.Fatalf("generation fence map=%v starting=%d", current, starting)
+	}
+	current.close()
+}
+
+func TestConcurrentNewerGenerationsShareOnePTY(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	entered, release := make(chan struct{}), make(chan struct{})
+	var actions atomic.Int32
+	d.beforeTerminalAction = func() {
+		if actions.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+	var starts atomic.Int32
+	d.beforePTYStart = func() { starts.Add(1) }
+	first := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	firstDone := make(chan error, 1)
+	go func() { _, err := d.terminal(first, acceptedFenceDeadline(t, first)); firstDone <- err }()
+	<-entered
+	newer := first
+	newer.TerminalGeneration = 2
+	results := make(chan error, 2)
+	for range 2 {
+		go func() { _, err := d.terminal(newer, acceptedFenceDeadline(t, newer)); results <- err }()
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(release)
+	if err := <-firstDone; err == nil || (!strings.Contains(err.Error(), "superseded") && !strings.Contains(err.Error(), "newer session")) {
+		t.Fatalf("older generation result=%v, want superseded", err)
+	}
+	if got := starts.Load(); got != 1 {
+		t.Fatalf("concurrent generations started %d PTYs, want one", got)
+	}
+	d.terminalMu.Lock()
+	current := d.terminals["record"]
+	d.terminalMu.Unlock()
+	if current != nil {
+		current.close()
+	}
+}
+
+func TestTerminalGenerationFenceLimitFailsClosed(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	d.terminalFences = make(map[string]int, terminalFenceLimit)
+	for i := range terminalFenceLimit {
+		d.terminalFences[fmt.Sprintf("record-%d", i)] = 1
+	}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "new-record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil || !strings.Contains(err.Error(), "fence limit") {
+		t.Fatalf("fence limit accepted a new record: %v", err)
+	}
+	d.terminalMu.Lock()
+	defer d.terminalMu.Unlock()
+	if len(d.terminalFences) != terminalFenceLimit || d.terminalStarting != 0 || len(d.terminals) != 0 {
+		t.Fatalf("fence limit state changed: fences=%d starting=%d terminals=%d", len(d.terminalFences), d.terminalStarting, len(d.terminals))
+	}
+}
+
+func TestHigherGenerationRetiresLowerMappedDuringStart(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	lower := &terminalSession{id: "record", recordID: "record", generation: 1, owner: d, done: make(chan struct{})}
+	d.beforeTerminalAction = func() {
+		d.terminalMu.Lock()
+		if d.terminals["record"] == nil {
+			d.terminals["record"] = lower
+		}
+		d.terminalMu.Unlock()
+	}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 2, Cols: 80, Rows: 24})
+	current, err := d.terminal(h, acceptedFenceDeadline(t, h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.generation != 2 {
+		t.Fatalf("installed generation=%d, want 2", current.generation)
+	}
+	lower.mu.Lock()
+	closed := lower.closed
+	lower.mu.Unlock()
+	if !closed {
+		t.Fatal("higher generation did not retire lower mapped session")
+	}
+	current.close()
+}
+
+func TestHigherGenerationRetiresLowerBeforeCapacityAdmission(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	for i := range maxTerminalSessions - 1 {
+		d.terminals[fmt.Sprintf("other-%d", i)] = &terminalSession{id: fmt.Sprintf("other-%d", i), generation: 1, owner: d, done: make(chan struct{})}
+	}
+	lower := &terminalSession{id: "record", recordID: "record", generation: 1, owner: d, done: make(chan struct{})}
+	d.beforeTerminalAdmission = func() {
+		d.terminalMu.Lock()
+		d.terminals["record"] = lower
+		d.terminalMu.Unlock()
+	}
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 2, Cols: 80, Rows: 24})
+	current, err := d.terminal(h, acceptedFenceDeadline(t, h))
+	if err != nil || current == nil || current.generation != 2 {
+		t.Fatalf("higher generation at capacity err=%v current=%v", err, current)
+	}
+	lower.mu.Lock()
+	closed := lower.closed
+	lower.mu.Unlock()
+	if !closed {
+		t.Fatal("capacity admission did not retire lower same-key generation")
+	}
+	for _, s := range d.terminals {
+		s.close()
+	}
+}
+
+func TestTerminalStartingAdmissionRejectsWhenFull(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	d.terminalStarting = maxTerminalSessions
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "full", Cols: 80, Rows: 24})
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil || !strings.Contains(err.Error(), "session limit") {
+		t.Fatalf("full starting admission accepted PTY: %v", err)
+	}
+	d.terminalMu.Lock()
+	starting := d.terminalStarting
+	d.terminalMu.Unlock()
+	if starting != maxTerminalSessions {
+		t.Fatalf("rejected admission changed starting count to %d", starting)
+	}
+}
+
+func TestStalePTYRetainsStartingReservationUntilTeardown(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{Shell: "/bin/sh"})
+	d.resetDone = true
+	d.sessions = maxTerminalSessions - 1
+	for i := 0; i < maxTerminalSessions-1; i++ {
+		id := fmt.Sprintf("mapped-%d", i)
+		d.terminals[id] = &terminalSession{id: id, owner: d, done: make(chan struct{})}
+	}
+	startEntered, releaseStart := make(chan struct{}), make(chan struct{})
+	var starts atomic.Int32
+	d.beforePTYStart = func() {
+		if starts.Add(1) == 1 {
+			close(startEntered)
+			<-releaseStart
+		}
+	}
+	teardownEntered, releaseTeardown := make(chan struct{}), make(chan struct{})
+	var teardowns atomic.Int32
+	d.afterTerminalProcessTeardown = func() {
+		if teardowns.Add(1) == 1 {
+			close(teardownEntered)
+			<-releaseTeardown
+		}
+	}
+	first := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "candidate", Cols: 80, Rows: 24})
+	firstDone := make(chan error, 1)
+	go func() { _, err := d.terminal(first, acceptedFenceDeadline(t, first)); firstDone <- err }()
+	<-startEntered
+	d.invalidateTerminalAdmissions(d.admissionSequence.Load())
+	close(releaseStart)
+	<-teardownEntered
+	other := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "other", Cols: 80, Rows: 24})
+	if _, err := d.terminal(other, acceptedFenceDeadline(t, other)); err == nil || !strings.Contains(err.Error(), "session limit") {
+		t.Fatalf("cross-key admission succeeded during stale PTY teardown: %v", err)
+	}
+	close(releaseTeardown)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("candidate retry failed after teardown: %v", err)
+	}
+	d.terminalMu.Lock()
+	sessions := make([]*terminalSession, 0, len(d.terminals))
+	for _, s := range d.terminals {
+		sessions = append(sessions, s)
+	}
+	d.terminalMu.Unlock()
+	for _, s := range sessions {
+		s.close()
+	}
+	d.waitExitReports()
+}
+
+func TestConcurrentCloseWaitsForActiveCloseOnce(t *testing.T) {
+	d := &system{}
+	s := &terminalSession{owner: d, done: make(chan struct{})}
+	entered, release := make(chan struct{}), make(chan struct{})
+	d.afterTerminalProcessTeardown = func() {
+		close(entered)
+		<-release
+	}
+	firstDone := make(chan struct{})
+	go func() { s.close(); close(firstDone) }()
+	<-entered
+	secondDone := make(chan struct{})
+	go func() { s.close(); close(secondDone) }()
+	select {
+	case <-secondDone:
+		t.Fatal("concurrent close returned before active close completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("active close did not complete")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent close did not complete after active close")
+	}
+}
+
+func TestOlderAuthoritativeHeaderDoesNotCloseNewerMappedGeneration(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":2}]}`), nil
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
+	d.resetDone = true
+	newer := &terminalSession{id: "record", recordID: "record", generation: 2, owner: d, done: make(chan struct{})}
+	d.terminals["record"] = newer
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil {
+		t.Fatal("older authoritative header was accepted")
+	}
+	newer.mu.Lock()
+	closed := newer.closed
+	newer.mu.Unlock()
+	if closed {
+		t.Fatal("older authoritative header closed newer mapped generation")
 	}
 }
 
