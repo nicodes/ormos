@@ -29,6 +29,10 @@ import (
 )
 
 func fencedHeader(h relay.StreamHeader) relay.StreamHeader {
+	if h.Kind == relay.KindTerminal && h.TerminalRecordID == "" {
+		h.TerminalRecordID = h.SessionID
+		h.TerminalGeneration = 1
+	}
 	h.ActionFence = strings.Repeat("a", 40)
 	h.NotAfterMilli = time.Now().Add(5 * time.Second).UnixMilli()
 	return h
@@ -467,6 +471,11 @@ func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testin
 	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/system/terminal-sessions" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"sessions":[]}`)
+			return
+		}
 		ws, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			serverErr <- err
@@ -506,6 +515,7 @@ func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testin
 		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
 		PairingToken: "test-pairing-token",
 	})
+	d.resetDone = true
 	cancelInvoked := make(chan struct{})
 	d.setCancel(func() {
 		close(cancelInvoked)
@@ -1070,6 +1080,82 @@ func TestTerminalHandshakeDeadlineDropsASilentPeer(t *testing.T) {
 	}
 }
 
+func TestTerminalLifecycleHeaderBoundaryPrecedesHandshake(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		record     string
+		generation int
+	}{
+		{"missing record", "", 1},
+		{"missing generation", "record", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &system{terminals: make(map[string]*terminalSession), audit: newAuditor()}
+			agent, client := net.Pipe()
+			defer client.Close()
+			done := make(chan struct{})
+			go func() { d.serveStream(agent); close(done) }()
+			h := relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "boundary", TerminalRecordID: tc.record, TerminalGeneration: tc.generation, Cols: 80, Rows: 24, ActionFence: strings.Repeat("a", 40), NotAfterMilli: time.Now().Add(time.Second).UnixMilli()}
+			if err := relay.WriteHeader(client, h); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("lifecycle boundary waited for handshake")
+			}
+			if len(d.terminals) != 0 {
+				t.Fatal("boundary refusal created a PTY")
+			}
+		})
+	}
+
+	withTempConfigDir(t)
+	key, err := relay.GenerateAgentKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &system{key: key, cfg: systemConfig{Shell: "/bin/cat"}, terminals: make(map[string]*terminalSession), audit: newAuditor()}
+	reached := make(chan struct{})
+	d.beforeTerminalAction = func() { close(reached) }
+	agent, client := net.Pipe()
+	defer client.Close()
+	go d.serveStream(agent)
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "boundary-valid", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	if err := relay.WriteHeader(client, h); err != nil {
+		t.Fatal(err)
+	}
+	clientKey, err := relay.GenerateAgentKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := relay.WriteClientHello(client, clientKey.PublicKey().Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := relay.ReadServerHello(client); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-reached:
+	case <-time.After(time.Second):
+		t.Fatal("valid lifecycle control did not reach terminal creation")
+	}
+	var s *terminalSession
+	deadline := time.Now().Add(time.Second)
+	for s == nil && time.Now().Before(deadline) {
+		d.terminalMu.Lock()
+		s = d.terminals["record"]
+		d.terminalMu.Unlock()
+		if s == nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if s == nil {
+		t.Fatal("valid lifecycle control did not create PTY")
+	}
+	s.close()
+}
+
 // The other half, and the one that fails as a user-visible disconnect rather
 // than as a red test: the deadline must be CLEARED once the handshake is done.
 // Leaving it armed kills every terminal, busy or not, terminalHandshakeTO after
@@ -1434,6 +1520,11 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 	withTempConfigDir(t)
 	headers := make(chan http.Header, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/system/terminal-sessions" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"sessions":[{"id":"advertised-key","project_id":"project","session_id":"advertised-key","state":"running","generation":1}]}`)
+			return
+		}
 		select {
 		case headers <- r.Header.Clone():
 		default:
@@ -1451,6 +1542,7 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 		PairingToken: "test-pairing-token",
 		Shell:        "/bin/sh",
 	})
+	d.resetDone = true
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// The tunnel dying immediately is expected: the dial published the key, and
@@ -1485,7 +1577,7 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "advertised-key", Cols: 80, Rows: 24})
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project:advertised-key", TerminalRecordID: "advertised-key", TerminalGeneration: 1, Cols: 80, Rows: 24})
 	if err := relay.WriteHeader(client, h); err != nil {
 		t.Fatal(err)
 	}

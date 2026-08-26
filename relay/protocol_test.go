@@ -72,12 +72,22 @@ func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
 	}
 }
 
-func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
+func TestCurrentAgentAdvertisesOnlyV3(t *testing.T) {
 	if StreamFenceVersionLegacyV0 != "" {
 		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
 	}
-	if StreamFenceVersion != StreamFenceVersionV2 {
-		t.Fatalf("advertised stream-fence version = %q, want v2 %q", StreamFenceVersion, StreamFenceVersionV2)
+	if StreamFenceVersion != StreamFenceVersionV3 {
+		t.Fatalf("advertised stream-fence version = %q, want v3 %q", StreamFenceVersion, StreamFenceVersionV3)
+	}
+}
+
+func TestLifecycleStreamHeaderWireFields(t *testing.T) {
+	data, err := json.Marshal(StreamHeader{Kind: KindTerminal, SessionID: "project:session", TerminalRecordID: "record", TerminalGeneration: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(data), `{"kind":"terminal","session_id":"project:session","terminal_record_id":"record","terminal_generation":7}`; got != want {
+		t.Fatalf("header = %s, want %s", got, want)
 	}
 }
 
@@ -87,10 +97,8 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 // statuses are pinned in contract_test.go, and JSON tags and numeric terminal
 // tags are pinned against complete literal payloads in their dedicated tests.
 //
-// TestCurrentAgentAdvertisesOnlyV2 above pins the fence version's alias
-// RELATIONSHIP (StreamFenceVersion == StreamFenceVersionV2) and the empty-string
-// legacy sentinel; neither it nor anything else recorded what "2" actually is,
-// so respelling it "v2" kept the whole module green (nicodes/ormos-be#421).
+// TestCurrentAgentAdvertisesOnlyV3 above pins the current fence-version alias
+// and the empty-string legacy sentinel; this table records the wire literals.
 //
 // The argument is the one TestTunnelHeaderNamesArePinnedToTheirWireSpellings
 // makes for the header names, and it applies unchanged: a value here derives
@@ -141,7 +149,7 @@ func TestCurrentAgentAdvertisesOnlyV2(t *testing.T) {
 //     remember. What the relay makes of the closed stream it gets back is in
 //     another repository and is not asserted here.
 //
-// StreamFenceVersionV1 is here even though this agent only ever advertises v2,
+// StreamFenceVersionV1 and V2 are here even though this agent only advertises V3,
 // because a deployed relay still reads it to decide what an older agent can be
 // asked to do.
 //
@@ -162,6 +170,7 @@ func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
 	for _, tc := range []struct{ name, got, want string }{
 		{"StreamFenceVersionV1", StreamFenceVersionV1, "1"},
 		{"StreamFenceVersionV2", StreamFenceVersionV2, "2"},
+		{"StreamFenceVersionV3", StreamFenceVersionV3, "3"},
 		{"KindTerminal", string(KindTerminal), "terminal"},
 		{"KindProxy", string(KindProxy), "proxy"},
 		{"KindListPorts", string(KindListPorts), "listports"},

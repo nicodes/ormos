@@ -62,18 +62,26 @@ func hostName() string {
 
 // runTUI starts the system tunnel and renders a Bubble Tea dashboard that also
 // lets the operator manage this system's projects and ports.
-func runTUI(ctx context.Context, d *system) {
-	go d.Run(ctx)
-
+var runTUIProgram = func(ctx context.Context, d *system) {
 	p := tea.NewProgram(newModelContext(ctx, d), tea.WithAltScreen(), tea.WithMouseCellMotion())
-
-	// Quit the UI if the process is signalled.
 	go func() {
 		<-ctx.Done()
 		p.Quit()
 	}()
-
 	_, _ = p.Run()
+}
+
+func runTUI(ctx context.Context, d *system) {
+	uiCtx, cancel := context.WithCancel(ctx)
+	runDone := make(chan struct{})
+	go func() {
+		d.Run(uiCtx)
+		close(runDone)
+	}()
+
+	runTUIProgram(uiCtx, d)
+	cancel()
+	<-runDone
 }
 
 // ---- messages & tick ------------------------------------------------------
@@ -99,8 +107,10 @@ type terminalsMsg struct {
 // terminalCreatedMsg starts the interactive attachment only after persistence
 // has succeeded.
 type terminalCreatedMsg struct {
-	projectID, projectRoot, sessionID string
-	err                               error
+	projectRoot string
+	info        relay.TerminalSessionInfo
+	restarted   bool
+	err         error
 }
 
 var terminalSessionsCommand = func(d *system) tea.Cmd {
@@ -294,8 +304,8 @@ func (m model) createTerminalCmd(p relay.ProjectInfo) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
-		sessionID, err := d.createTerminalSession(ctx, p.ID)
-		return terminalCreatedMsg{projectID: p.ID, projectRoot: p.RootDir, sessionID: sessionID, err: err}
+		info, err := d.createTerminalSession(ctx, p.ID)
+		return terminalCreatedMsg{projectRoot: p.RootDir, info: info, err: err}
 	}
 }
 
@@ -389,8 +399,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.terminalsCmd()
 		}
 		m.err = ""
-		m.notice = "terminal created"
-		m, attach := m.startTerminal(msg.projectRoot, msg.projectID+":"+msg.sessionID, msg.sessionID)
+		if msg.restarted {
+			m.notice = "terminal restarted"
+		} else {
+			m.notice = "terminal created"
+		}
+		m, attach := m.startTerminal(msg.projectRoot, msg.info, msg.info.SessionID)
 		return m, tea.Batch(
 			tea.DisableMouse,
 			m.terminalsCmd(),
@@ -536,7 +550,20 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			case rowTerminal:
 				p := m.projects[r.projectIdx]
 				tab := m.terminals[r.terminalIdx]
-				m, attach := m.startTerminal(p.RootDir, p.ID+":"+tab.info.SessionID, tab.label)
+				if tab.info.State == relay.TerminalStateExited {
+					recordID := tab.info.ID
+					return m, func() tea.Msg {
+						ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+						defer cancel()
+						info, err := m.d.restartTerminalSession(ctx, recordID, p.ID, tab.info.SessionID, tab.info.Generation)
+						return terminalCreatedMsg{projectRoot: p.RootDir, info: info, restarted: true, err: err}
+					}
+				}
+				if tab.info.State != "" && tab.info.State != relay.TerminalStateRunning {
+					m.err = "terminal unavailable"
+					return m, nil
+				}
+				m, attach := m.startTerminal(p.RootDir, tab.info, tab.label)
 				return m, tea.Batch(tea.DisableMouse, attach)
 			case rowAddTerminal:
 				m.notice = ""
@@ -580,6 +607,11 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				port := m.projects[r.projectIdx].Ports[r.portIdx]
 				m.notice = ""
 				return m, mutateCmd(fmt.Sprintf("removed :%d", port.Port), func(ctx context.Context) error { return m.d.deletePort(ctx, port.ID) })
+			case rowTerminal:
+				tab := m.terminals[r.terminalIdx]
+				return m, mutateCmd("terminal deleted", func(ctx context.Context) error {
+					return m.d.deleteTerminalSession(ctx, tab.info.ID, tab.info.Generation)
+				})
 			}
 		}
 	}
@@ -835,7 +867,14 @@ func (m model) View() string {
 			summary := labelStyle.Render(portSummary(p, m.live))
 			b.WriteString(cursor + name + " " + dirStyle.Render(pad(p.RootDir, 32)) + " " + summary + "\n")
 		case rowTerminal:
-			label := m.terminals[r.terminalIdx].label
+			tab := m.terminals[r.terminalIdx]
+			label := tab.label
+			if tab.info.State == relay.TerminalStateExited {
+				label += " (exited)"
+			}
+			if tab.info.State == relay.TerminalStateClosing {
+				label += " (closing)"
+			}
 			if i == m.cursor {
 				label = selStyle.Render(label)
 			}
@@ -902,7 +941,17 @@ func (m model) View() string {
 			case rowProject:
 				hints += " · r rename · e dir · d delete"
 			case rowTerminal:
-				hints += " · enter open in TUI (Ctrl-G detaches)"
+				tab := m.terminals[r.terminalIdx]
+				switch tab.info.State {
+				case relay.TerminalStateExited:
+					hints += " · enter restart"
+				case relay.TerminalStateClosing:
+					hints += " · d delete"
+				case "", relay.TerminalStateRunning:
+					hints += " · enter open in TUI (Ctrl-G detaches) · d delete"
+				default:
+					hints += " · terminal unavailable · d delete"
+				}
 			case rowAddTerminal:
 				hints += " · enter new terminal in TUI (Ctrl-G detaches)"
 			case rowPort:
