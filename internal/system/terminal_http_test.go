@@ -9,14 +9,13 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/nicodes/ormos/relay"
 )
 
-func TestTerminalExitReportRetriesExactGenerationAndCancels(t *testing.T) {
+func TestTerminalExitReportRetriesExactGeneration(t *testing.T) {
 	oldClient := httpClient
 	t.Cleanup(func() { httpClient = oldClient })
 	var requests int
@@ -39,45 +38,19 @@ func TestTerminalExitReportRetriesExactGenerationAndCancels(t *testing.T) {
 		return testHTTPResponse(http.StatusNoContent, ""), nil
 	})}
 	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, resetDone: true}
+	started := time.Now()
 	d.reportTerminalExit("retry-record-unique", 17)
 	select {
 	case got := <-seen:
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("focused retry took %s, want under 1s", elapsed)
+		}
 		if got != 17 {
 			t.Fatalf("generation=%d", got)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(900 * time.Millisecond):
 		t.Fatal("exit report did not retry")
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	d.mu.Lock()
-	d.runCtx = ctx
-	d.mu.Unlock()
-	requests = 0
-	started := make(chan struct{})
-	var startedOnce sync.Once
-	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.URL.Path != "/system/terminal-sessions/retry-record-unique/exit" {
-			return testHTTPResponse(http.StatusNotFound, ""), nil
-		}
-		requests++
-		startedOnce.Do(func() { close(started) })
-		<-req.Context().Done()
-		return nil, req.Context().Err()
-	})}
-	d.reportTerminalExit("retry-record-unique", 18)
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("cancellation test request did not start")
-	}
-	cancel()
-	count := requests
-	time.Sleep(100 * time.Millisecond)
-	if requests != count {
-		t.Fatalf("cancellation did not stop retries: %d -> %d", count, requests)
-	}
-	d.waitExitReports()
 }
 
 func TestTerminalSessionHTTPWireShape(t *testing.T) {
@@ -135,6 +108,42 @@ func TestTerminalSessionHTTPWireShape(t *testing.T) {
 	}
 	if requests != 2 {
 		t.Fatalf("requests = %d, want GET + POST", requests)
+	}
+}
+
+func TestTerminalMutationGenerationWireShape(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if req.Method == http.MethodPost || req.Method == http.MethodDelete {
+			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+				return nil, err
+			}
+		}
+		if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/restart") {
+			if len(body) != 1 || body["generation"] != float64(3) {
+				t.Fatalf("restart body=%#v", body)
+			}
+			return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":4}`), nil
+		}
+		if req.Method == http.MethodDelete && req.URL.Path == "/system/terminal-sessions/record" {
+			if len(body) != 1 || body["generation"] != float64(4) {
+				t.Fatalf("delete body=%#v", body)
+			}
+			return testHTTPResponse(http.StatusNoContent, ""), nil
+		}
+		if req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions" {
+			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
+		}
+		return testHTTPResponse(http.StatusNotFound, ""), nil
+	})}
+	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, resetDone: true, terminals: make(map[string]*terminalSession)}
+	if _, err := d.restartTerminalSession(context.Background(), "record", "project", "tab", 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.deleteTerminalSession(context.Background(), "record", 4); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -1522,7 +1522,7 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/system/terminal-sessions" {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"sessions":[{"id":"advertised-key","state":"running","generation":1}]}`)
+			_, _ = io.WriteString(w, `{"sessions":[{"id":"advertised-key","project_id":"project","session_id":"advertised-key","state":"running","generation":1}]}`)
 			return
 		}
 		select {
@@ -1577,7 +1577,7 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "advertised-key", Cols: 80, Rows: 24})
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project:advertised-key", TerminalRecordID: "advertised-key", TerminalGeneration: 1, Cols: 80, Rows: 24})
 	if err := relay.WriteHeader(client, h); err != nil {
 		t.Fatal(err)
 	}

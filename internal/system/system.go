@@ -34,6 +34,7 @@ const (
 var (
 	terminalExitReportBackoff    = 500 * time.Millisecond
 	terminalExitReportMaxBackoff = 30 * time.Second
+	terminalExitReportShutdownTO = 5 * time.Second
 )
 
 type relayHTTPError struct {
@@ -78,6 +79,12 @@ type system struct {
 	terminalAdmissionMu sync.Mutex
 	terminalAdmissions  map[string]*terminalAdmissionState
 	admissionSequence   atomic.Uint64
+	shuttingDown        bool
+	activeAdmissions    int
+	admissionsIdle      chan struct{}
+	exitReportsClosed   bool
+	publishedTerminals  map[*terminalSession]struct{}
+	publishedClose      sync.WaitGroup
 	reconcileStateMu    sync.Mutex
 	reconcileRunning    bool
 	reconcileAgain      bool
@@ -87,6 +94,9 @@ type system struct {
 	resetDone           bool
 	resetErr            error
 	runCtx              context.Context
+	exitReportCtx       context.Context
+	exitReportCancel    context.CancelFunc
+	exitReportReady     chan struct{}
 	exitReports         sync.WaitGroup
 
 	policy  policy   // local restrictions the agent enforces itself
@@ -100,21 +110,26 @@ type system struct {
 
 	// Test seams for parking execution at the external-action boundaries. They
 	// remain nil in production. proxyDialContext defaults to net.Dialer.
-	beforeShutdownAction           func()
-	beforeProxyDial                func()
-	afterProxyDial                 func()
-	beforeTerminalAction           func()
-	beforeTerminalAdmission        func()
-	beforePTYStart                 func()
-	beforeTerminalAdmissionWait    func()
-	beforeTerminalAdmissionInstall func()
-	beforeReconcileAdmissionCutoff func()
-	afterTerminalProcessTeardown   func()
-	proxyDialContext               func(context.Context, string, string) (net.Conn, error)
-	shutdownAckSlots               chan struct{}
-	actionNow                      func() time.Time
-	connectAndServeFn              func(context.Context) (bool, error)
-	pollPortsFn                    func(context.Context)
+	beforeShutdownAction               func()
+	beforeProxyDial                    func()
+	afterProxyDial                     func()
+	beforeTerminalAction               func()
+	beforeTerminalAdmission            func()
+	beforePTYStart                     func()
+	beforeTerminalAdmissionWait        func()
+	beforeTerminalAdmissionInstall     func()
+	beforeReconcileAdmissionCutoff     func()
+	afterTerminalProcessTeardown       func()
+	beforeTerminalExitReport           func()
+	afterShutdownAdmissionInvalidation func()
+	beforeExitReportContext            func()
+	beforeExitReportContextPublish     func()
+	beforeExitReportContextWait        func()
+	proxyDialContext                   func(context.Context, string, string) (net.Conn, error)
+	shutdownAckSlots                   chan struct{}
+	actionNow                          func() time.Time
+	connectAndServeFn                  func(context.Context) (bool, error)
+	pollPortsFn                        func(context.Context)
 }
 
 // setCancel lets the agent shut itself down when the relay asks it to.
@@ -132,6 +147,41 @@ func (d *system) lifecycleContext() context.Context {
 		return context.Background()
 	}
 	return ctx
+}
+
+func (d *system) exitReportContextState() (context.Context, bool) {
+	d.mu.Lock()
+	ctx := d.exitReportCtx
+	shutdownCtx := ctx != nil
+	if ctx == nil {
+		ctx = d.runCtx
+	}
+	d.mu.Unlock()
+	if ctx == nil {
+		return context.Background(), shutdownCtx
+	}
+	return ctx, shutdownCtx
+}
+
+func (d *system) waitForExitReportContext() bool {
+	if d.beforeExitReportContextWait != nil {
+		d.beforeExitReportContextWait()
+	}
+	d.mu.Lock()
+	ready := d.exitReportReady
+	if ready == nil {
+		ready = make(chan struct{})
+		d.exitReportReady = ready
+	}
+	d.mu.Unlock()
+	timer := time.NewTimer(terminalExitReportShutdownTO + time.Duration(maxTerminalSessions)*terminalKillGrace)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // shutdownCancel returns the root cancellation installed by Run. Looking it up
@@ -559,6 +609,9 @@ func (d *system) resetTerminalSessions(ctx context.Context) error {
 // creation. Run performs the reset before opening the tunnel, but the TUI can
 // issue a command while that first reset is still pending.
 func (d *system) terminalLifecycleReady() error {
+	if d.shutdownStarted() {
+		return errors.New("terminal lifecycle is shutting down")
+	}
 	if d.cfg.RelayURL == "" {
 		return nil
 	}
@@ -573,17 +626,43 @@ func (d *system) terminalLifecycleReady() error {
 	return errors.New("terminal lifecycle reset pending")
 }
 
+func (d *system) shutdownStarted() bool {
+	d.terminalAdmissionMu.Lock()
+	started := d.shuttingDown
+	d.terminalAdmissionMu.Unlock()
+	return started
+}
+
 func (d *system) reportTerminalExit(recordID string, generation int) {
 	if recordID == "" || generation <= 0 || d.cfg.RelayURL == "" {
 		return
 	}
+	d.terminalAdmissionMu.Lock()
+	if d.exitReportsClosed {
+		d.terminalAdmissionMu.Unlock()
+		return
+	}
 	d.exitReports.Add(1)
+	d.terminalAdmissionMu.Unlock()
 	client := httpClient
 	go func() {
 		defer d.exitReports.Done()
-		ctx := d.lifecycleContext()
 		backoff := terminalExitReportBackoff
 		for {
+			ctx, shutdownCtx := d.exitReportContextState()
+			if ctx.Err() != nil {
+				if shutdownCtx {
+					return
+				}
+				if d.shutdownStarted() {
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				if !d.waitForExitReportContext() {
+					return
+				}
+				continue
+			}
 			requestCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			_, err := d.relayDoWithClient(requestCtx, client, http.MethodPost, "/system/terminal-sessions/"+url.PathEscape(recordID)+"/exit", struct {
 				Generation int `json:"generation"`
@@ -605,7 +684,16 @@ func (d *system) reportTerminalExit(recordID string, generation int) {
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return
+				if shutdownCtx {
+					return
+				}
+				if d.shutdownStarted() {
+					continue
+				}
+				if !d.waitForExitReportContext() {
+					return
+				}
+				continue
 			case <-timer.C:
 			}
 			if backoff < terminalExitReportMaxBackoff {
@@ -619,6 +707,81 @@ func (d *system) reportTerminalExit(recordID string, generation int) {
 }
 
 func (d *system) waitExitReports() { d.exitReports.Wait() }
+
+func (d *system) finishShutdown() {
+	d.terminalAdmissionMu.Lock()
+	if d.shuttingDown {
+		d.terminalAdmissionMu.Unlock()
+		return
+	}
+	d.shuttingDown = true
+	if d.beforeExitReportContextPublish != nil {
+		d.beforeExitReportContextPublish()
+	}
+	// Publish a usable background shutdown context immediately. A report worker
+	// can already be observing runCtx cancellation before this lock is reached;
+	// the ready channel lets it synchronize without dropping the report. The
+	// shutdown deadline is started after terminal teardown below, not here.
+	d.mu.Lock()
+	d.exitReportCtx, d.exitReportCancel = context.WithCancel(context.Background())
+	if d.exitReportReady == nil {
+		d.exitReportReady = make(chan struct{})
+	}
+	close(d.exitReportReady)
+	d.mu.Unlock()
+	for key, state := range d.terminalAdmissions {
+		state.canceled = true
+		close(state.done)
+		delete(d.terminalAdmissions, key)
+	}
+	idle := d.admissionsIdle
+	if d.activeAdmissions == 0 {
+		idle = nil
+	}
+	d.terminalAdmissionMu.Unlock()
+	if d.afterShutdownAdmissionInvalidation != nil {
+		d.afterShutdownAdmissionInvalidation()
+	}
+	if idle != nil {
+		<-idle
+	}
+
+	d.terminalMu.Lock()
+	sessions := make([]*terminalSession, 0, len(d.terminals))
+	for _, s := range d.terminals {
+		sessions = append(sessions, s)
+	}
+	d.terminalMu.Unlock()
+	for _, s := range sessions {
+		s.close()
+	}
+	// No admission can register after shuttingDown and the admission activity
+	// drain above. Waiting is therefore safe: there is no Add concurrent with
+	// Wait, and it also covers a published session removed from terminals before
+	// it reached reportTerminalExit.
+	d.publishedClose.Wait()
+	if d.beforeExitReportContext != nil {
+		d.beforeExitReportContext()
+	}
+	// Start the bounded report window only after all published close operations
+	// have completed, so slow process teardown cannot consume report time.
+	d.mu.Lock()
+	reportCancel := d.exitReportCancel
+	d.mu.Unlock()
+	reportDeadline := time.AfterFunc(terminalExitReportShutdownTO, reportCancel)
+	d.terminalAdmissionMu.Lock()
+	d.exitReportsClosed = true
+	d.terminalAdmissionMu.Unlock()
+	d.waitExitReports()
+	d.mu.Lock()
+	cancel := d.exitReportCancel
+	d.exitReportCancel = nil
+	d.mu.Unlock()
+	reportDeadline.Stop()
+	if cancel != nil {
+		cancel()
+	}
+}
 
 func (d *system) reconcileSnapshot(ctx context.Context) error {
 	if d.beforeReconcileAdmissionCutoff != nil {
@@ -782,7 +945,7 @@ func (d *system) restartTerminalSession(ctx context.Context, recordID, projectID
 	if err := d.terminalLifecycleReady(); err != nil {
 		return relay.TerminalSessionInfo{}, err
 	}
-	data, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions/"+url.PathEscape(recordID)+"/restart", nil)
+	data, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions/"+url.PathEscape(recordID)+"/restart", map[string]int{"generation": previousGeneration})
 	if err != nil {
 		return relay.TerminalSessionInfo{}, err
 	}
@@ -796,8 +959,8 @@ func (d *system) restartTerminalSession(ctx context.Context, recordID, projectID
 	return info, nil
 }
 
-func (d *system) deleteTerminalSession(ctx context.Context, recordID string) error {
-	if _, err := d.relayDo(ctx, http.MethodDelete, "/system/terminal-sessions/"+url.PathEscape(recordID), nil); err != nil {
+func (d *system) deleteTerminalSession(ctx context.Context, recordID string, generation int) error {
+	if _, err := d.relayDo(ctx, http.MethodDelete, "/system/terminal-sessions/"+url.PathEscape(recordID), map[string]int{"generation": generation}); err != nil {
 		return err
 	}
 	return d.reconcileTerminalSessionsSync(ctx)
@@ -863,7 +1026,7 @@ func (d *system) deletePort(ctx context.Context, portID string) error {
 // Run connects to the relay and serves the tunnel, reconnecting with backoff
 // until ctx is cancelled.
 func (d *system) Run(ctx context.Context) {
-	defer d.waitExitReports()
+	defer d.finishShutdown()
 	d.mu.Lock()
 	d.runCtx = ctx
 	d.mu.Unlock()

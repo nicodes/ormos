@@ -51,13 +51,13 @@ func TestLifecycleTerminalValidationControlsPTYCreation(t *testing.T) {
 			d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/cat"})
 			d.resetDone = true
 			httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-				row := `{"id":"record","session_id":"session","state":"` + tc.state + `","generation":` + fmt.Sprint(tc.generation) + `}`
+				row := `{"id":"record","project_id":"project","session_id":"session","state":"` + tc.state + `","generation":` + fmt.Sprint(tc.generation) + `}`
 				if tc.name == "missing record" {
-					row = `{"id":"other","session_id":"session","state":"running","generation":1}`
+					row = `{"id":"other","project_id":"project","session_id":"session","state":"running","generation":1}`
 				}
 				return testHTTPResponse(http.StatusOK, `{"sessions":[`+row+`]}`), nil
 			})}
-			h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, Cwd: t.TempDir(), SessionID: "session", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+			h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, Cwd: t.TempDir(), SessionID: "project:session", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
 			s, err := d.terminal(h, acceptedFenceDeadline(t, h))
 			if (err == nil) != tc.wantCreate {
 				t.Fatalf("err=%v wantCreate=%v", err, tc.wantCreate)
@@ -71,6 +71,37 @@ func TestLifecycleTerminalValidationControlsPTYCreation(t *testing.T) {
 				t.Fatalf("refused request created %d PTYs", len(d.terminals))
 			}
 		})
+	}
+}
+
+func TestTerminalV3RejectsCrossedCompositeIdentityOnAdmissionAndReattach(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	var fetches atomic.Int32
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		row := `{"id":"record","project_id":"project-a","session_id":"tab-b","state":"running","generation":1}`
+		if fetches.Add(1) == 3 {
+			row = `{"id":"record","project_id":"project-b","session_id":"tab-b","state":"running","generation":1}`
+		}
+		return testHTTPResponse(http.StatusOK, `{"sessions":[`+row+`]}`), nil
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
+	d.resetDone = true
+	wrong := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project-a:tab-a", TerminalRecordID: "record", TerminalGeneration: 1, Cwd: t.TempDir(), Cols: 80, Rows: 24})
+	if _, err := d.terminal(wrong, acceptedFenceDeadline(t, wrong)); err == nil {
+		t.Fatal("crossed composite identity was admitted")
+	}
+	correct := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project-a:tab-b", TerminalRecordID: "record", TerminalGeneration: 1, Cwd: t.TempDir(), Cols: 80, Rows: 24})
+	s, err := d.terminal(correct, acceptedFenceDeadline(t, correct))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.close()
+	crossed := correct
+	crossed.SessionID = "project-b:tab-b"
+	if _, err := d.terminal(crossed, acceptedFenceDeadline(t, crossed)); err == nil {
+		t.Fatal("crossed composite identity was reattached")
 	}
 }
 
@@ -127,14 +158,14 @@ func TestCrossKeyAdmissionDoesNotBlockOnHeldHTTP(t *testing.T) {
 		if fetch == 1 {
 			close(firstFetchStarted)
 			<-releaseFirst
-			return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+			return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":1}]}`), nil
 		}
-		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"other","session_id":"other-tab","state":"running","generation":1}]}`), nil
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"other","project_id":"other-project","session_id":"other-tab","state":"running","generation":1}]}`), nil
 	})}
 	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
 	d.resetDone = true
-	first := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
-	second := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "other-tab", TerminalRecordID: "other", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	first := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project:tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	second := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "other-project:other-tab", TerminalRecordID: "other", TerminalGeneration: 1, Cols: 80, Rows: 24})
 	firstDone := make(chan error, 1)
 	go func() {
 		_, err := d.terminal(first, acceptedFenceDeadline(t, first))
@@ -183,7 +214,7 @@ func TestAdmissionPublishedDuringReconcileFetchSurvivesSnapshot(t *testing.T) {
 				<-releaseFetch
 				return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
 			}
-			return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+			return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":1}]}`), nil
 		}
 		if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/exit") {
 			reports.Add(1)
@@ -195,7 +226,7 @@ func TestAdmissionPublishedDuringReconcileFetchSurvivesSnapshot(t *testing.T) {
 	reconcileDone := make(chan error, 1)
 	go func() { reconcileDone <- d.reconcileSnapshot(context.Background()) }()
 	<-fetchStarted
-	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project:tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
 	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err != nil {
 		t.Fatalf("terminal admission during reconcile fetch failed: %v", err)
 	}
@@ -280,7 +311,7 @@ func TestReconcileInvalidatesAdmissionBeforePTYStart(t *testing.T) {
 	oldClient := httpClient
 	t.Cleanup(func() { httpClient = oldClient })
 	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":1}]}`), nil
 	})}
 	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
 	d.resetDone = true
@@ -294,7 +325,7 @@ func TestReconcileInvalidatesAdmissionBeforePTYStart(t *testing.T) {
 			<-release
 		}
 	}
-	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project:tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
 	result := make(chan error, 1)
 	go func() { _, err := d.terminal(h, acceptedFenceDeadline(t, h)); result <- err }()
 	<-entered
@@ -324,7 +355,7 @@ func TestReconcileInvalidatesAdmissionBeforePublish(t *testing.T) {
 	oldClient := httpClient
 	t.Cleanup(func() { httpClient = oldClient })
 	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":1}]}`), nil
 	})}
 	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
 	d.resetDone = true
@@ -336,7 +367,7 @@ func TestReconcileInvalidatesAdmissionBeforePublish(t *testing.T) {
 			<-release
 		}
 	}
-	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project:tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
 	result := make(chan error, 1)
 	go func() { _, err := d.terminal(h, acceptedFenceDeadline(t, h)); result <- err }()
 	<-entered
@@ -467,7 +498,7 @@ func TestReconcileClosesExactMappedGenerationAndReportsIt(t *testing.T) {
 		case req.Method == http.MethodGet && req.URL.Path == "/system/terminal-sessions":
 			lists++
 			if lists == 1 {
-				return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":1}]}`), nil
+				return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":1}]}`), nil
 			}
 			return testHTTPResponse(http.StatusOK, `{"sessions":[]}`), nil
 		case req.Method == http.MethodPost && req.URL.Path == "/system/terminal-sessions/record/exit":
@@ -485,7 +516,7 @@ func TestReconcileClosesExactMappedGenerationAndReportsIt(t *testing.T) {
 	})}
 	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
 	d.resetDone = true
-	client, err := d.AttachTerminal(t.TempDir(), relay.TerminalSessionInfo{ID: "record", SessionID: "tab", State: relay.TerminalStateRunning, Generation: 1}, 80, 24)
+	client, err := d.AttachTerminal(t.TempDir(), relay.TerminalSessionInfo{ID: "record", ProjectID: "project", SessionID: "tab", State: relay.TerminalStateRunning, Generation: 1}, 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -792,13 +823,13 @@ func TestOlderAuthoritativeHeaderDoesNotCloseNewerMappedGeneration(t *testing.T)
 	oldClient := httpClient
 	t.Cleanup(func() { httpClient = oldClient })
 	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","session_id":"tab","state":"running","generation":2}]}`), nil
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":2}]}`), nil
 	})}
 	d := newSystem(systemConfig{RelayURL: "ws://relay.test", Shell: "/bin/sh"})
 	d.resetDone = true
-	newer := &terminalSession{id: "record", recordID: "record", generation: 2, owner: d, done: make(chan struct{})}
+	newer := &terminalSession{id: "record", recordID: "record", streamSessionID: "project:tab", generation: 2, owner: d, done: make(chan struct{})}
 	d.terminals["record"] = newer
-	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
+	h := fencedHeader(relay.StreamHeader{Kind: relay.KindTerminal, SessionID: "project:tab", TerminalRecordID: "record", TerminalGeneration: 1, Cols: 80, Rows: 24})
 	if _, err := d.terminal(h, acceptedFenceDeadline(t, h)); err == nil {
 		t.Fatal("older authoritative header was accepted")
 	}

@@ -210,7 +210,9 @@ func (r *replayRing) snapshot() []byte {
 type terminalSession struct {
 	id                string
 	recordID          string
+	streamSessionID   string
 	generation        int
+	published         bool
 	admissionSequence uint64
 	owner             *system
 	cwd               string // the directory policy was evaluated against
@@ -496,6 +498,9 @@ func (d *system) AttachTerminal(projectRoot string, info relay.TerminalSessionIn
 	if sessionID == "" {
 		return nil, fmt.Errorf("missing session id")
 	}
+	if info.ProjectID != "" {
+		sessionID = info.ProjectID + ":" + sessionID
+	}
 	header := relay.StreamHeader{Kind: relay.KindTerminal, Cwd: projectRoot, SessionID: sessionID, TerminalRecordID: recordID, TerminalGeneration: generation, Cols: cols, Rows: rows}
 	s, err := d.terminal(header, d.actionTime().Add(terminalLocalActionTO))
 	if err != nil {
@@ -743,8 +748,15 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 	if h.TerminalRecordID != "" {
 		key = h.TerminalRecordID
 	}
-	releaseAdmission, wait, startPTY, admissionState := d.claimTerminalAdmission(key, h.TerminalGeneration)
+	releaseAdmission, wait, startPTY, admissionState, claimErr := d.claimTerminalAdmission(key, h.TerminalGeneration)
+	if claimErr != nil {
+		if releaseAdmission != nil {
+			releaseAdmission()
+		}
+		return nil, claimErr
+	}
 	if wait != nil {
+		defer releaseAdmission()
 		if err := waitForTerminalAdmission(wait, actionDeadline); err != nil {
 			return nil, err
 		}
@@ -754,8 +766,33 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 	d.terminalMu.Lock()
 	existing := d.terminals[key]
 	d.terminalMu.Unlock()
+	v3Admission := h.TerminalRecordID != "" && d.cfg.RelayURL != ""
+	if v3Admission {
+		ctx, cancel := context.WithTimeout(d.lifecycleContext(), terminalLocalActionTO)
+		rows, err := d.fetchTerminalSessions(ctx)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("validate terminal record: %w", err)
+		}
+		found := false
+		for _, row := range rows {
+			if row.ID == h.TerminalRecordID {
+				found = true
+				if row.State != relay.TerminalStateRunning || row.Generation != h.TerminalGeneration || h.SessionID != row.ProjectID+":"+row.SessionID {
+					return nil, fmt.Errorf("terminal record is not the requested running identity")
+				}
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("terminal record not found")
+		}
+	}
 	var stale *terminalSession
 	if existing != nil {
+		if v3Admission && existing.streamSessionID != h.SessionID {
+			return nil, fmt.Errorf("terminal session identity mismatch")
+		}
 		if h.TerminalRecordID != "" && existing.generation > 0 && (existing.recordID != h.TerminalRecordID || existing.generation != h.TerminalGeneration) {
 			if h.TerminalGeneration > 0 && h.TerminalGeneration <= existing.generation {
 				return nil, fmt.Errorf("terminal generation mismatch; newer session is already mapped")
@@ -781,27 +818,6 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 			}
 			d.audit.record(auditEntry{Event: "terminal-reattach", Detail: existing.cwd, Allowed: true})
 			return existing, nil
-		}
-	}
-	if h.TerminalRecordID != "" && d.cfg.RelayURL != "" {
-		ctx, cancel := context.WithTimeout(d.lifecycleContext(), terminalLocalActionTO)
-		rows, err := d.fetchTerminalSessions(ctx)
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("validate terminal record: %w", err)
-		}
-		found := false
-		for _, row := range rows {
-			if row.ID == h.TerminalRecordID {
-				found = true
-				if row.State != relay.TerminalStateRunning || row.Generation != h.TerminalGeneration {
-					return nil, fmt.Errorf("terminal record is not the requested running generation")
-				}
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("terminal record not found")
 		}
 	}
 	if stale != nil {
@@ -878,6 +894,9 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 	d.audit.record(auditEntry{Event: "terminal", Detail: cwd, Allowed: true})
 	if !startPTY() {
 		d.releaseTerminalStarting()
+		if d.shutdownStarted() {
+			return nil, errors.New("terminal lifecycle is shutting down")
+		}
 		return nil, &terminalAdmissionRetryError{reason: "terminal generation was superseded before PTY start"}
 	}
 	if d.beforePTYStart != nil {
@@ -922,7 +941,11 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 		d.releaseTerminalStarting()
 		return nil, fmt.Errorf("set pty size: %w", err)
 	}
-	s := &terminalSession{id: key, recordID: h.TerminalRecordID, generation: h.TerminalGeneration, admissionSequence: admissionState.sequence, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
+	streamSessionID := ""
+	if v3Admission {
+		streamSessionID = h.SessionID
+	}
+	s := &terminalSession{id: key, recordID: h.TerminalRecordID, streamSessionID: streamSessionID, generation: h.TerminalGeneration, admissionSequence: admissionState.sequence, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
 	if s.recordID == "" {
 		s.recordID = key
 		s.generation = 1
@@ -931,6 +954,9 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 		if !d.beginTerminalPublish(admissionState) {
 			s.close()
 			d.releaseTerminalStarting()
+			if d.shutdownStarted() {
+				return nil, errors.New("terminal lifecycle is shutting down")
+			}
 			return nil, &terminalAdmissionRetryError{reason: "terminal generation was superseded before publish"}
 		}
 		// Another request may have advanced the generation while this PTY was
@@ -948,6 +974,12 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 			// observe the entry after this increment, so it cannot decrement a
 			// session that has not yet been counted.
 			d.addSession(1)
+			if d.publishedTerminals == nil {
+				d.publishedTerminals = make(map[*terminalSession]struct{})
+			}
+			d.publishedTerminals[s] = struct{}{}
+			d.publishedClose.Add(1)
+			s.published = true
 			d.terminals[key] = s
 			d.terminalStarting--
 			d.finishTerminalPublish()
@@ -970,18 +1002,22 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 	return s, nil
 }
 
-func (d *system) claimTerminalAdmission(key string, generation int) (func(), <-chan struct{}, func() bool, *terminalAdmissionState) {
+func (d *system) claimTerminalAdmission(key string, generation int) (func(), <-chan struct{}, func() bool, *terminalAdmissionState, error) {
 	d.terminalAdmissionMu.Lock()
 	defer d.terminalAdmissionMu.Unlock()
+	activityDone := d.beginAdmissionActivityLocked()
 	if d.terminalAdmissions == nil {
 		d.terminalAdmissions = make(map[string]*terminalAdmissionState)
+	}
+	if d.shuttingDown {
+		return activityDone, nil, nil, nil, errors.New("terminal lifecycle is shutting down")
 	}
 	if current := d.terminalAdmissions[key]; current != nil {
 		if generation <= current.generation || current.starting {
 			if d.beforeTerminalAdmissionWait != nil {
 				d.beforeTerminalAdmissionWait()
 			}
-			return func() {}, current.done, nil, nil
+			return activityDone, current.done, nil, nil, nil
 		}
 		current.canceled = true
 		close(current.done)
@@ -999,6 +1035,7 @@ func (d *system) claimTerminalAdmission(key string, generation int) (func(), <-c
 				close(state.done)
 			}
 			d.terminalAdmissionMu.Unlock()
+			activityDone()
 		}, nil, func() bool {
 			d.terminalAdmissionMu.Lock()
 			defer d.terminalAdmissionMu.Unlock()
@@ -1007,7 +1044,25 @@ func (d *system) claimTerminalAdmission(key string, generation int) (func(), <-c
 			}
 			state.starting = true
 			return true
-		}, state
+		}, state, nil
+}
+
+func (d *system) beginAdmissionActivityLocked() func() {
+	if d.activeAdmissions == 0 {
+		d.admissionsIdle = make(chan struct{})
+	}
+	d.activeAdmissions++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			d.terminalAdmissionMu.Lock()
+			d.activeAdmissions--
+			if d.activeAdmissions == 0 {
+				close(d.admissionsIdle)
+			}
+			d.terminalAdmissionMu.Unlock()
+		})
+	}
 }
 
 func waitForTerminalAdmission(done <-chan struct{}, deadline time.Time) error {
@@ -1944,7 +1999,16 @@ func (s *terminalSession) close() {
 			if mapped {
 				s.owner.addSession(-1)
 				s.owner.logf("terminal session ended")
+				if s.owner.beforeTerminalExitReport != nil {
+					s.owner.beforeTerminalExitReport()
+				}
 				s.owner.reportTerminalExit(s.recordID, s.generation)
+			}
+			if s.published {
+				s.owner.terminalAdmissionMu.Lock()
+				delete(s.owner.publishedTerminals, s)
+				s.owner.terminalAdmissionMu.Unlock()
+				s.owner.publishedClose.Done()
 			}
 		}
 	})
