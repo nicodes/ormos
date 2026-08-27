@@ -5,6 +5,7 @@ package system
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -205,34 +206,24 @@ func TestTerminalCreationPersistsBeforeAttach(t *testing.T) {
 	}
 }
 
-func TestExitedTerminalEnterRestartsBeforeAttach(t *testing.T) {
+func TestExitedTerminalEnterHasNoRestartAction(t *testing.T) {
 	m := terminalDashboard(t)
 	next, _ := m.Update(terminalsMsg{terminals: []relay.TerminalSessionInfo{{ID: "record", ProjectID: "project-a", SessionID: "a-tab", State: relay.TerminalStateExited, Generation: 3}}})
 	m = next.(model)
 	m.cursor = rowIndex(m.rows, rowTerminal, "project-a", "a-tab")
-	oldClient, oldAttach := httpClient, attachTerminalScreen
-	t.Cleanup(func() { httpClient, attachTerminalScreen = oldClient, oldAttach })
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	requests := 0
 	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.Method != http.MethodPost || req.URL.Path != "/system/terminal-sessions/record/restart" {
-			t.Fatalf("restart request=%s %s", req.Method, req.URL.Path)
-		}
-		return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project-a","session_id":"a-tab","state":"running","generation":4}`), nil
+		requests++
+		return nil, fmt.Errorf("unexpected request: %s %s", req.Method, req.URL.Path)
 	})}
-	_, restartCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	created, ok := restartCmd().(terminalCreatedMsg)
-	if !ok || created.info.ID != "record" || created.info.Generation != 4 {
-		t.Fatalf("restart result=%#v", created)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil || requests != 0 || updated.(model).mode == modeTerminal {
+		t.Fatalf("exited enter command=%v requests=%d mode=%v", cmd, requests, updated.(model).mode)
 	}
-	client := newFakeTerminalAttachment()
-	attachTerminalScreen = func(_ *system, _ string, info relay.TerminalSessionInfo, _, _ int) (terminalAttachment, error) {
-		if info.ID != "record" || info.Generation != 4 {
-			t.Fatalf("attach info=%+v", info)
-		}
-		return client, nil
-	}
-	updated, _ := m.Update(created)
-	if updated.(model).mode != modeTerminal {
-		t.Fatal("restarted terminal did not enter terminal mode")
+	if got := updated.(model).notice; got != "terminal exited; removal is automatic" {
+		t.Fatalf("exited notice=%q", got)
 	}
 }
 
@@ -243,7 +234,7 @@ func TestTerminalStateLabelsAndNoticesMatchActions(t *testing.T) {
 		want  string
 		avoid string
 	}{
-		{relay.TerminalStateExited, "enter restart", "open in TUI"},
+		{relay.TerminalStateExited, "exited; removing automatically", "restart"},
 		{relay.TerminalStateClosing, "d delete", "enter open in TUI"},
 		{"future-state", "terminal unavailable", "enter open in TUI"},
 	} {
@@ -256,11 +247,6 @@ func TestTerminalStateLabelsAndNoticesMatchActions(t *testing.T) {
 		if !strings.Contains(view, tc.want) || strings.Contains(view, tc.avoid) {
 			t.Fatalf("state=%s view lacks truthful footer: %q", tc.state, view)
 		}
-	}
-	m.notice = ""
-	next, _ := m.Update(terminalCreatedMsg{info: relay.TerminalSessionInfo{ID: "record", SessionID: "a-tab", State: relay.TerminalStateRunning, Generation: 4}, restarted: true, err: nil})
-	if got := next.(model).notice; got != "terminal restarted" {
-		t.Fatalf("restart notice=%q", got)
 	}
 }
 
