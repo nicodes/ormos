@@ -123,6 +123,81 @@ func TestTokenValidTreatsTransportFailureAsUnavailable(t *testing.T) {
 	}
 }
 
+func TestStartupRevocationClearsOnlySavedAuthentication(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(srv.Close)
+	httpClient = srv.Client()
+
+	cfg := systemConfig{
+		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
+		ClientID:     "stable-client",
+		SystemID:     "revoked-system",
+		Email:        "owner@example.test",
+		PairingToken: "revoked-token",
+	}
+	if err := saveConfigFile(cfg); err != nil {
+		t.Fatal(err)
+	}
+	needsLogin, err := loginRequired(&cfg)
+	if err != nil || !needsLogin {
+		t.Fatalf("loginRequired = (%v, %v), want (true, nil)", needsLogin, err)
+	}
+	saved, err := loadConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PairingToken != "" || saved.PairingToken != "" {
+		t.Fatal("authoritative startup revocation left the pairing token in memory or on disk")
+	}
+	if cfg.SystemID != "" || cfg.Email != "" || saved.SystemID != "" || saved.Email != "" {
+		t.Fatal("authoritative startup revocation left saved account authentication metadata")
+	}
+	if cfg.ClientID != "stable-client" || saved.ClientID != "stable-client" ||
+		cfg.RelayURL != "ws"+strings.TrimPrefix(srv.URL, "http") || saved.RelayURL != cfg.RelayURL {
+		t.Fatal("clearing startup authentication changed the stable client identity or relay URL")
+	}
+}
+
+func TestStartupInconclusiveCheckPreservesSavedAuthentication(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(srv.Close)
+	httpClient = srv.Client()
+
+	cfg := systemConfig{
+		RelayURL:     "ws" + strings.TrimPrefix(srv.URL, "http"),
+		ClientID:     "stable-client",
+		SystemID:     "current-system",
+		Email:        "owner@example.test",
+		PairingToken: "current-token",
+	}
+	if err := saveConfigFile(cfg); err != nil {
+		t.Fatal(err)
+	}
+	needsLogin, err := loginRequired(&cfg)
+	if err == nil || needsLogin {
+		t.Fatalf("loginRequired = (%v, %v), want (false, throttled error)", needsLogin, err)
+	}
+	saved, err := loadConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PairingToken != "current-token" || saved.PairingToken != "current-token" ||
+		cfg.SystemID != "current-system" || saved.SystemID != "current-system" ||
+		cfg.Email != "owner@example.test" || saved.Email != "owner@example.test" {
+		t.Fatal("inconclusive startup check destroyed saved authentication")
+	}
+}
+
 // A code that stays pending for one poll and is then approved must yield the
 // provisioning payload, with the code shown exactly once.
 func TestDeviceLoginPendingThenApproved(t *testing.T) {
