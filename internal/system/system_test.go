@@ -265,7 +265,7 @@ func TestConfiguredStartupLocksBeforeAgentActions(t *testing.T) {
 		}
 		switch fn := call.Fun.(type) {
 		case *ast.Ident:
-			if _, wanted := map[string]bool{"acquireStateDirLock": true, "tokenValid": true, "performLogin": true, "newSystem": true, "runTUI": true}[fn.Name]; wanted && positions[fn.Name] == token.NoPos {
+			if _, wanted := map[string]bool{"acquireStateDirLock": true, "loginRequired": true, "performLogin": true, "newSystem": true, "runTUI": true}[fn.Name]; wanted && positions[fn.Name] == token.NoPos {
 				positions[fn.Name] = call.Pos()
 			}
 		case *ast.SelectorExpr:
@@ -279,7 +279,7 @@ func TestConfiguredStartupLocksBeforeAgentActions(t *testing.T) {
 	if lockPos == token.NoPos {
 		t.Fatal("runSystem does not acquire the state lock")
 	}
-	for _, action := range []string{"tokenValid", "performLogin", "newSystem", "runTUI", "Run"} {
+	for _, action := range []string{"loginRequired", "performLogin", "newSystem", "runTUI", "Run"} {
 		if positions[action] == token.NoPos {
 			t.Fatalf("runSystem action %s not found", action)
 		}
