@@ -169,15 +169,12 @@ func runSystem() {
 		// authoritatively revoked. A throttled or unavailable startup check is
 		// neither valid nor revoked: preserve the token and stop without starting
 		// the concurrent ports/reset/connect loops.
-		valid := false
-		if cfg.PairingToken != "" {
-			valid, err = tokenValid(cfg.RelayURL, cfg.PairingToken)
-			if err != nil {
-				writeLoginError(os.Stderr, err)
-				os.Exit(1)
-			}
+		needsLogin, loginStateErr := loginRequired(&cfg)
+		if loginStateErr != nil {
+			writeLoginError(os.Stderr, loginStateErr)
+			os.Exit(1)
 		}
-		if cfg.PairingToken == "" || !valid {
+		if needsLogin {
 			li, loginErr := performLogin(ctx, cfg.RelayURL)
 			if loginErr != nil {
 				// The user walking away from the pairing screen is not a failure:
@@ -215,15 +212,47 @@ func runSystem() {
 		if !errors.Is(runErr, errPairingTokenRevoked) {
 			return
 		}
-		if err := clearLoginConfig(); err != nil {
+		if err := clearRevokedLogin(&cfg); err != nil {
 			writeLoginError(os.Stderr, fmt.Errorf("clear revoked pairing token: %w", err))
 			os.Exit(1)
 		}
-		cfg.PairingToken = ""
-		cfg.SystemID = ""
-		cfg.Email = ""
 		fmt.Fprintln(os.Stderr, "pairing token was revoked; starting device pairing")
 	}
+}
+
+// loginRequired classifies the saved credential before any concurrent agent
+// activity starts. A missing or authoritatively revoked token needs pairing;
+// throttling, relay faults and unexpected responses are errors so callers keep
+// the credential rather than destroying it on an inconclusive answer.
+func loginRequired(cfg *systemConfig) (bool, error) {
+	if cfg.PairingToken == "" {
+		return true, nil
+	}
+	valid, err := tokenValid(cfg.RelayURL, cfg.PairingToken)
+	if err != nil {
+		return false, err
+	}
+	if valid {
+		return false, nil
+	}
+	if err := clearRevokedLogin(cfg); err != nil {
+		return false, fmt.Errorf("clear revoked pairing token: %w", err)
+	}
+	return true, nil
+}
+
+// clearRevokedLogin keeps the durable config and the running copy in step. The
+// relay URL and stable client ID survive so re-pairing the same machine does not
+// create a duplicate, while every account credential is removed before a fresh
+// device code is shown.
+func clearRevokedLogin(cfg *systemConfig) error {
+	if err := clearLoginConfig(); err != nil {
+		return err
+	}
+	cfg.PairingToken = ""
+	cfg.SystemID = ""
+	cfg.Email = ""
+	return nil
 }
 
 // writeLoginError runs after the pairing TUI has restored the live terminal.
