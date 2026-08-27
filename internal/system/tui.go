@@ -109,7 +109,6 @@ type terminalsMsg struct {
 type terminalCreatedMsg struct {
 	projectRoot string
 	info        relay.TerminalSessionInfo
-	restarted   bool
 	err         error
 }
 
@@ -399,11 +398,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.terminalsCmd()
 		}
 		m.err = ""
-		if msg.restarted {
-			m.notice = "terminal restarted"
-		} else {
-			m.notice = "terminal created"
-		}
+		m.notice = "terminal created"
 		m, attach := m.startTerminal(msg.projectRoot, msg.info, msg.info.SessionID)
 		return m, tea.Batch(
 			tea.DisableMouse,
@@ -551,13 +546,8 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				p := m.projects[r.projectIdx]
 				tab := m.terminals[r.terminalIdx]
 				if tab.info.State == relay.TerminalStateExited {
-					recordID := tab.info.ID
-					return m, func() tea.Msg {
-						ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-						defer cancel()
-						info, err := m.d.restartTerminalSession(ctx, recordID, p.ID, tab.info.SessionID, tab.info.Generation)
-						return terminalCreatedMsg{projectRoot: p.RootDir, info: info, restarted: true, err: err}
-					}
+					m.notice = "terminal exited; removal is automatic"
+					return m, nil
 				}
 				if tab.info.State != "" && tab.info.State != relay.TerminalStateRunning {
 					m.err = "terminal unavailable"
@@ -944,7 +934,7 @@ func (m model) View() string {
 				tab := m.terminals[r.terminalIdx]
 				switch tab.info.State {
 				case relay.TerminalStateExited:
-					hints += " · enter restart"
+					hints += " · exited; removing automatically"
 				case relay.TerminalStateClosing:
 					hints += " · d delete"
 				case "", relay.TerminalStateRunning:

@@ -971,24 +971,6 @@ func (d *system) createTerminalSession(ctx context.Context, projectID string) (r
 	return relay.TerminalSessionInfo{}, fmt.Errorf("could not allocate a unique terminal session id")
 }
 
-func (d *system) restartTerminalSession(ctx context.Context, recordID, projectID, sessionID string, previousGeneration int) (relay.TerminalSessionInfo, error) {
-	if err := d.terminalLifecycleReady(); err != nil {
-		return relay.TerminalSessionInfo{}, err
-	}
-	data, err := d.relayDo(ctx, http.MethodPost, "/system/terminal-sessions/"+url.PathEscape(recordID)+"/restart", map[string]int{"generation": previousGeneration})
-	if err != nil {
-		return relay.TerminalSessionInfo{}, err
-	}
-	var info relay.TerminalSessionInfo
-	if err := json.Unmarshal(data, &info); err != nil {
-		return relay.TerminalSessionInfo{}, err
-	}
-	if info.ID == "" || info.ID != recordID || info.ProjectID != projectID || info.SessionID != sessionID || info.State != relay.TerminalStateRunning || info.Generation <= previousGeneration {
-		return relay.TerminalSessionInfo{}, fmt.Errorf("restart returned invalid terminal session")
-	}
-	return info, nil
-}
-
 func (d *system) deleteTerminalSession(ctx context.Context, recordID string, generation int) error {
 	if _, err := d.relayDo(ctx, http.MethodDelete, "/system/terminal-sessions/"+url.PathEscape(recordID), map[string]int{"generation": generation}); err != nil {
 		return err
