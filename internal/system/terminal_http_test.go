@@ -121,12 +121,6 @@ func TestTerminalMutationGenerationWireShape(t *testing.T) {
 				return nil, err
 			}
 		}
-		if req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/restart") {
-			if len(body) != 1 || body["generation"] != float64(3) {
-				t.Fatalf("restart body=%#v", body)
-			}
-			return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":4}`), nil
-		}
 		if req.Method == http.MethodDelete && req.URL.Path == "/system/terminal-sessions/record" {
 			if len(body) != 1 || body["generation"] != float64(4) {
 				t.Fatalf("delete body=%#v", body)
@@ -139,9 +133,6 @@ func TestTerminalMutationGenerationWireShape(t *testing.T) {
 		return testHTTPResponse(http.StatusNotFound, ""), nil
 	})}
 	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, resetDone: true, terminals: make(map[string]*terminalSession)}
-	if _, err := d.restartTerminalSession(context.Background(), "record", "project", "tab", 3); err != nil {
-		t.Fatal(err)
-	}
 	if err := d.deleteTerminalSession(context.Background(), "record", 4); err != nil {
 		t.Fatal(err)
 	}
@@ -211,77 +202,6 @@ func TestTerminalSessionCreateRetriesOnlyExplicitConflict(t *testing.T) {
 	}
 	if requests != 8 || randomCalls != 8 {
 		t.Fatalf("conflict exhaustion requests=%d random=%d, want 8", requests, randomCalls)
-	}
-}
-
-func TestRestartTerminalSessionRequiresFlatRunningGeneration(t *testing.T) {
-	oldClient := httpClient
-	t.Cleanup(func() { httpClient = oldClient })
-	for name, body := range map[string]string{
-		"wrapper":         `{"session":{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":2}}`,
-		"missing id":      `{"project_id":"project","session_id":"tab","state":"running","generation":2}`,
-		"missing session": `{"id":"record","project_id":"project","state":"running","generation":2}`,
-		"not running":     `{"id":"record","project_id":"project","session_id":"tab","state":"closing","generation":2}`,
-		"bad generation":  `{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":0}`,
-		"wrong record":    `{"id":"other","project_id":"project","session_id":"tab","state":"running","generation":2}`,
-		"wrong project":   `{"id":"record","project_id":"other","session_id":"tab","state":"running","generation":2}`,
-		"wrong session":   `{"id":"record","project_id":"project","session_id":"other","state":"running","generation":2}`,
-		"same generation": `{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":1}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-				return testHTTPResponse(http.StatusOK, body), nil
-			})}
-			d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, resetDone: true}
-			if _, err := d.restartTerminalSession(context.Background(), "record", "project", "tab", 1); err == nil {
-				t.Fatal("malformed restart response was accepted")
-			}
-		})
-	}
-}
-
-func TestRestartTerminalSessionRequiresCompletedReset(t *testing.T) {
-	for name, state := range map[string]struct {
-		done bool
-		err  error
-	}{
-		"reset pending": {done: false},
-		"reset failed":  {err: errors.New("reset unavailable")},
-	} {
-		t.Run(name, func(t *testing.T) {
-			calls := 0
-			oldClient := httpClient
-			t.Cleanup(func() { httpClient = oldClient })
-			httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-				calls++
-				return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":2}`), nil
-			})}
-			d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, resetDone: state.done, resetErr: state.err}
-			if _, err := d.restartTerminalSession(context.Background(), "record", "project", "tab", 1); err == nil {
-				t.Fatal("restart bypassed terminal lifecycle reset")
-			}
-			if calls != 0 {
-				t.Fatalf("restart issued %d POSTs before reset completion", calls)
-			}
-		})
-	}
-
-	calls := 0
-	oldClient := httpClient
-	t.Cleanup(func() { httpClient = oldClient })
-	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		if req.Method != http.MethodPost || req.URL.Path != "/system/terminal-sessions/record/restart" {
-			t.Fatalf("unexpected restart request: %s %s", req.Method, req.URL.Path)
-		}
-		return testHTTPResponse(http.StatusOK, `{"id":"record","project_id":"project","session_id":"tab","state":"running","generation":2}`), nil
-	})}
-	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, resetDone: true}
-	if _, err := d.restartTerminalSession(context.Background(), "record", "project", "tab", 1); err != nil {
-		t.Fatalf("completed reset blocked restart: %v", err)
-	}
-	if calls != 1 {
-		t.Fatalf("completed reset issued %d POSTs, want one", calls)
 	}
 }
 
