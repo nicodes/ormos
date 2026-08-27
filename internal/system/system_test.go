@@ -27,6 +27,81 @@ import (
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
+func TestConcurrentPortsAndReset401StopsBeforeConnect(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	arrived := make(chan string, 2)
+	release := make(chan struct{})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/system/ports", "/system/terminal-sessions/reset":
+			requests.Add(1)
+			arrived <- r.URL.Path
+			<-release
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = io.WriteString(w, `{"error":"invalid pairing token"}`)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	httpClient = server.Client()
+	d := newSystem(systemConfig{RelayURL: "ws" + strings.TrimPrefix(server.URL, "http"), PairingToken: "stale", Shell: "/bin/sh"})
+	d.pollPortsFn = func(ctx context.Context) { _, _ = d.fetchConfiguredPorts(ctx) }
+	var connects atomic.Int32
+	d.connectAndServeFn = func(context.Context) (bool, error) {
+		connects.Add(1)
+		return false, nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- d.Run(context.Background()) }()
+	seen := map[string]bool{}
+	for range 2 {
+		select {
+		case path := <-arrived:
+			seen[path] = true
+		case <-time.After(2 * time.Second):
+			t.Fatal("ports and reset did not both reach the relay")
+		}
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, errPairingTokenRevoked) {
+			t.Fatalf("Run error = %v, want pairing-token revocation", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop after authoritative 401")
+	}
+	if !seen["/system/ports"] || !seen["/system/terminal-sessions/reset"] {
+		t.Fatalf("paths reached = %v", seen)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests after revocation = %d, want exactly the two synchronized in-flight requests", got)
+	}
+	if got := connects.Load(); got != 0 {
+		t.Fatalf("connect attempts = %d, want 0 after reset 401", got)
+	}
+}
+
+func TestConnect401MarksPairingTokenRevoked(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	d := newSystem(systemConfig{RelayURL: "ws" + strings.TrimPrefix(server.URL, "http"), PairingToken: "stale", Shell: "/bin/sh"})
+	connected, err := d.connectAndServe(context.Background())
+	if connected || !errors.Is(err, errPairingTokenRevoked) {
+		t.Fatalf("connect = (%v, %v), want false and pairing-token revocation", connected, err)
+	}
+	if !errors.Is(d.pairingRevocationError(), errPairingTokenRevoked) {
+		t.Fatal("401 handshake did not publish revocation to the run loop")
+	}
+}
+
 func TestReconnectRunsTerminalReconciliation(t *testing.T) {
 	withTempConfigDir(t)
 	hold := make(chan struct{})

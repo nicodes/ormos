@@ -164,47 +164,66 @@ func runSystem() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Log in on demand: when there is no saved token, or the saved one was
-	// revoked (system forgotten in the UI). Pairing is a device-authorization
-	// flow — a code approved in the web app — so no credentials are ever typed
-	// here: never arguments (world-readable via /proc/<pid>/cmdline, and they
-	// land in shell history) and never the environment (inherited by every
-	// child, and it lives in dotfiles).
-	if cfg.PairingToken == "" || !tokenValid(cfg.RelayURL, cfg.PairingToken) {
-		li, err := performLogin(ctx, cfg.RelayURL)
-		if err != nil {
-			// The user walking away from the pairing screen is not a failure:
-			// say so plainly and exit with the conventional 128+SIGINT.
-			if errors.Is(err, errLoginCancelled) {
-				fmt.Fprintln(os.Stderr, "pairing cancelled")
-				os.Exit(130)
+	for {
+		// Log in on demand: when there is no saved token, or the saved one was
+		// authoritatively revoked. A throttled or unavailable startup check is
+		// neither valid nor revoked: preserve the token and stop without starting
+		// the concurrent ports/reset/connect loops.
+		valid := false
+		if cfg.PairingToken != "" {
+			valid, err = tokenValid(cfg.RelayURL, cfg.PairingToken)
+			if err != nil {
+				writeLoginError(os.Stderr, err)
+				os.Exit(1)
 			}
-			writeLoginError(os.Stderr, err)
+		}
+		if cfg.PairingToken == "" || !valid {
+			li, loginErr := performLogin(ctx, cfg.RelayURL)
+			if loginErr != nil {
+				// The user walking away from the pairing screen is not a failure:
+				// say so plainly and exit with the conventional 128+SIGINT.
+				if errors.Is(loginErr, errLoginCancelled) {
+					fmt.Fprintln(os.Stderr, "pairing cancelled")
+					os.Exit(130)
+				}
+				writeLoginError(os.Stderr, loginErr)
+				os.Exit(1)
+			}
+			cfg.ClientID = li.ClientID
+			cfg.PairingToken = li.PairingToken
+			cfg.SystemID = li.SystemID
+			cfg.Email = li.Email
+		}
+		if cfg.PairingToken == "" {
+			fmt.Fprintln(os.Stderr, "error: no pairing token")
 			os.Exit(1)
 		}
-		cfg.ClientID = li.ClientID
-		cfg.PairingToken = li.PairingToken
-		cfg.SystemID = li.SystemID
-		cfg.Email = li.Email
-	}
-	if cfg.PairingToken == "" {
-		fmt.Fprintln(os.Stderr, "error: no pairing token")
-		os.Exit(1)
-	}
 
-	d := newSystem(cfg)
-	d.setCancel(cancel) // let the relay request a graceful shutdown (UI Stop/Forget)
-
-	if !isTTY() {
-		d.EchoToStderr(true)
-		// Print the sealing-key fingerprint once, up front: headless has no
-		// dashboard to show it, and it is what a user reads against the app to
-		// confirm the relay has not swapped the key.
-		fmt.Fprintf(os.Stderr, "sealing key fingerprint: %s (verify this in the app)\n", d.Fingerprint())
-		d.Run(ctx) // blocks until ctx done
-		return
+		d := newSystem(cfg)
+		d.setCancel(cancel) // let the relay request a graceful shutdown (UI Stop/Forget)
+		var runErr error
+		if !isTTY() {
+			d.EchoToStderr(true)
+			// Print the sealing-key fingerprint once, up front: headless has no
+			// dashboard to show it, and it is what a user reads against the app to
+			// confirm the relay has not swapped the key.
+			fmt.Fprintf(os.Stderr, "sealing key fingerprint: %s (verify this in the app)\n", d.Fingerprint())
+			runErr = d.Run(ctx) // blocks until ctx done or the token is revoked
+		} else {
+			runErr = runTUI(ctx, d)
+		}
+		if !errors.Is(runErr, errPairingTokenRevoked) {
+			return
+		}
+		if err := clearLoginConfig(); err != nil {
+			writeLoginError(os.Stderr, fmt.Errorf("clear revoked pairing token: %w", err))
+			os.Exit(1)
+		}
+		cfg.PairingToken = ""
+		cfg.SystemID = ""
+		cfg.Email = ""
+		fmt.Fprintln(os.Stderr, "pairing token was revoked; starting device pairing")
 	}
-	runTUI(ctx, d)
 }
 
 // writeLoginError runs after the pairing TUI has restored the live terminal.
