@@ -44,6 +44,8 @@ type relayHTTPError struct {
 
 func (e *relayHTTPError) Error() string { return e.message }
 
+var errPairingTokenRevoked = errors.New("pairing token revoked")
+
 // PortStatus is one configured exposed port for this system, with whether it
 // is currently being served (a local process is listening on it).
 type PortStatus struct {
@@ -130,6 +132,8 @@ type system struct {
 	actionNow                          func() time.Time
 	connectAndServeFn                  func(context.Context) (bool, error)
 	pollPortsFn                        func(context.Context)
+	runCancel                          context.CancelFunc
+	pairingTokenRevoked                bool
 }
 
 // setCancel lets the agent shut itself down when the relay asks it to.
@@ -137,6 +141,29 @@ func (d *system) setCancel(cancel context.CancelFunc) {
 	d.mu.Lock()
 	d.cancel = cancel
 	d.mu.Unlock()
+}
+
+// markPairingTokenRevoked stops every loop sharing this system as soon as any
+// authoritative agent endpoint returns 401. It does not clear configuration;
+// the top-level owner of the state-directory lock does that before re-pairing.
+func (d *system) markPairingTokenRevoked() {
+	d.mu.Lock()
+	d.pairingTokenRevoked = true
+	cancel := d.runCancel
+	d.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (d *system) pairingRevocationError() error {
+	d.mu.Lock()
+	revoked := d.pairingTokenRevoked
+	d.mu.Unlock()
+	if revoked {
+		return errPairingTokenRevoked
+	}
+	return nil
 }
 
 func (d *system) lifecycleContext() context.Context {
@@ -542,6 +569,9 @@ func (d *system) relayDoWithClient(ctx context.Context, client *http.Client, met
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var e struct {
 			Error string `json:"error"`
+		}
+		if resp.StatusCode == http.StatusUnauthorized {
+			d.markPairingTokenRevoked()
 		}
 		if json.Unmarshal(data, &e) == nil && e.Error != "" {
 			return nil, &relayHTTPError{statusCode: resp.StatusCode, message: e.Error}
@@ -1025,10 +1055,13 @@ func (d *system) deletePort(ctx context.Context, portID string) error {
 
 // Run connects to the relay and serves the tunnel, reconnecting with backoff
 // until ctx is cancelled.
-func (d *system) Run(ctx context.Context) {
+func (d *system) Run(ctx context.Context) error {
 	defer d.finishShutdown()
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 	d.mu.Lock()
-	d.runCtx = ctx
+	d.runCtx = runCtx
+	d.runCancel = cancelRun
 	d.mu.Unlock()
 	// Reaching here with a cleartext remote relay means the operator opted in
 	// via ORMOS_INSECURE=1 (runSystem refuses it otherwise) — say so loudly,
@@ -1037,20 +1070,20 @@ func (d *system) Run(ctx context.Context) {
 		d.logf("WARNING: %s is a remote cleartext relay; the pairing token is sent unencrypted (allowed by ORMOS_INSECURE=1) — use wss://", d.cfg.RelayURL)
 	}
 	if d.pollPortsFn != nil {
-		go d.pollPortsFn(ctx)
+		go d.pollPortsFn(runCtx)
 	} else {
-		go d.pollPorts(ctx)
+		go d.pollPorts(runCtx)
 	}
 	backoff := minBackoff
 	for {
-		if ctx.Err() != nil {
-			return
+		if runCtx.Err() != nil {
+			return d.pairingRevocationError()
 		}
 		d.resetMu.Lock()
 		resetDone := d.resetDone
 		d.resetMu.Unlock()
 		if !resetDone {
-			resetCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+			resetCtx, cancel := context.WithTimeout(runCtx, 8*time.Second)
 			err := d.resetTerminalSessions(resetCtx)
 			cancel()
 			if err != nil {
@@ -1059,8 +1092,8 @@ func (d *system) Run(ctx context.Context) {
 				d.resetMu.Unlock()
 				d.logf("terminal lifecycle reset failed: %v (retry in %s)", err, backoff)
 				select {
-				case <-ctx.Done():
-					return
+				case <-runCtx.Done():
+					return d.pairingRevocationError()
 				case <-time.After(backoff):
 				}
 				if backoff < maxBackoff {
@@ -1081,9 +1114,9 @@ func (d *system) Run(ctx context.Context) {
 		if d.connectAndServeFn != nil {
 			connect = d.connectAndServeFn
 		}
-		connected, err := connect(ctx)
-		if ctx.Err() != nil {
-			return
+		connected, err := connect(runCtx)
+		if runCtx.Err() != nil {
+			return d.pairingRevocationError()
 		}
 		lifetime := time.Since(began)
 		if tunnelHealthy(connected, lifetime) {
@@ -1101,8 +1134,8 @@ func (d *system) Run(ctx context.Context) {
 			d.logf("tunnel closed after %s (retry in %s)", lifetime.Round(time.Millisecond), backoff)
 		}
 		select {
-		case <-ctx.Done():
-			return
+		case <-runCtx.Done():
+			return d.pairingRevocationError()
 		case <-time.After(backoff + jitter(backoff)):
 		}
 		if backoff < maxBackoff {
@@ -1143,7 +1176,7 @@ func jitter(d time.Duration) time.Duration {
 func (d *system) connectAndServe(ctx context.Context) (connected bool, err error) {
 	url := d.cfg.RelayURL + "/system/connect"
 	d.logf("connecting to %s", url)
-	conn, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(ctx, url, &websocket.DialOptions{
 		HTTPHeader: map[string][]string{
 			"Authorization": {"Bearer " + d.cfg.PairingToken},
 			// Always advertise the current fenced+ACK protocol. The shared
@@ -1157,6 +1190,13 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 		},
 	})
 	if err != nil {
+		if resp != nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusUnauthorized {
+				d.markPairingTokenRevoked()
+				return false, errPairingTokenRevoked
+			}
+		}
 		return false, fmt.Errorf("dial: %w", err)
 	}
 	// No SetReadLimit here, deliberately. relay.NetConn presents this connection

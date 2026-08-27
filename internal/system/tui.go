@@ -71,17 +71,17 @@ var runTUIProgram = func(ctx context.Context, d *system) {
 	_, _ = p.Run()
 }
 
-func runTUI(ctx context.Context, d *system) {
+func runTUI(ctx context.Context, d *system) error {
 	uiCtx, cancel := context.WithCancel(ctx)
-	runDone := make(chan struct{})
+	runDone := make(chan error, 1)
 	go func() {
-		d.Run(uiCtx)
-		close(runDone)
+		runDone <- d.Run(uiCtx)
+		cancel()
 	}()
 
 	runTUIProgram(uiCtx, d)
 	cancel()
-	<-runDone
+	return <-runDone
 }
 
 // ---- messages & tick ------------------------------------------------------
