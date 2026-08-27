@@ -288,17 +288,33 @@ The code expires in %d seconds. Waiting for approval — ctrl-C to cancel.
 
 // tokenValid checks whether a pairing token is still accepted by the relay
 // (a system can be forgotten in the UI, revoking its token). It hits the
-// lightweight ports endpoint. If the relay is unreachable it returns true so we
-// don't force a re-login while offline — the run loop will keep retrying.
-func tokenValid(relayWS, token string) bool {
+// lightweight ports endpoint. Only 2xx proves validity and only 401 proves
+// revocation; throttling, outages, unexpected responses, and transport errors
+// preserve the saved credential and stop startup rather than launching the
+// concurrent agent loops with an unproved token.
+func tokenValid(relayWS, token string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, httpBaseFromWS(relayWS)+"/system/ports", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpBaseFromWS(relayWS)+"/system/ports", nil)
+	if err != nil {
+		return false, fmt.Errorf("check pairing token: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return true
+		return false, fmt.Errorf("check pairing token: %w", err)
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode != http.StatusUnauthorized
+	switch {
+	case resp.StatusCode >= 200 && resp.StatusCode < 300:
+		return true, nil
+	case resp.StatusCode == http.StatusUnauthorized:
+		return false, nil
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return false, errors.New("pairing token check was throttled; retry later")
+	case resp.StatusCode >= 500:
+		return false, fmt.Errorf("pairing token check unavailable: relay returned %s", resp.Status)
+	default:
+		return false, fmt.Errorf("pairing token check failed: relay returned %s", resp.Status)
+	}
 }
