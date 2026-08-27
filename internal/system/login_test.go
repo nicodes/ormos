@@ -69,6 +69,60 @@ func startResponse(userCode, deviceCode string) relay.DeviceStartResponse {
 	}
 }
 
+func TestTokenValidClassifiesStartupResponses(t *testing.T) {
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+
+	tests := []struct {
+		name      string
+		status    int
+		wantValid bool
+		wantErr   string
+	}{
+		{"accepted", http.StatusOK, true, ""},
+		{"revoked", http.StatusUnauthorized, false, ""},
+		{"throttled", http.StatusTooManyRequests, false, "throttled"},
+		{"unavailable", http.StatusServiceUnavailable, false, "unavailable"},
+		{"unexpected client response", http.StatusForbidden, false, "failed"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var auth string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				auth = r.Header.Get("Authorization")
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+			httpClient = srv.Client()
+			valid, err := tokenValid("ws"+strings.TrimPrefix(srv.URL, "http"), "startup-token")
+			if valid != tc.wantValid {
+				t.Fatalf("valid = %v, want %v", valid, tc.wantValid)
+			}
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("error = %v, want nil", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("error = %v, want text %q", err, tc.wantErr)
+			}
+			if auth != "Bearer startup-token" {
+				t.Fatalf("Authorization = %q", auth)
+			}
+		})
+	}
+}
+
+func TestTokenValidTreatsTransportFailureAsUnavailable(t *testing.T) {
+	oldClient := httpClient
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("network down")
+	})}
+	t.Cleanup(func() { httpClient = oldClient })
+	valid, err := tokenValid("wss://relay.example.test", "saved-token")
+	if valid || err == nil || !strings.Contains(err.Error(), "network down") {
+		t.Fatalf("tokenValid transport failure = (%v, %v), want false and preserved error", valid, err)
+	}
+}
+
 // A code that stays pending for one poll and is then approved must yield the
 // provisioning payload, with the code shown exactly once.
 func TestDeviceLoginPendingThenApproved(t *testing.T) {
