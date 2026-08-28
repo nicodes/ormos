@@ -157,6 +157,37 @@ func TestServeStreamDropsHeaderlessStream(t *testing.T) {
 	}
 }
 
+func TestServeStreamRejectsV4ForAnotherAuthenticatedSystemBeforeAction(t *testing.T) {
+	withTempConfigDir(t)
+	d := newSystem(systemConfig{SystemID: "system-a"})
+	stopped := make(chan struct{}, 1)
+	d.setCancel(func() { stopped <- struct{}{} })
+	header := fencedHeader(relay.StreamHeader{
+		Kind: relay.KindShutdown, ProtocolVersion: relay.StreamFenceVersionV4,
+		SystemID: "system-b",
+	})
+	agent, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		d.serveStream(agent)
+		close(done)
+	}()
+	if err := relay.WriteHeader(client, header); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("wrong-system v4 stream did not fail closed")
+	}
+	select {
+	case <-stopped:
+		t.Fatal("wrong-system v4 stream reached the shutdown action")
+	default:
+	}
+}
+
 func TestShutdownRequiresLiveAgentFence(t *testing.T) {
 	withTempConfigDir(t)
 	d := newSystem(systemConfig{})

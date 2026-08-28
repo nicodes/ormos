@@ -82,6 +82,13 @@ func (d *system) serveStream(stream net.Conn) {
 		d.logf("stream header error: %v", err)
 		return
 	}
+	if header.ProtocolVersion == relay.StreamFenceVersionV4 {
+		if err := relay.ValidateV4StreamHeader(header, d.cfg.SystemID); err != nil {
+			d.audit.record(auditEntry{Event: string(header.Kind), Allowed: false, Detail: err.Error()})
+			d.logf("refusing %s stream: %v", header.Kind, err)
+			return
+		}
+	}
 	actionDeadline, err := relay.AcceptStreamFence(header, d.actionTime())
 	if err != nil {
 		d.audit.record(auditEntry{Event: string(header.Kind), Allowed: false, Detail: err.Error()})
