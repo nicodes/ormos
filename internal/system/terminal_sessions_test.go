@@ -105,6 +105,50 @@ func TestTerminalV3RejectsCrossedCompositeIdentityOnAdmissionAndReattach(t *test
 	}
 }
 
+func TestTerminalV4UsesDirectSystemRecordGenerationIdentity(t *testing.T) {
+	withTempConfigDir(t)
+	oldClient := httpClient
+	t.Cleanup(func() { httpClient = oldClient })
+	httpClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		// Project and display session remain control-plane metadata in v4. They do
+		// not participate in PTY routing or authorization.
+		return testHTTPResponse(http.StatusOK, `{"sessions":[{"id":"record-a","project_id":"unrelated-project","session_id":"display-label","state":"running","generation":7}]}`), nil
+	})}
+	d := newSystem(systemConfig{RelayURL: "ws://relay.test", SystemID: "system-a", Shell: "/bin/sh"})
+	d.resetDone = true
+	h := fencedHeader(relay.StreamHeader{
+		Kind: relay.KindTerminal, ProtocolVersion: relay.StreamFenceVersionV4,
+		SystemID: "system-a", TerminalRecordID: "record-a", TerminalGeneration: 7,
+		Cwd: t.TempDir(), Cols: 80, Rows: 24,
+	})
+	staleD := newSystem(systemConfig{RelayURL: "ws://relay.test", SystemID: "system-a", Shell: "/bin/sh"})
+	staleD.resetDone = true
+	staleFirst := h
+	staleFirst.TerminalGeneration = 6
+	if _, err := staleD.terminal(staleFirst, acceptedFenceDeadline(t, staleFirst)); err == nil {
+		t.Fatal("fresh v4 admission ignored the authoritative exact generation")
+	}
+	s, err := d.terminal(h, acceptedFenceDeadline(t, h))
+	if err != nil {
+		t.Fatalf("direct v4 identity was refused: %v", err)
+	}
+	defer s.close()
+
+	reattach := h
+	reattach.ActionFence = strings.Repeat("b", 40)
+	reattach.NotAfterMilli = time.Now().Add(time.Second).UnixMilli()
+	got, err := d.terminal(reattach, acceptedFenceDeadline(t, reattach))
+	if err != nil || got != s {
+		t.Fatalf("same direct resource with a fresh action fence reattached as (%p, %v), want %p", got, err, s)
+	}
+
+	stale := h
+	stale.TerminalGeneration = 6
+	if _, err := d.terminal(stale, acceptedFenceDeadline(t, stale)); err == nil {
+		t.Fatal("stale v4 generation was admitted")
+	}
+}
+
 func TestConcurrentSameGenerationTerminalCallsShareOnePTY(t *testing.T) {
 	withTempConfigDir(t)
 	d := newSystem(systemConfig{Shell: "/bin/cat"})

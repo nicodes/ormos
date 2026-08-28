@@ -188,16 +188,29 @@ private hosted backend.
 
 ## Protocol compatibility
 
-The `v0.1` wire format is unchanged from the backend version it was extracted
-from. Breaking protocol changes must be rolled out in this order:
+The tunnel handshake negotiates `X-Ormos-Stream-Fence-Version`. A genuinely
+absent header identifies released v0 agents; explicit values `1`, `2`, `3`, and
+`4` identify the corresponding contracts. Empty, duplicate, comma-joined,
+malformed, and unknown values are refused rather than interpreted as a legacy
+downgrade. Backends must inspect all header values, not only the first one.
+
+V4 terminal actions are keyed directly by authenticated system ID, durable
+terminal record ID, and exact lifecycle generation. Their requested working
+directory and existing action fence/expiry are bound into the sealed stream key
+schedule. V4 proxy actions are system-scoped by authenticated system ID and
+numeric port. Project/session composites and human-readable project, terminal,
+or port labels do not route or authorize either action. V3 retains its released
+project-composite terminal identity during the compatibility window.
+
+Protocol changes must be rolled out in this order:
 
 1. deploy backend support for both the currently released agent and the new
    format;
 2. publish the new agent release;
 3. remove old-format support only after the compatibility window.
 
-There is no automatic version negotiation in `v0.1`, so publishing a breaking
-agent before compatible server support would strand users of `@latest`.
+V0-v3 support may be retired only in a later coordinated change after the
+compatibility window; adding v4 does not itself change those versions' behavior.
 
 ## Development
 
