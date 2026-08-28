@@ -7,6 +7,7 @@ package relay
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -77,8 +78,34 @@ const (
 	StreamFenceVersionV1       = "1"
 	StreamFenceVersionV2       = "2"
 	StreamFenceVersionV3       = "3"
-	StreamFenceVersion         = StreamFenceVersionV3
+	// Version 4 gives terminal and proxy actions direct system-scoped resource
+	// identities. Project names, project ids, session labels, and port labels are
+	// not part of v4 routing or authorization.
+	StreamFenceVersionV4 = "4"
+	StreamFenceVersion   = StreamFenceVersionV4
 )
+
+// ParseStreamFenceVersionHeader validates the complete set of HTTP values for
+// StreamFenceVersionHeader. Passing nil represents a genuinely absent header
+// from a released v0 agent. An explicit empty value, a duplicate field line,
+// comma-joined values, and unknown versions are malformed rather than downgrade
+// requests. Backends should call this on Header.Values, not Header.Get, because
+// Get hides duplicates.
+func ParseStreamFenceVersionHeader(values []string) (string, error) {
+	if len(values) == 0 {
+		return StreamFenceVersionLegacyV0, nil
+	}
+	if len(values) != 1 {
+		return "", fmt.Errorf("stream-fence version header must occur exactly once")
+	}
+	version := values[0]
+	switch version {
+	case StreamFenceVersionV1, StreamFenceVersionV2, StreamFenceVersionV3, StreamFenceVersionV4:
+		return version, nil
+	default:
+		return "", fmt.Errorf("unsupported stream-fence version %q", version)
+	}
+}
 
 // ValidTerminalSize reports whether a terminal's dimensions are within bounds.
 func ValidTerminalSize(cols, rows int) bool {
@@ -115,6 +142,8 @@ const (
 // reads it to decide how to handle the stream.
 type StreamHeader struct {
 	Kind               StreamKind `json:"kind"`
+	ProtocolVersion    string     `json:"protocol_version,omitempty"`
+	SystemID           string     `json:"system_id,omitempty"`
 	Port               int        `json:"port,omitempty"`       // for KindProxy: local TCP port to dial
 	Cols               int        `json:"cols,omitempty"`       // for KindTerminal: initial columns
 	Rows               int        `json:"rows,omitempty"`       // for KindTerminal: initial rows
@@ -124,6 +153,71 @@ type StreamHeader struct {
 	TerminalGeneration int        `json:"terminal_generation,omitempty"`
 	ActionFence        string     `json:"action_fence,omitempty"`    // opaque durable side-effect capability
 	NotAfterMilli      int64      `json:"not_after_milli,omitempty"` // agent refuses the action at/after this instant
+}
+
+// ValidateV4StreamHeader validates the direct-system identity before an action
+// handler performs policy checks or touches a PTY/socket. The authenticated
+// tunnel's system id is the authority; display labels never enter this check.
+func ValidateV4StreamHeader(h StreamHeader, authenticatedSystemID string) error {
+	if h.ProtocolVersion != StreamFenceVersionV4 {
+		return fmt.Errorf("stream protocol version is not v4")
+	}
+	if authenticatedSystemID == "" || h.SystemID == "" || h.SystemID != authenticatedSystemID {
+		return fmt.Errorf("v4 stream system identity mismatch")
+	}
+	if h.SessionID != "" {
+		return fmt.Errorf("v4 stream must not use project-composite session identity")
+	}
+	switch h.Kind {
+	case KindTerminal:
+		if h.TerminalRecordID == "" {
+			return fmt.Errorf("v4 terminal is missing its record identity")
+		}
+		if h.TerminalGeneration <= 0 {
+			return fmt.Errorf("v4 terminal generation must be positive")
+		}
+		if h.Cwd == "" {
+			return fmt.Errorf("v4 terminal is missing its working directory")
+		}
+	case KindProxy:
+		if !ValidPort(h.Port) {
+			return fmt.Errorf("v4 proxy port is invalid")
+		}
+	case KindShutdown:
+		// Shutdown is system-scoped and has no additional resource identity.
+	default:
+		return fmt.Errorf("v4 direct-system identity is not valid for stream kind %q", h.Kind)
+	}
+	return nil
+}
+
+// TerminalSessionBinding returns the identity bound into the terminal key
+// schedule. V0-v3 preserve their released SessionID behavior. V4 binds the
+// authenticated system resource, exact durable
+// generation, requested cwd, and the already-existing fence plus expiry.
+func TerminalSessionBinding(h StreamHeader) (string, error) {
+	if h.ProtocolVersion != StreamFenceVersionV4 {
+		return h.SessionID, nil
+	}
+	if h.SystemID == "" || h.TerminalRecordID == "" || h.TerminalGeneration <= 0 || h.Cwd == "" || h.ActionFence == "" || h.NotAfterMilli <= 0 {
+		return "", fmt.Errorf("incomplete v4 terminal binding")
+	}
+	return fmt.Sprintf("v4\x00%s\x00%s\x00%d\x00%s\x00%s\x00%d",
+		h.SystemID, h.TerminalRecordID, h.TerminalGeneration, h.Cwd, h.ActionFence, h.NotAfterMilli), nil
+}
+
+// TerminalResourceIdentity is the stable identity used to decide whether a PTY
+// may be reattached. The per-request fence and cwd remain bound by
+// TerminalSessionBinding and revalidated independently; they intentionally do
+// not make each authorized reattach look like a different durable terminal.
+func TerminalResourceIdentity(h StreamHeader) (string, error) {
+	if h.ProtocolVersion != StreamFenceVersionV4 {
+		return h.SessionID, nil
+	}
+	if h.SystemID == "" || h.TerminalRecordID == "" || h.TerminalGeneration <= 0 {
+		return "", fmt.Errorf("incomplete v4 terminal resource identity")
+	}
+	return fmt.Sprintf("v4\x00%s\x00%s\x00%d", h.SystemID, h.TerminalRecordID, h.TerminalGeneration), nil
 }
 
 const maxActionFenceFuture = time.Minute
@@ -284,11 +378,57 @@ func ReadHeader(r io.Reader) (StreamHeader, *bufio.Reader, error) {
 	if err != nil {
 		return StreamHeader{}, br, err
 	}
+	if err := rejectDuplicateJSONNames(line); err != nil {
+		return StreamHeader{}, br, err
+	}
+	var envelope struct {
+		ProtocolVersion string `json:"protocol_version"`
+	}
+	if err := json.Unmarshal(line, &envelope); err != nil {
+		return StreamHeader{}, br, fmt.Errorf("decode stream header: %w", err)
+	}
+	if envelope.ProtocolVersion != "" && envelope.ProtocolVersion != StreamFenceVersionV3 && envelope.ProtocolVersion != StreamFenceVersionV4 {
+		return StreamHeader{}, br, fmt.Errorf("unsupported stream protocol version %q", envelope.ProtocolVersion)
+	}
 	var h StreamHeader
-	if err := json.Unmarshal(line, &h); err != nil {
+	if envelope.ProtocolVersion == StreamFenceVersionV4 {
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&h); err != nil {
+			return StreamHeader{}, br, fmt.Errorf("decode v4 stream header: %w", err)
+		}
+	} else if err := json.Unmarshal(line, &h); err != nil {
 		return StreamHeader{}, br, fmt.Errorf("decode stream header: %w", err)
 	}
 	return h, br, nil
+}
+
+func rejectDuplicateJSONNames(line []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(line))
+	tok, err := dec.Token()
+	if err != nil || tok != json.Delim('{') {
+		return fmt.Errorf("decode v4 stream header: expected object")
+	}
+	seen := make(map[string]struct{})
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("decode v4 stream header: %w", err)
+		}
+		name, ok := tok.(string)
+		if !ok {
+			return fmt.Errorf("decode v4 stream header: expected field name")
+		}
+		if _, exists := seen[name]; exists {
+			return fmt.Errorf("decode v4 stream header: duplicate field %q", name)
+		}
+		seen[name] = struct{}{}
+		var discard json.RawMessage
+		if err := dec.Decode(&discard); err != nil {
+			return fmt.Errorf("decode v4 stream header: %w", err)
+		}
+	}
+	return nil
 }
 
 func readBoundedJSONLine(r io.Reader) ([]byte, *bufio.Reader, error) {
