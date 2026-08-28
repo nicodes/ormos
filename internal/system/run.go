@@ -50,10 +50,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/nicodes/ormos/relay"
 )
 
 // Main accepts `ormos`, `ormos --config PATH`, `ormos --help` and
-// `ormos --version`, and nothing else — no `-h` shorthand, no subcommands.
+// `ormos --version`, `ormos --protocol-version`, and nothing else — no `-h`
+// shorthand, no subcommands.
 // Parsed by hand rather than with the flag package, which would accept
 // single-dash spellings and add its own -h.
 //
@@ -68,6 +71,9 @@ func Main(args []string, version string) {
 		return
 	case len(args) == 1 && args[0] == "--version":
 		fmt.Println(version)
+		return
+	case len(args) == 1 && args[0] == "--protocol-version":
+		fmt.Println(relay.StreamFenceVersion)
 		return
 	case len(args) == 2 && args[0] == "--config" && args[1] != "":
 		configFileOverride = args[1]
@@ -90,6 +96,7 @@ usage:
   ormos --config PATH      run with a different config file
   ormos --help             show this
   ormos --version          print the version
+  ormos --protocol-version print the advertised tunnel protocol version
 
 Just run ormos. If this machine isn't registered yet (or its credentials were
 revoked by forgetting it in the UI), it shows a short pairing code — approve it

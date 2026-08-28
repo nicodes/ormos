@@ -218,6 +218,7 @@ compatibility window; adding v4 does not itself change those versions' behavior.
 go test -race ./...
 go vet ./...
 go run . --version
+go run . --protocol-version
 ```
 
 The repository is intentionally limited to the public agent and shared
