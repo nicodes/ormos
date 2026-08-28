@@ -106,3 +106,10 @@ runs:
           echo "::error::built binary reported no version at all"
           exit 1
         fi
+
+        protocol="$($tmp/ormos --protocol-version)"
+        echo "protocol $protocol"
+        if [ "$protocol" != "4" ]; then
+          echo "::error::built binary advertises protocol '$protocol', expected the v4 release contract"
+          exit 1
+        fi

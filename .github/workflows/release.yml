@@ -149,6 +149,9 @@ jobs:
           cat > dist/notes.md <<NOTES
           ormos $TAG
 
+          Advertised tunnel protocol: v4 (with backend compatibility for
+          released v0-v3 agents during the documented migration window).
+
           \`\`\`sh
           go install github.com/nicodes/ormos@$TAG
           \`\`\`
