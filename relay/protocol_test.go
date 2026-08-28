@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -72,12 +73,128 @@ func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
 	}
 }
 
-func TestCurrentAgentAdvertisesOnlyV3(t *testing.T) {
+func TestCurrentAgentAdvertisesV4(t *testing.T) {
 	if StreamFenceVersionLegacyV0 != "" {
 		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
 	}
-	if StreamFenceVersion != StreamFenceVersionV3 {
-		t.Fatalf("advertised stream-fence version = %q, want v3 %q", StreamFenceVersion, StreamFenceVersionV3)
+	if StreamFenceVersion != StreamFenceVersionV4 {
+		t.Fatalf("advertised stream-fence version = %q, want v4 %q", StreamFenceVersion, StreamFenceVersionV4)
+	}
+}
+
+func TestParseStreamFenceVersionHeaderPreservesReleasedVersionsAndFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		values []string
+		want   string
+		bad    bool
+	}{
+		{"absent v0", nil, "", false},
+		{"v1", []string{"1"}, "1", false},
+		{"v2", []string{"2"}, "2", false},
+		{"v3", []string{"3"}, "3", false},
+		{"v4", []string{"4"}, "4", false},
+		{"explicit empty", []string{""}, "", true},
+		{"duplicate", []string{"4", "3"}, "", true},
+		{"comma joined", []string{"4, 3"}, "", true},
+		{"explicit zero", []string{"0"}, "", true},
+		{"unknown", []string{"5"}, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseStreamFenceVersionHeader(tc.values)
+			if (err != nil) != tc.bad || got != tc.want {
+				t.Fatalf("ParseStreamFenceVersionHeader(%q) = (%q, %v), want (%q, bad=%v)", tc.values, got, err, tc.want, tc.bad)
+			}
+		})
+	}
+}
+
+func TestV4DirectSystemIdentityAndTerminalBinding(t *testing.T) {
+	now := time.Now().Add(time.Second).UnixMilli()
+	h := StreamHeader{
+		Kind: KindTerminal, ProtocolVersion: StreamFenceVersionV4,
+		SystemID: "system-a", TerminalRecordID: "record-a", TerminalGeneration: 7,
+		Cwd: "/code/app", Cols: 80, Rows: 24,
+		ActionFence: strings.Repeat("a", 40), NotAfterMilli: now,
+	}
+	if err := ValidateV4StreamHeader(h, "system-a"); err != nil {
+		t.Fatalf("valid v4 terminal: %v", err)
+	}
+	encoded, err := json.Marshal(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const v4Wire = `{"kind":"terminal","protocol_version":"4","system_id":"system-a","cols":80,"rows":24,"cwd":"/code/app","terminal_record_id":"record-a","terminal_generation":7,"action_fence":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","not_after_milli":`
+	if !strings.HasPrefix(string(encoded), v4Wire) || !strings.HasSuffix(string(encoded), fmt.Sprint(now)+`}`) {
+		t.Fatalf("v4 terminal wire payload = %s, want the pinned direct-system fields", encoded)
+	}
+	binding, err := TerminalSessionBinding(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceIdentity, err := TerminalResourceIdentity(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*StreamHeader){
+		"system":     func(v *StreamHeader) { v.SystemID = "system-b" },
+		"record":     func(v *StreamHeader) { v.TerminalRecordID = "record-b" },
+		"generation": func(v *StreamHeader) { v.TerminalGeneration++ },
+		"cwd":        func(v *StreamHeader) { v.Cwd = "/code/other" },
+		"fence":      func(v *StreamHeader) { v.ActionFence = strings.Repeat("b", 40) },
+		"expiry":     func(v *StreamHeader) { v.NotAfterMilli++ },
+	} {
+		t.Run(name+" is bound", func(t *testing.T) {
+			changed := h
+			mutate(&changed)
+			got, err := TerminalSessionBinding(changed)
+			if err != nil || got == binding {
+				t.Fatalf("changed %s produced binding (%q, %v), want a distinct valid binding", name, got, err)
+			}
+		})
+	}
+	newFence := h
+	newFence.ActionFence = strings.Repeat("b", 40)
+	newFence.NotAfterMilli++
+	if got, err := TerminalResourceIdentity(newFence); err != nil || got != resourceIdentity {
+		t.Fatalf("new authorized attach changed durable resource identity: (%q, %v)", got, err)
+	}
+
+	withLabel := h
+	withLabel.SessionID = "project-a:display-label"
+	if err := ValidateV4StreamHeader(withLabel, "system-a"); err == nil {
+		t.Fatal("v4 project-composite/session label was accepted as identity")
+	}
+	wrongSystem := h
+	if err := ValidateV4StreamHeader(wrongSystem, "system-b"); err == nil {
+		t.Fatal("v4 terminal for another authenticated system was accepted")
+	}
+	proxy := StreamHeader{Kind: KindProxy, ProtocolVersion: StreamFenceVersionV4, SystemID: "system-a", Port: 8080}
+	if err := ValidateV4StreamHeader(proxy, "system-a"); err != nil {
+		t.Fatalf("system-scoped v4 proxy: %v", err)
+	}
+}
+
+func TestReadHeaderV4IsStrictWhileV3RemainsCompatible(t *testing.T) {
+	validV4 := `{"kind":"terminal","protocol_version":"4","system_id":"system-a","cols":80,"rows":24,"cwd":"/code/app","terminal_record_id":"record-a","terminal_generation":7,"action_fence":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","not_after_milli":1700000000123}` + "\n"
+	if h, _, err := ReadHeader(strings.NewReader(validV4)); err != nil || h.SystemID != "system-a" {
+		t.Fatalf("valid v4 header = (%+v, %v)", h, err)
+	}
+	for name, wire := range map[string]string{
+		"unknown field":         `{"kind":"proxy","protocol_version":"4","system_id":"system-a","port":8080,"label":"display-only"}` + "\n",
+		"duplicate field":       `{"kind":"proxy","protocol_version":"4","system_id":"system-a","port":8080,"port":8081}` + "\n",
+		"unknown version":       `{"kind":"proxy","protocol_version":"5","system_id":"system-a","port":8080}` + "\n",
+		"duplicate negotiation": `{"kind":"proxy","protocol_version":"4","protocol_version":"3","system_id":"system-a","port":8080}` + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := ReadHeader(strings.NewReader(wire)); err == nil {
+				t.Fatal("malformed header was accepted")
+			}
+		})
+	}
+	legacy := `{"kind":"terminal","protocol_version":"3","session_id":"project:tab","future_additive_field":true}` + "\n"
+	if h, _, err := ReadHeader(strings.NewReader(legacy)); err != nil || h.SessionID != "project:tab" {
+		t.Fatalf("v3 additive header = (%+v, %v), want preserved lenient behavior", h, err)
 	}
 }
 
@@ -97,7 +214,7 @@ func TestLifecycleStreamHeaderWireFields(t *testing.T) {
 // statuses are pinned in contract_test.go, and JSON tags and numeric terminal
 // tags are pinned against complete literal payloads in their dedicated tests.
 //
-// TestCurrentAgentAdvertisesOnlyV3 above pins the current fence-version alias
+// TestCurrentAgentAdvertisesV4 above pins the current fence-version alias
 // and the empty-string legacy sentinel; this table records the wire literals.
 //
 // The argument is the one TestTunnelHeaderNamesArePinnedToTheirWireSpellings
@@ -171,6 +288,7 @@ func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
 		{"StreamFenceVersionV1", StreamFenceVersionV1, "1"},
 		{"StreamFenceVersionV2", StreamFenceVersionV2, "2"},
 		{"StreamFenceVersionV3", StreamFenceVersionV3, "3"},
+		{"StreamFenceVersionV4", StreamFenceVersionV4, "4"},
 		{"KindTerminal", string(KindTerminal), "terminal"},
 		{"KindProxy", string(KindProxy), "proxy"},
 		{"KindListPorts", string(KindListPorts), "listports"},

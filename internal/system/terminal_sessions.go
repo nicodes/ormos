@@ -622,7 +622,7 @@ func (c *localTerminalConn) kill() {
 }
 
 func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
-	if h.SessionID == "" {
+	if h.ProtocolVersion != relay.StreamFenceVersionV4 && h.SessionID == "" {
 		d.logf("terminal refused: missing session id")
 		return
 	}
@@ -664,7 +664,12 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 	// Both public keys, the salt and the session id are bound into the schedule,
 	// so a relay that swapped the agent's key yields a derivation the client
 	// rejects, and a record captured from one tab cannot be replayed into another.
-	keys, err := relay.DeriveSessionKeys(d.key, peer, salt, h.SessionID)
+	binding, err := relay.TerminalSessionBinding(h)
+	if err != nil {
+		d.logf("terminal refused: %v", err)
+		return
+	}
+	keys, err := relay.DeriveSessionKeys(d.key, peer, salt, binding)
 	if err != nil {
 		d.logf("terminal refused: key agreement failed: %v", err)
 		return
@@ -725,6 +730,9 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 		if fi, err := os.Stat(expanded); err == nil && fi.IsDir() {
 			cwd = expanded
 		} else {
+			if h.ProtocolVersion == relay.StreamFenceVersionV4 {
+				return nil, fmt.Errorf("v4 terminal cwd %q is not an existing directory", h.Cwd)
+			}
 			d.logf("terminal cwd %q unusable, using default", h.Cwd)
 		}
 	}
@@ -766,8 +774,8 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 	d.terminalMu.Lock()
 	existing := d.terminals[key]
 	d.terminalMu.Unlock()
-	v3Admission := h.TerminalRecordID != "" && d.cfg.RelayURL != ""
-	if v3Admission {
+	remoteLifecycleAdmission := h.TerminalRecordID != "" && d.cfg.RelayURL != ""
+	if remoteLifecycleAdmission {
 		ctx, cancel := context.WithTimeout(d.lifecycleContext(), terminalLocalActionTO)
 		rows, err := d.fetchTerminalSessions(ctx)
 		cancel()
@@ -778,7 +786,11 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 		for _, row := range rows {
 			if row.ID == h.TerminalRecordID {
 				found = true
-				if row.State != relay.TerminalStateRunning || row.Generation != h.TerminalGeneration || h.SessionID != row.ProjectID+":"+row.SessionID {
+				identityMatches := row.State == relay.TerminalStateRunning && row.Generation == h.TerminalGeneration
+				if h.ProtocolVersion != relay.StreamFenceVersionV4 {
+					identityMatches = identityMatches && h.SessionID == row.ProjectID+":"+row.SessionID
+				}
+				if !identityMatches {
 					return nil, fmt.Errorf("terminal record is not the requested running identity")
 				}
 				break
@@ -789,8 +801,12 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 		}
 	}
 	var stale *terminalSession
+	streamIdentity, err := relay.TerminalResourceIdentity(h)
+	if err != nil {
+		return nil, err
+	}
 	if existing != nil {
-		if v3Admission && existing.streamSessionID != h.SessionID {
+		if remoteLifecycleAdmission && existing.streamSessionID != streamIdentity {
 			return nil, fmt.Errorf("terminal session identity mismatch")
 		}
 		if h.TerminalRecordID != "" && existing.generation > 0 && (existing.recordID != h.TerminalRecordID || existing.generation != h.TerminalGeneration) {
@@ -942,8 +958,8 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 		return nil, fmt.Errorf("set pty size: %w", err)
 	}
 	streamSessionID := ""
-	if v3Admission {
-		streamSessionID = h.SessionID
+	if remoteLifecycleAdmission {
+		streamSessionID = streamIdentity
 	}
 	s := &terminalSession{id: key, recordID: h.TerminalRecordID, streamSessionID: streamSessionID, generation: h.TerminalGeneration, admissionSequence: admissionState.sequence, owner: d, cwd: cwd, ptmx: ptmx, cmd: cmd, pgid: pgid, conns: make(map[terminalConn]struct{}), done: make(chan struct{})}
 	if s.recordID == "" {
