@@ -1,6 +1,6 @@
 module github.com/nicodes/ormos
 
-go 1.25.13
+go 1.26.0
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0
@@ -11,8 +11,8 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/hashicorp/yamux v0.1.2
 	github.com/vito/midterm v0.2.5
-	golang.org/x/crypto v0.55.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/crypto v0.56.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
