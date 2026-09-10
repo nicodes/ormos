@@ -890,6 +890,11 @@ func TestOlderAuthoritativeHeaderDoesNotCloseNewerMappedGeneration(t *testing.T)
 // AgentToClient, the browser opens with the same key.
 func sealedPair(t *testing.T, sessionID string) (agent *sealedConn, client *relay.SealedStream) {
 	t.Helper()
+	return sealedPairMode(t, sessionID, false)
+}
+
+func sealedPairMode(t *testing.T, sessionID string, resume bool) (agent *sealedConn, client *relay.SealedStream) {
+	t.Helper()
 	agentKey, err := relay.GenerateAgentKey()
 	if err != nil {
 		t.Fatal(err)
@@ -911,6 +916,9 @@ func sealedPair(t *testing.T, sessionID string) (agent *sealedConn, client *rela
 		t.Fatal(err)
 	}
 	server, browser := net.Pipe()
+	if resume {
+		_ = browser.SetDeadline(time.Now().Add(5 * time.Second))
+	}
 	agentStream, err := relay.NewSealedStream(server, server, agentKeys.AgentToClient, agentKeys.ClientToAgent)
 	if err != nil {
 		t.Fatal(err)
@@ -920,7 +928,7 @@ func sealedPair(t *testing.T, sessionID string) (agent *sealedConn, client *rela
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { server.Close(); browser.Close() })
-	return newSealedConn(server, agentStream), clientStream
+	return newSealedConnMode(server, agentStream, resume), clientStream
 }
 
 // waitConns blocks until the session holds exactly n connections.

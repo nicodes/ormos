@@ -453,9 +453,29 @@ func (s *SealedStream) WriteFrame(frame []byte) error {
 
 // ReadFrame reads one record, opens it, and decodes the frame inside.
 func (s *SealedStream) ReadFrame() (TermFrame, error) {
-	rec, err := ReadRecordInto(s.r, s.rbuf)
+	plain, err := s.readPlainFrame()
 	if err != nil {
 		return TermFrame{}, err
+	}
+	return DecodeFrame(plain)
+}
+
+// ReadResumeFrame is used only after v5 negotiation. It intentionally does not
+// auto-detect legacy data: accepting an unsequenced frame would bypass input
+// deduplication and output continuity checks. It shares the existing seal and
+// bounded record reader, with one reader per connection.
+func (s *SealedStream) ReadResumeFrame() (ResumeFrame, error) {
+	plain, err := s.readPlainFrame()
+	if err != nil {
+		return ResumeFrame{}, err
+	}
+	return DecodeResumeFrame(plain)
+}
+
+func (s *SealedStream) readPlainFrame() ([]byte, error) {
+	rec, err := ReadRecordInto(s.r, s.rbuf)
+	if err != nil {
+		return nil, err
 	}
 	// Keep it only if it is worth keeping. No else: a record too large to reuse
 	// leaves the previous buffer in place, which is never over the cap by
@@ -464,9 +484,5 @@ func (s *SealedStream) ReadFrame() (TermFrame, error) {
 	if cap(rec) <= maxReusedRecord {
 		s.rbuf = rec
 	}
-	plain, err := s.recv.Open(rec)
-	if err != nil {
-		return TermFrame{}, err
-	}
-	return DecodeFrame(plain)
+	return s.recv.Open(rec)
 }

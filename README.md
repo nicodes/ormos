@@ -212,6 +212,34 @@ Protocol changes must be rolled out in this order:
 V0-v3 support may be retired only in a later coordinated change after the
 compatibility window; adding v4 does not itself change those versions' behavior.
 
+### V5 development status (not advertised)
+
+The shared parser and codec recognize v5 acknowledged terminal resumption, but
+the agent still advertises v4 and rejects v5 stream dispatch until coordinated
+backend/client and tunnel-handoff integration is verified. This is not a released
+uninterrupted-handoff guarantee.
+
+V5 retains v4's durable resource identity while using a distinct sealed connection
+binding. Output carries absolute offsets into a bounded 256 KiB replay window;
+an expired cursor receives an explicit gap, not a renderer reset. Input has
+separate accepted, PTY-written and client-confirmed cursors. ACKs describe actual
+PTY writes, not queue admission or shell-command completion. Whole-frame retries
+are deduplicated, including after partial writes, and cannot overtake earlier
+input from the same writer.
+
+Each PTY retains at most four writer identities. Replacement connections share a
+writer slot. Only disconnected writers whose accepted input is fully written and
+client-confirmed may be reclaimed; uncertain delivery is never silently evicted.
+Unknown resume identities and exhausted capacity fail explicitly without closing
+the PTY or its existing attachments. Connection send queues and ACK notifications
+remain bounded. A v5 output queue failure requires a cursor-checked reconnect;
+the legacy reset-and-replay path is never applied to a v5 renderer.
+
+Local tests cover sealed ready/ACK ordering, real PTY input and retry suppression,
+exact replay suffixes, and gap replies preserving old attachments. Distributed
+tunnel ownership, client rendering acknowledgments and release retirement still
+need end-to-end verification before advertisement.
+
 ## Development
 
 ```sh
