@@ -83,9 +83,9 @@ const (
 	// not part of v4 routing or authorization.
 	StreamFenceVersionV4 = "4"
 	// Version 5 adds acknowledged terminal resumption without redefining v4's
-	// direct resource identity. Advertisement remains v4 until integration is complete.
+	// direct resource identity.
 	StreamFenceVersionV5 = "5"
-	StreamFenceVersion   = StreamFenceVersionV4
+	StreamFenceVersion   = StreamFenceVersionV5
 )
 
 // ParseStreamFenceVersionHeader validates the complete set of HTTP values for

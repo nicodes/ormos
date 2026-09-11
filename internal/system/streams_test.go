@@ -507,6 +507,7 @@ func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testin
 			_, _ = io.WriteString(w, `{"sessions":[]}`)
 			return
 		}
+		w.Header().Set(relay.StreamFenceVersionHeader, r.Header.Get(relay.StreamFenceVersionHeader))
 		ws, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			serverErr <- err
@@ -1457,6 +1458,7 @@ func TestAgentDialAdvertisesItsKeyAndFenceVersion(t *testing.T) {
 		case headers <- r.Header.Clone():
 		default:
 		}
+		w.Header().Set(relay.StreamFenceVersionHeader, r.Header.Get(relay.StreamFenceVersionHeader))
 		ws, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
@@ -1560,6 +1562,7 @@ func TestTheAdvertisedKeyIsTheKeyTerminalsAreSealedWith(t *testing.T) {
 		case headers <- r.Header.Clone():
 		default:
 		}
+		w.Header().Set(relay.StreamFenceVersionHeader, r.Header.Get(relay.StreamFenceVersionHeader))
 		ws, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return

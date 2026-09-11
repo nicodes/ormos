@@ -212,12 +212,13 @@ Protocol changes must be rolled out in this order:
 V0-v3 support may be retired only in a later coordinated change after the
 compatibility window; adding v4 does not itself change those versions' behavior.
 
-### V5 development status (not advertised)
+### V5 acknowledged terminal resumption
 
-The shared parser and codec recognize v5 acknowledged terminal resumption, but
-the agent still advertises v4 and rejects v5 stream dispatch until coordinated
-backend/client and tunnel-handoff integration is verified. This is not a released
-uninterrupted-handoff guarantee.
+The agent advertises v5 only to a backend that positively echoes that exact
+capability on the authenticated WebSocket upgrade. V5 terminal streams use
+acknowledged resumption; v0-v4 parsing and v4 direct resource identity remain
+available to compatible backends and clients. A successful resume proves only
+the retained cursor window described below, not universal network continuity.
 
 V5 retains v4's durable resource identity while using a distinct sealed connection
 binding. Output carries absolute offsets into a bounded 256 KiB replay window;
@@ -236,9 +237,9 @@ remain bounded. A v5 output queue failure requires a cursor-checked reconnect;
 the legacy reset-and-replay path is never applied to a v5 renderer.
 
 Local tests cover sealed ready/ACK ordering, real PTY input and retry suppression,
-exact replay suffixes, and gap replies preserving old attachments. Distributed
-tunnel ownership, client rendering acknowledgments and release retirement still
-need end-to-end verification before advertisement.
+exact replay suffixes, and gap replies preserving old attachments. A replay gap
+is a failed handoff: the PTY and an old attachment are preserved where possible,
+and no silent renderer reset or uninterrupted-continuity claim is made.
 
 ## Development
 
