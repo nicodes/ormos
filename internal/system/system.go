@@ -1181,6 +1181,18 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 		}
 		return false, fmt.Errorf("dial: %w", err)
 	}
+	// V5 is active only after the authenticated relay positively echoes the
+	// exact capability on the 101 response. Older agents ignore this response
+	// header; requiring it here prevents a new agent from assuming acknowledged
+	// resume semantics merely because an intermediary accepted the WebSocket.
+	negotiated, negotiationErr := relay.ParseStreamFenceVersionHeader(resp.Header.Values(relay.StreamFenceVersionHeader))
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	if negotiationErr != nil || negotiated != relay.StreamFenceVersion {
+		_ = conn.Close(websocket.StatusPolicyViolation, "terminal protocol negotiation failed")
+		return false, fmt.Errorf("relay did not confirm terminal protocol %s", relay.StreamFenceVersion)
+	}
 	// No SetReadLimit here, deliberately. relay.NetConn presents this connection
 	// as a net.Conn, and websocket.NetConn disables the read limit to do so: a
 	// byte stream may legitimately span messages, so a per-message cap cannot

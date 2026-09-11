@@ -108,6 +108,7 @@ func TestReconnectRunsTerminalReconciliation(t *testing.T) {
 	terminalLists := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/system/connect" {
+			w.Header().Set(relay.StreamFenceVersionHeader, r.Header.Get(relay.StreamFenceVersionHeader))
 			ws, err := websocket.Accept(w, r, nil)
 			if err == nil {
 				<-hold
@@ -743,6 +744,7 @@ func TestInitialReconnectReconciliationBlocksStreamAcceptance(t *testing.T) {
 			<-releaseList
 			_, _ = io.WriteString(w, `{"sessions":[{"id":"keep","state":"running","generation":4}]}`)
 		case r.URL.Path == "/system/connect":
+			w.Header().Set(relay.StreamFenceVersionHeader, r.Header.Get(relay.StreamFenceVersionHeader))
 			ws, err := websocket.Accept(w, r, nil)
 			if err != nil {
 				return

@@ -73,12 +73,12 @@ func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
 	}
 }
 
-func TestCurrentAgentAdvertisesV4(t *testing.T) {
+func TestCurrentAgentAdvertisesV5(t *testing.T) {
 	if StreamFenceVersionLegacyV0 != "" {
 		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
 	}
-	if StreamFenceVersion != StreamFenceVersionV4 {
-		t.Fatalf("advertised stream-fence version = %q, want v4 %q", StreamFenceVersion, StreamFenceVersionV4)
+	if StreamFenceVersion != StreamFenceVersionV5 {
+		t.Fatalf("advertised stream-fence version = %q, want v5 %q", StreamFenceVersion, StreamFenceVersionV5)
 	}
 }
 
