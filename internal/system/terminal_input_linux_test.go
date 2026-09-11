@@ -5,6 +5,7 @@ package system
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -15,6 +16,185 @@ import (
 )
 
 const terminalInputSchedulerAllowance = 100 * time.Millisecond
+
+func TestSealedResumedAttachmentAcknowledgesActualPTYInputWithoutRetryDuplication(t *testing.T) {
+	ptmx, tty := rawNonblockingPTYPair(t)
+	s := newInputTestSession(ptmx)
+	agent, client := sealedPairMode(t, "actual-pty-ack", true)
+	done := make(chan struct{})
+	go func() { s.attachResume(agent, relay.ResumeHello{Writer: [16]byte{1}, Initial: true}); close(done) }()
+	t.Cleanup(func() {
+		agent.kill()
+		s.close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("resumed attachment reader leaked")
+		}
+	})
+	readResumeInitial(t, client)
+	for _, step := range []struct {
+		offset uint64
+		data   string
+		ack    uint64
+	}{
+		{0, "abc", 3}, {0, "abc", 3}, {3, "def", 6},
+	} {
+		frame, err := relay.EncodeSequencedData(step.offset, []byte(step.data))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := client.WriteFrame(frame); err != nil {
+			t.Fatal(err)
+		}
+		ack, err := client.ReadResumeFrame()
+		if err != nil || ack.InputAck == nil || *ack.InputAck != step.ack {
+			t.Fatal("PTY-written acknowledgment incorrect", err)
+		}
+	}
+	result := make(chan error, 1)
+	go func() {
+		data := make([]byte, 6)
+		_, err := io.ReadFull(tty, data)
+		if err == nil && string(data) != "abcdef" {
+			err = errors.New("sealed retry duplicated PTY input")
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ACK preceded PTY delivery")
+	}
+	if err := client.WriteFrame(relay.EncodeClientAck(relay.ResumeClientAck{InputConfirmed: 6})); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		s.inputMu.Lock()
+		writer := s.resumeWriters[0]
+		confirmed := writer.input.confirmed == 6 && len(writer.input.receipts) == 0
+		s.inputMu.Unlock()
+		if confirmed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("client confirmation did not release receipts")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestResumedPTYInputAcknowledgesWritesAndDeduplicatesReplacement(t *testing.T) {
+	ptmx, tty := rawNonblockingPTYPair(t)
+	s := &terminalSession{ptmx: ptmx, done: make(chan struct{}), input: make(chan *terminalInput, terminalSchedulerQueue)}
+	// Drive the real writer deterministically rather than racing the scheduler
+	// to observe the queued-but-not-written state.
+	s.inputOnce.Do(func() {})
+	oldConn := &sealedConn{}
+	hello := relay.ResumeHello{Writer: [16]byte{1}, Initial: true}
+	writer, err := s.resumeWriters.acquire(hello, oldConn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate, err := s.submitResumeInput(writer, 0, []byte("abcd")); err != nil || duplicate {
+		t.Fatal(err)
+	}
+	if duplicate, err := s.submitResumeInput(writer, 4, []byte("ef")); err != nil || duplicate {
+		t.Fatal(err)
+	}
+	if writer.input.written != 0 || writer.input.accepted != 6 {
+		t.Fatal("queued input was acknowledged")
+	}
+	writer.release(oldConn)
+	hello.Initial = false
+	if got, err := s.resumeWriters.acquire(hello, &sealedConn{}); err != nil || got != writer {
+		t.Fatal("replacement lost accepted bytes", err)
+	}
+	if duplicate, err := s.submitResumeInput(writer, 0, []byte("abcd")); err != nil || !duplicate {
+		t.Fatal("queued retry was not deduplicated", err)
+	}
+	if s.inputCalls != 2 {
+		t.Fatal("retry allocated another scheduler slot")
+	}
+	first, second := <-s.input, <-s.input
+	if complete, err := s.writeInputQuantum(second); complete || err != nil || second.off != 0 {
+		t.Fatal("later frame overtook queued predecessor", err)
+	}
+	// Exercise an actual two-byte PTY write, then the same request's remainder.
+	whole := first.p
+	first.p = first.p[:2]
+	if _, err := s.writeInputQuantum(first); err != nil {
+		t.Fatal(err)
+	}
+	first.p = whole
+	if writer.input.written != 2 {
+		t.Fatal("partial write progress was not exact")
+	}
+	if duplicate, err := s.submitResumeInput(writer, 0, []byte("abcd")); err != nil || !duplicate {
+		t.Fatal("partial-write retry duplicated bytes", err)
+	}
+	if complete, err := s.writeInputQuantum(second); complete || err != nil || second.off != 0 {
+		t.Fatal("later frame overtook partial predecessor", err)
+	}
+	if complete, err := s.writeInputQuantum(first); !complete || err != nil {
+		t.Fatal(err)
+	}
+	if complete, err := s.writeInputQuantum(second); !complete || err != nil {
+		t.Fatal(err)
+	}
+	s.releaseInput(first)
+	s.releaseInput(second)
+	if writer.input.written != 6 || writer.input.confirmed != 0 || writer.reclaimable() {
+		t.Fatal("write was mistaken for client confirmation")
+	}
+	result := make(chan error, 1)
+	go func() {
+		data := make([]byte, 6)
+		_, err := io.ReadFull(tty, data)
+		if err == nil && string(data) != "abcdef" {
+			err = errors.New("PTY received reordered or duplicate bytes")
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("PTY did not receive admitted input")
+	}
+	if s.inputCalls != 0 || s.inputBytes != 0 || len(s.input) != 0 {
+		t.Fatal("scheduler accounting leaked")
+	}
+}
+
+func TestResumedInputAdmissionRejectsWithoutAdvancingCursor(t *testing.T) {
+	s := &terminalSession{done: make(chan struct{}), input: make(chan *terminalInput, terminalSchedulerQueue)}
+	s.inputOnce.Do(func() {})
+	writer, err := s.resumeWriters.acquire(relay.ResumeHello{Writer: [16]byte{1}, Initial: true}, &sealedConn{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.browserInputCalls = terminalBrowserInputQueue
+	if _, err := s.submitResumeInput(writer, 0, []byte("x")); !errors.Is(err, ErrTerminalInputBackpressure) {
+		t.Fatal(err)
+	}
+	if writer.input.accepted != 0 || len(writer.input.receipts) != 0 || len(s.input) != 0 {
+		t.Fatal("rejected frame mutated acceptance")
+	}
+	if _, err := s.submitResumeInput(&terminalResumeWriter{}, 0, []byte("x")); !errors.Is(err, errTerminalWriterUnknown) {
+		t.Fatal("unretained writer admitted", err)
+	}
+	s.inputClosed = true
+	if _, err := s.submitResumeInput(writer, 0, []byte("x")); !errors.Is(err, ErrTerminalClientClosed) {
+		t.Fatal("closed scheduler admitted input", err)
+	}
+}
 
 // This is the kernel-level shutdown/progress case: the slave is raw and does
 // not echo, the nonblocking master is filled to EAGAIN, and no shell drains it.

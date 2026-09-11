@@ -150,12 +150,19 @@ var terminalHandshakeTO = 10 * time.Second
 // second copy of it to disagree; tests and the benchmark shrink it by
 // constructing the ring with a buffer of the size they want.
 type replayRing struct {
-	buf   []byte
-	start int // index of the oldest byte held
-	size  int // bytes held
+	buf          []byte
+	start        int    // index of the oldest byte held
+	size         int    // bytes held
+	total        uint64 // absolute PTY-output position, independent of ring wrap
+	positionLost bool
 }
 
 func (r *replayRing) append(p []byte) {
+	if uint64(len(p)) > ^uint64(0)-r.total {
+		r.positionLost = true
+	} else {
+		r.total += uint64(len(p))
+	}
 	if r.buf == nil {
 		r.buf = make([]byte, terminalReplayBytes)
 	}
@@ -230,7 +237,8 @@ type terminalSession struct {
 	browserInputBytes int
 	browserInputCalls int
 	inputClosed       bool
-	inputCapacity     chan struct{} // closed and replaced under inputMu on accounting release
+	resumeWriters     terminalResumeWriters // protected by inputMu
+	inputCapacity     chan struct{}         // closed and replaced under inputMu on accounting release
 	inputOnce         sync.Once
 	inputStarted      chan struct{}
 	inputStopped      chan struct{}
@@ -261,6 +269,8 @@ type terminalInput struct {
 	off           int
 	local         *localTerminalConn
 	reservedBytes int // original local Write length; zero for browser/test submissions
+	resume        *terminalResumeWriter
+	resumeOffset  uint64
 }
 
 // terminalConn is the common outbound half of a browser or local attachment.
@@ -296,7 +306,12 @@ type terminalConn interface {
 // catastrophically, so it must not be reachable by calling something twice.
 type sealedConn struct {
 	net.Conn
-	stream *relay.SealedStream
+	stream          *relay.SealedStream
+	resume          bool // immutable before publication
+	inputAck        atomic.Uint64
+	ackWake         chan struct{}
+	outputQueued    uint64 // session mu protects output cursors
+	outputConfirmed uint64
 
 	// send carries encoded (not yet sealed) frames to the writer goroutine.
 	// Frames are immutable once encoded, so one buffer is safely shared by
@@ -318,11 +333,17 @@ type sealedConn struct {
 }
 
 func newSealedConn(conn net.Conn, stream *relay.SealedStream) *sealedConn {
+	return newSealedConnMode(conn, stream, false)
+}
+
+func newSealedConnMode(conn net.Conn, stream *relay.SealedStream, resume bool) *sealedConn {
 	c := &sealedConn{
-		Conn:   conn,
-		stream: stream,
-		send:   make(chan []byte, terminalSendQueue),
-		dead:   make(chan struct{}),
+		Conn:    conn,
+		stream:  stream,
+		resume:  resume,
+		ackWake: make(chan struct{}, 1),
+		send:    make(chan []byte, terminalSendQueue),
+		dead:    make(chan struct{}),
 	}
 	go c.writeLoop()
 	return c
@@ -353,20 +374,65 @@ func (c *sealedConn) enqueue(frame []byte) bool {
 // per-write deadline is still terminalWriteTO, but it now bounds only this
 // goroutine: a socket that stalls costs its own connection and nothing else.
 func (c *sealedConn) writeLoop() {
+	// A resumed connection's first queued frame is its ready/gap response.
+	// Never allow asynchronous PTY progress to overtake that handshake.
+	if c.resume {
+		select {
+		case <-c.dead:
+			return
+		case frame := <-c.send:
+			c.queued.Add(-int64(len(frame)))
+			if !c.writeEncoded(frame) {
+				return
+			}
+			if decoded, err := relay.DecodeResumeFrame(frame); err != nil || decoded.Gap != nil {
+				c.kill()
+				return
+			}
+		}
+	}
 	for {
 		select {
 		case <-c.dead:
 			return
 		case frame := <-c.send:
 			c.queued.Add(-int64(len(frame)))
-			_ = c.SetWriteDeadline(time.Now().Add(terminalWriteTO))
-			err := c.stream.WriteFrame(frame)
-			_ = c.SetWriteDeadline(time.Time{})
-			if err != nil {
-				c.kill()
+			if !c.writeEncoded(frame) {
+				return
+			}
+		case <-c.ackWake:
+			if !c.writeEncoded(relay.EncodeInputAck(c.inputAck.Load())) {
 				return
 			}
 		}
+	}
+}
+
+func (c *sealedConn) writeEncoded(frame []byte) bool {
+	_ = c.SetWriteDeadline(time.Now().Add(terminalWriteTO))
+	err := c.stream.WriteFrame(frame)
+	_ = c.SetWriteDeadline(time.Time{})
+	if err != nil {
+		c.kill()
+		return false
+	}
+	return true
+}
+
+// Coalesced independently of the output queue: an ACK cannot create an
+// unbounded backlog or block the PTY writer. Only writeLoop uses the send seal.
+func (c *sealedConn) acknowledgeInput(written uint64) {
+	if !c.resume {
+		return
+	}
+	for previous := c.inputAck.Load(); written > previous; previous = c.inputAck.Load() {
+		if c.inputAck.CompareAndSwap(previous, written) {
+			break
+		}
+	}
+	select {
+	case c.ackWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -622,7 +688,7 @@ func (c *localTerminalConn) kill() {
 }
 
 func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.StreamHeader, actionDeadline time.Time) {
-	if h.ProtocolVersion != relay.StreamFenceVersionV4 && h.SessionID == "" {
+	if h.ProtocolVersion != relay.StreamFenceVersionV4 && h.ProtocolVersion != relay.StreamFenceVersionV5 && h.SessionID == "" {
 		d.logf("terminal refused: missing session id")
 		return
 	}
@@ -679,11 +745,29 @@ func (d *system) handleTerminal(stream net.Conn, br *bufio.Reader, h relay.Strea
 		d.logf("terminal refused: %v", err)
 		return
 	}
+	var resumeHello *relay.ResumeHello
+	if h.ProtocolVersion == relay.StreamFenceVersionV5 {
+		frame, err := sealed.ReadResumeFrame()
+		if err != nil || frame.Hello == nil {
+			return
+		}
+		resumeHello = frame.Hello
+	}
 	_ = stream.SetDeadline(time.Time{})
 
-	s, err := d.terminal(h, actionDeadline)
+	s, err := d.terminalMode(h, actionDeadline, resumeHello != nil && !resumeHello.Initial)
 	if err != nil {
+		if resumeHello != nil && errors.Is(err, errTerminalWriterUnknown) {
+			// No PTY exists to attach to. Explicitly fail without creating one.
+			frame, _ := relay.EncodeReplayGap(relay.ReplayGap{Reason: relay.ReplayWriterUnknown})
+			_ = stream.SetWriteDeadline(time.Now().Add(terminalWriteTO))
+			_ = sealed.WriteFrame(frame)
+		}
 		d.logf("terminal session: %v", err)
+		return
+	}
+	if resumeHello != nil {
+		s.attachResume(newSealedConnMode(stream, sealed, true), *resumeHello)
 		return
 	}
 	s.attach(newSealedConn(stream, sealed))
@@ -694,8 +778,12 @@ type terminalAdmissionRetryError struct{ reason string }
 func (e *terminalAdmissionRetryError) Error() string { return e.reason }
 
 func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*terminalSession, error) {
+	return d.terminalMode(h, actionDeadline, false)
+}
+
+func (d *system) terminalMode(h relay.StreamHeader, actionDeadline time.Time, requireExisting bool) (*terminalSession, error) {
 	for {
-		s, err := d.terminalAttempt(h, actionDeadline)
+		s, err := d.terminalAttemptMode(h, actionDeadline, requireExisting)
 		var retry *terminalAdmissionRetryError
 		if !errors.As(err, &retry) {
 			return s, err
@@ -707,6 +795,10 @@ func (d *system) terminal(h relay.StreamHeader, actionDeadline time.Time) (*term
 }
 
 func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time) (*terminalSession, error) {
+	return d.terminalAttemptMode(h, actionDeadline, false)
+}
+
+func (d *system) terminalAttemptMode(h relay.StreamHeader, actionDeadline time.Time, requireExisting bool) (*terminalSession, error) {
 	if err := d.terminalLifecycleReady(); err != nil {
 		return nil, err
 	}
@@ -730,7 +822,7 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 		if fi, err := os.Stat(expanded); err == nil && fi.IsDir() {
 			cwd = expanded
 		} else {
-			if h.ProtocolVersion == relay.StreamFenceVersionV4 {
+			if h.ProtocolVersion == relay.StreamFenceVersionV4 || h.ProtocolVersion == relay.StreamFenceVersionV5 {
 				return nil, fmt.Errorf("v4 terminal cwd %q is not an existing directory", h.Cwd)
 			}
 			d.logf("terminal cwd %q unusable, using default", h.Cwd)
@@ -774,6 +866,9 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 	d.terminalMu.Lock()
 	existing := d.terminals[key]
 	d.terminalMu.Unlock()
+	if requireExisting && (existing == nil || existing.recordID != h.TerminalRecordID || existing.generation != h.TerminalGeneration) {
+		return nil, errTerminalWriterUnknown
+	}
 	remoteLifecycleAdmission := h.TerminalRecordID != "" && d.cfg.RelayURL != ""
 	if remoteLifecycleAdmission {
 		ctx, cancel := context.WithTimeout(d.lifecycleContext(), terminalLocalActionTO)
@@ -787,7 +882,7 @@ func (d *system) terminalAttempt(h relay.StreamHeader, actionDeadline time.Time)
 			if row.ID == h.TerminalRecordID {
 				found = true
 				identityMatches := row.State == relay.TerminalStateRunning && row.Generation == h.TerminalGeneration
-				if h.ProtocolVersion != relay.StreamFenceVersionV4 {
+				if h.ProtocolVersion != relay.StreamFenceVersionV4 && h.ProtocolVersion != relay.StreamFenceVersionV5 {
 					identityMatches = identityMatches && h.SessionID == row.ProjectID+":"+row.SessionID
 				}
 				if !identityMatches {
@@ -1499,6 +1594,16 @@ func (s *terminalSession) drainInput() {
 // writeInputQuantum is the sole PTY write path. It uses the permanently
 // nonblocking descriptor directly, then waits no longer than 25ms for POLLOUT.
 func (s *terminalSession) writeInputQuantum(in *terminalInput) (complete bool, err error) {
+	if in.resume != nil {
+		s.inputMu.Lock()
+		ordered := in.resumeOffset+uint64(in.off) == in.resume.input.written
+		s.inputMu.Unlock()
+		if !ordered {
+			// Partial writes return to the scheduler tail. A later frame from
+			// this writer must wait, while other writers/local input stay fair.
+			return false, nil
+		}
+	}
 	limit := min(len(in.p), in.off+terminalInputQuantum)
 	deadline := time.Now().Add(terminalInputPollWindow)
 	for in.off < limit {
@@ -1516,6 +1621,21 @@ func (s *terminalSession) writeInputQuantum(in *terminalInput) (complete bool, e
 		}
 		written, err := ptyWrite(s.ptmx, in.p[in.off:limit])
 		if written > 0 {
+			if in.resume != nil {
+				s.inputMu.Lock()
+				commitErr := in.resume.input.commit(in.resumeOffset+uint64(in.off), written)
+				if commitErr == nil {
+					for _, conn := range in.resume.connections {
+						if conn != nil {
+							conn.acknowledgeInput(in.resume.input.written)
+						}
+					}
+				}
+				s.inputMu.Unlock()
+				if commitErr != nil {
+					return true, commitErr
+				}
+			}
 			in.off += written
 			continue
 		}
@@ -1858,7 +1978,33 @@ func (s *terminalSession) catchUp() []byte {
 func (s *terminalSession) broadcast(frame []byte, resendOnResync bool) []terminalConn {
 	var dropped []terminalConn
 	var catchUp []byte
+	var sequenced []byte
 	for conn := range s.conns {
+		if resumed, ok := conn.(*sealedConn); ok && resumed.resume {
+			out := frame
+			decoded, err := relay.DecodeFrame(frame)
+			if err == nil && decoded.Data != nil {
+				if s.replay.positionLost || uint64(len(decoded.Data)) > s.replay.total {
+					err = errTerminalReplayGap
+				} else {
+					if sequenced == nil {
+						sequenced, err = relay.EncodeSequencedData(s.replay.total-uint64(len(decoded.Data)), decoded.Data)
+					}
+					out = sequenced
+				}
+			}
+			if err == nil && conn.enqueue(out) {
+				if decoded.Data != nil {
+					resumed.outputQueued = s.replay.total
+				}
+				continue
+			}
+			// Never apply legacy RIS/reset catch-up to an acknowledged renderer.
+			// Reconnection must validate its cursor against retained history.
+			dropped = append(dropped, conn)
+			delete(s.conns, conn)
+			continue
+		}
 		if conn.enqueue(frame) {
 			continue
 		}

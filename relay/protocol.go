@@ -82,7 +82,10 @@ const (
 	// identities. Project names, project ids, session labels, and port labels are
 	// not part of v4 routing or authorization.
 	StreamFenceVersionV4 = "4"
-	StreamFenceVersion   = StreamFenceVersionV4
+	// Version 5 adds acknowledged terminal resumption without redefining v4's
+	// direct resource identity.
+	StreamFenceVersionV5 = "5"
+	StreamFenceVersion   = StreamFenceVersionV5
 )
 
 // ParseStreamFenceVersionHeader validates the complete set of HTTP values for
@@ -100,7 +103,7 @@ func ParseStreamFenceVersionHeader(values []string) (string, error) {
 	}
 	version := values[0]
 	switch version {
-	case StreamFenceVersionV1, StreamFenceVersionV2, StreamFenceVersionV3, StreamFenceVersionV4:
+	case StreamFenceVersionV1, StreamFenceVersionV2, StreamFenceVersionV3, StreamFenceVersionV4, StreamFenceVersionV5:
 		return version, nil
 	default:
 		return "", fmt.Errorf("unsupported stream-fence version %q", version)
@@ -191,19 +194,29 @@ func ValidateV4StreamHeader(h StreamHeader, authenticatedSystemID string) error 
 	return nil
 }
 
+func ValidateDirectStreamHeader(h StreamHeader, authenticatedSystemID string) error {
+	if h.ProtocolVersion != StreamFenceVersionV4 && h.ProtocolVersion != StreamFenceVersionV5 {
+		return fmt.Errorf("stream has no direct resource identity")
+	}
+	// The resource constraints are identical. Version-specific sealed framing
+	// and key bindings remain separate and cannot be inferred from this helper.
+	h.ProtocolVersion = StreamFenceVersionV4
+	return ValidateV4StreamHeader(h, authenticatedSystemID)
+}
+
 // TerminalSessionBinding returns the identity bound into the terminal key
 // schedule. V0-v3 preserve their released SessionID behavior. V4 binds the
 // authenticated system resource, exact durable
 // generation, requested cwd, and the already-existing fence plus expiry.
 func TerminalSessionBinding(h StreamHeader) (string, error) {
-	if h.ProtocolVersion != StreamFenceVersionV4 {
+	if h.ProtocolVersion != StreamFenceVersionV4 && h.ProtocolVersion != StreamFenceVersionV5 {
 		return h.SessionID, nil
 	}
 	if h.SystemID == "" || h.TerminalRecordID == "" || h.TerminalGeneration <= 0 || h.Cwd == "" || h.ActionFence == "" || h.NotAfterMilli <= 0 {
 		return "", fmt.Errorf("incomplete v4 terminal binding")
 	}
-	return fmt.Sprintf("v4\x00%s\x00%s\x00%d\x00%s\x00%s\x00%d",
-		h.SystemID, h.TerminalRecordID, h.TerminalGeneration, h.Cwd, h.ActionFence, h.NotAfterMilli), nil
+	return fmt.Sprintf("v%s\x00%s\x00%s\x00%d\x00%s\x00%s\x00%d",
+		h.ProtocolVersion, h.SystemID, h.TerminalRecordID, h.TerminalGeneration, h.Cwd, h.ActionFence, h.NotAfterMilli), nil
 }
 
 // TerminalResourceIdentity is the stable identity used to decide whether a PTY
@@ -211,7 +224,7 @@ func TerminalSessionBinding(h StreamHeader) (string, error) {
 // TerminalSessionBinding and revalidated independently; they intentionally do
 // not make each authorized reattach look like a different durable terminal.
 func TerminalResourceIdentity(h StreamHeader) (string, error) {
-	if h.ProtocolVersion != StreamFenceVersionV4 {
+	if h.ProtocolVersion != StreamFenceVersionV4 && h.ProtocolVersion != StreamFenceVersionV5 {
 		return h.SessionID, nil
 	}
 	if h.SystemID == "" || h.TerminalRecordID == "" || h.TerminalGeneration <= 0 {
@@ -387,11 +400,11 @@ func ReadHeader(r io.Reader) (StreamHeader, *bufio.Reader, error) {
 	if err := json.Unmarshal(line, &envelope); err != nil {
 		return StreamHeader{}, br, fmt.Errorf("decode stream header: %w", err)
 	}
-	if envelope.ProtocolVersion != "" && envelope.ProtocolVersion != StreamFenceVersionV3 && envelope.ProtocolVersion != StreamFenceVersionV4 {
+	if envelope.ProtocolVersion != "" && envelope.ProtocolVersion != StreamFenceVersionV3 && envelope.ProtocolVersion != StreamFenceVersionV4 && envelope.ProtocolVersion != StreamFenceVersionV5 {
 		return StreamHeader{}, br, fmt.Errorf("unsupported stream protocol version %q", envelope.ProtocolVersion)
 	}
 	var h StreamHeader
-	if envelope.ProtocolVersion == StreamFenceVersionV4 {
+	if envelope.ProtocolVersion == StreamFenceVersionV4 || envelope.ProtocolVersion == StreamFenceVersionV5 {
 		dec := json.NewDecoder(bytes.NewReader(line))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&h); err != nil {

@@ -212,6 +212,35 @@ Protocol changes must be rolled out in this order:
 V0-v3 support may be retired only in a later coordinated change after the
 compatibility window; adding v4 does not itself change those versions' behavior.
 
+### V5 acknowledged terminal resumption
+
+The agent advertises v5 only to a backend that positively echoes that exact
+capability on the authenticated WebSocket upgrade. V5 terminal streams use
+acknowledged resumption; v0-v4 parsing and v4 direct resource identity remain
+available to compatible backends and clients. A successful resume proves only
+the retained cursor window described below, not universal network continuity.
+
+V5 retains v4's durable resource identity while using a distinct sealed connection
+binding. Output carries absolute offsets into a bounded 256 KiB replay window;
+an expired cursor receives an explicit gap, not a renderer reset. Input has
+separate accepted, PTY-written and client-confirmed cursors. ACKs describe actual
+PTY writes, not queue admission or shell-command completion. Whole-frame retries
+are deduplicated, including after partial writes, and cannot overtake earlier
+input from the same writer.
+
+Each PTY retains at most four writer identities. Replacement connections share a
+writer slot. Only disconnected writers whose accepted input is fully written and
+client-confirmed may be reclaimed; uncertain delivery is never silently evicted.
+Unknown resume identities and exhausted capacity fail explicitly without closing
+the PTY or its existing attachments. Connection send queues and ACK notifications
+remain bounded. A v5 output queue failure requires a cursor-checked reconnect;
+the legacy reset-and-replay path is never applied to a v5 renderer.
+
+Local tests cover sealed ready/ACK ordering, real PTY input and retry suppression,
+exact replay suffixes, and gap replies preserving old attachments. A replay gap
+is a failed handoff: the PTY and an old attachment are preserved where possible,
+and no silent renderer reset or uninterrupted-continuity claim is made.
+
 ## Development
 
 ```sh

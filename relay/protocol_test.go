@@ -73,12 +73,12 @@ func TestTunnelHeaderNamesArePinnedToTheirWireSpellings(t *testing.T) {
 	}
 }
 
-func TestCurrentAgentAdvertisesV4(t *testing.T) {
+func TestCurrentAgentAdvertisesV5(t *testing.T) {
 	if StreamFenceVersionLegacyV0 != "" {
 		t.Fatalf("legacy v0 sentinel = %q, want header absence", StreamFenceVersionLegacyV0)
 	}
-	if StreamFenceVersion != StreamFenceVersionV4 {
-		t.Fatalf("advertised stream-fence version = %q, want v4 %q", StreamFenceVersion, StreamFenceVersionV4)
+	if StreamFenceVersion != StreamFenceVersionV5 {
+		t.Fatalf("advertised stream-fence version = %q, want v5 %q", StreamFenceVersion, StreamFenceVersionV5)
 	}
 }
 
@@ -98,7 +98,8 @@ func TestParseStreamFenceVersionHeaderPreservesReleasedVersionsAndFailsClosed(t 
 		{"duplicate", []string{"4", "3"}, "", true},
 		{"comma joined", []string{"4, 3"}, "", true},
 		{"explicit zero", []string{"0"}, "", true},
-		{"unknown", []string{"5"}, "", true},
+		{"v5", []string{StreamFenceVersionV5}, StreamFenceVersionV5, false},
+		{"unknown", []string{"6"}, "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := ParseStreamFenceVersionHeader(tc.values)
@@ -183,7 +184,7 @@ func TestReadHeaderV4IsStrictWhileV3RemainsCompatible(t *testing.T) {
 	for name, wire := range map[string]string{
 		"unknown field":         `{"kind":"proxy","protocol_version":"4","system_id":"system-a","port":8080,"label":"display-only"}` + "\n",
 		"duplicate field":       `{"kind":"proxy","protocol_version":"4","system_id":"system-a","port":8080,"port":8081}` + "\n",
-		"unknown version":       `{"kind":"proxy","protocol_version":"5","system_id":"system-a","port":8080}` + "\n",
+		"unknown version":       `{"kind":"proxy","protocol_version":"6","system_id":"system-a","port":8080}` + "\n",
 		"duplicate negotiation": `{"kind":"proxy","protocol_version":"4","protocol_version":"3","system_id":"system-a","port":8080}` + "\n",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -289,6 +290,7 @@ func TestWireStringValuesArePinnedToTheirLiterals(t *testing.T) {
 		{"StreamFenceVersionV2", StreamFenceVersionV2, "2"},
 		{"StreamFenceVersionV3", StreamFenceVersionV3, "3"},
 		{"StreamFenceVersionV4", StreamFenceVersionV4, "4"},
+		{"StreamFenceVersionV5", StreamFenceVersionV5, "5"},
 		{"KindTerminal", string(KindTerminal), "terminal"},
 		{"KindProxy", string(KindProxy), "proxy"},
 		{"KindListPorts", string(KindListPorts), "listports"},
