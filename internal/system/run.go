@@ -63,6 +63,12 @@ import (
 // The version is passed in rather than declared here: it is stamped at release
 // time with -ldflags "-X main.version=...", and main is the one package name
 // that flag can name without knowing this directory's import path.
+// uiMainFn and runSystemFn are dispatch seams: ui_dispatch_test.go drives Main
+// through them so a command can never again exist in one switch and vanish in
+// the other.
+var uiMainFn = RunUI
+var runSystemFn = runSystem
+
 func Main(args []string, version string) {
 	switch {
 	case len(args) == 0:
@@ -75,6 +81,12 @@ func Main(args []string, version string) {
 	case len(args) == 1 && args[0] == "--protocol-version":
 		fmt.Println(relay.StreamFenceVersion)
 		return
+	case len(args) >= 1 && args[0] == "ui":
+		if err := uiMainFn(args[1:], version); err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(2)
+		}
+		return
 	case len(args) == 2 && args[0] == "--config" && args[1] != "":
 		configFileOverride = args[1]
 	case args[0] == "--config":
@@ -85,11 +97,10 @@ func Main(args []string, version string) {
 		usage()
 		os.Exit(2)
 	}
-	runSystem()
+	runSystemFn()
 }
 
-func usage() {
-	fmt.Fprint(os.Stderr, `ormos — personal remote-access system
+var usageText = `ormos — personal remote-access system
 
 usage:
   ormos                    run the system
@@ -97,6 +108,7 @@ usage:
   ormos --help             show this
   ormos --version          print the version
   ormos --protocol-version print the advertised tunnel protocol version
+  ormos ui [--bind IP] [--port N]  serve the local web UI (loopback default)
 
 Just run ormos. If this machine isn't registered yet (or its credentials were
 revoked by forgetting it in the UI), it shows a short pairing code — approve it
@@ -121,7 +133,10 @@ the one this machine holds for production.
 To sign this machine out, delete the saved config (or press L in the dashboard):
   rm ~/.config/ormos/config.json
 That does not delete the system from the account; use the app to forget it.
-`)
+`
+
+func usage() {
+	fmt.Fprint(os.Stderr, usageText)
 }
 
 func runSystem() {
