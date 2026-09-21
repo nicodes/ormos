@@ -1,6 +1,4 @@
-/ormos
-/dist/
-/.ormos-dev/
-.env
-.env.local
-.DS_Store
+# The web app's dependencies and local build state. internal/ui/dist is a
+# COMMITTED export (see internal/ui/embed.go), so these are anchored at /ui.
+/ui/node_modules/
+/ui/dist/
