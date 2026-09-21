@@ -224,3 +224,39 @@ go run . --protocol-version
 The repository is intentionally limited to the public agent and shared
 protocol. The hosted backend, application, and deployment configuration are not
 part of this repository.
+
+## `ormos ui` — the local web app
+
+`ormos ui`, run on this machine, serves a SolidJS + Tailwind app — the same
+screen the CLI is, in a browser. It is embedded in the binary as a static
+export (`ui/` is the source; `internal/ui/dist` is the committed export CI
+byte-verifies) and reads only this machine: status, the policy-allowed
+listening ports, the terminals this UI opened with their output tails, and
+the agent's own audit log.
+
+It never talks to the relay, and it has no account system: the listener is
+the boundary. It binds loopback by default:
+
+```
+ormos ui                          # http://127.0.0.1:8481
+ormos ui --bind 100.x.y.z         # this machine's tailnet address
+ormos ui --port 9000
+```
+
+Actions are a server-enforced allowlist — open and kill a terminal, and
+nothing else, whatever the page sends. Opened terminals are confined to the
+machine's policy roots (`allowedRoots` in `~/.config/ormos/policy.json`) and
+refused entirely when the policy sets `terminalsDisabled`. v1 is read-mostly:
+you can watch output, not type — interactive input over WebSocket is a later
+slice.
+
+### From a phone over Tailscale
+
+```
+ormos ui                  # loopback on the machine
+tailscale serve --bg 8481 # https://<machine>.<tail-net>.ts.net
+```
+
+Open the printed URL on the phone. Tailscale is the identity — only devices
+on your tailnet can reach it. `--bind 0.0.0.0` is accepted but prints exactly
+what it promises, and it is never the default.

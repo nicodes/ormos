@@ -50,6 +50,23 @@ jobs:
       - name: Setup
         uses: ./.github/actions/setup
 
+      # The web export is COMMITTED (internal/ui/embed.go says why: a bare
+      # `go install` must build on a machine with no Node). Rebuilding it from
+      # source and diffing is the drift check, not the build -- if this fails,
+      # the committed bytes stopped being what ui/ produces.
+      - name: The committed web export matches its source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ui
+          npm ci
+          npm run build
+          cd ..
+          if ! git diff --exit-code --stat internal/ui/dist; then
+            echo "::error::internal/ui/dist is not what ui/ produces. Run npm ci && npm run build inside ui/ and commit the result."
+            exit 1
+          fi
+
       # Built first: a compile error should fail before a test suite spends
       # minutes reaching the same conclusion more slowly. Same order as
       # release.yml, which is the point — one ordering, no exceptions to
