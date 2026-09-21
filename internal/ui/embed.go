@@ -1,3 +1,5 @@
+//go:build (linux && !android) || (darwin && !ios)
+
 // Package ui carries the local web app into the binary.
 //
 // dist/ is the static export of the tree at the repository root's ui/,
