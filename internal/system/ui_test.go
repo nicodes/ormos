@@ -291,7 +291,13 @@ func TestUIInjectionNeverReachesSpawn(t *testing.T) {
 	if got != http.StatusOK {
 		t.Fatalf("policy-rooted cwd refused: %d", got)
 	}
-	if !strings.Contains(fix.spawnLog.String(), "\x00"+sub) {
+	// The server logs the RESOLVED path; on darwin /var is a symlink to
+	// /private/var, so the assertion compares resolutions, not spellings.
+	resolvedSub, err := filepath.EvalSymlinks(sub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fix.spawnLog.String(), "\x00"+resolvedSub) {
 		t.Fatalf("spawn got an unresolved cwd: %q", fix.spawnLog.String())
 	}
 }
