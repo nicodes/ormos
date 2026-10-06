@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -210,5 +211,46 @@ func TestUIPreviewWebSocketUpgrade(t *testing.T) {
 	_, data, err := conn.Read(ctx)
 	if err != nil || string(data) != "hot reload" {
 		t.Fatalf("upgrade: %q %v", data, err)
+	}
+}
+
+func TestUIPreviewUnavailablePage(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	fix := newUIFixture(t, nil)
+	uiLoadPolicy = func() (policy, error) { return policy{AllowedPorts: []int{port}}, nil }
+	preview := httptest.NewServer(fix.srv.previewRoutes())
+	defer preview.Close()
+	req, _ := http.NewRequest(http.MethodGet, preview.URL+"/", nil)
+	req.AddCookie(&http.Cookie{Name: "ormos_preview_port", Value: strconv.Itoa(port)})
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status: %d", res.StatusCode)
+	}
+	if res.Header.Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Fatalf("content type: %q", res.Header.Get("Content-Type"))
+	}
+	if res.Header.Get("Cache-Control") != "no-store" {
+		t.Fatal("unavailable preview could be cached after the app starts")
+	}
+	for _, text := range []string{"<h1>No app listening</h1>", "Port " + strconv.Itoa(port), "refresh the preview."} {
+		if !strings.Contains(string(data), text) {
+			t.Fatalf("missing %q in unavailable page", text)
+		}
+	}
+	if strings.Contains(string(data), "connect: connection refused") {
+		t.Fatal("raw proxy error leaked into the page")
 	}
 }

@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 519a885c6b5146b785d4af923042c945b4376d32ae3feb3295071eda2bcd3625 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 75526d65f67f1bf839e5ee56906bc86769400eceb35490208a23c62656ac0bf2 -->
 
 # Ormos
 
@@ -43,4 +43,6 @@ In the terminal popup, the plus icon at the right of the tabs adds a command or 
 
 Saved command and prompt lists use plain rows without card outlines or a storage-caption row. Empty lists show a centered “No saved commands” or “No saved prompts.”
 
-Terminal content fills the pane below the shared header without an inset border or padding.
+Terminal content fills the pane below the shared header with a small 6-pixel inset and no frame border.
+
+When the selected port has no reachable app, the preview displays a dark, centered “No app listening” page with the port number and a short instruction to start the app and refresh. The response is not cached, so Refresh can pick up an app once it starts.
