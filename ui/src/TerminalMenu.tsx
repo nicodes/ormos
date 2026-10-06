@@ -1,10 +1,10 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
-import SavedCommands from "./SavedCommands";
+import SavedItems from "./SavedItems";
 
-export default function TerminalMenu(props: { enabled: boolean; focus: () => void; type: (data: string) => void }) {
+export default function TerminalMenu(props: { enabled: boolean; focus: () => void; type: (data: string) => void; paste: (data: string) => void }) {
   const [open, setOpen] = createSignal(false);
-  const [tab, setTab] = createSignal<"keyboard" | "saved">("keyboard");
+  const [tab, setTab] = createSignal<"keyboard" | "saved" | "prompts">("keyboard");
   const [position, setPosition] = createSignal({ top: "0px", right: "8px", "max-height": "280px" });
   let trigger!: HTMLButtonElement;
   let panel: HTMLDivElement | undefined;
@@ -47,7 +47,10 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
       <div ref={panel} id="terminal-controls" class="terminal-menu" role="dialog" aria-label="Terminal tools" style={position()}>
         <div class="terminal-menu-tabs" role="tablist" aria-label="Terminal tools tabs" onKeyDown={event => {
           if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
-            event.preventDefault(); setTab(event.key === "Home" ? "keyboard" : event.key === "End" ? "saved" : tab() === "keyboard" ? "saved" : "keyboard");
+            event.preventDefault();
+            const tabs = ["keyboard", "saved", "prompts"] as const;
+            const index = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (tabs.indexOf(tab()) + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+            setTab(tabs[index]);
             panel?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus();
           }
         }}>
@@ -57,13 +60,19 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
           <button id="saved-command-tab" role="tab" aria-label="Saved commands" title="Saved commands" aria-controls="saved-command-panel" aria-selected={tab() === "saved"} tabindex={tab() === "saved" ? 0 : -1} onClick={() => setTab("saved")}>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4V3Z" /></svg>
           </button>
+          <button id="saved-prompt-tab" role="tab" aria-label="Saved prompts" title="Saved prompts" aria-controls="saved-prompt-panel" aria-selected={tab() === "prompts"} tabindex={tab() === "prompts" ? 0 : -1} onClick={() => setTab("prompts")}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H7l-4 3V7a4 4 0 0 1 4-4h6a8 8 0 0 1 8 8ZM7 8h10M7 12h7" /></svg>
+          </button>
         </div>
         <div id="shortcut-panel" class="shortcut-controls" role="tabpanel" aria-labelledby="shortcut-tab" hidden={tab() !== "keyboard"}>
           <button disabled={!props.enabled} onClick={() => { setOpen(false); props.focus(); }}>Keyboard</button>
           <div class="terminal-menu-keys"><For each={keys}>{key => <button disabled={!props.enabled} aria-label={key.name ?? key.label} onPointerDown={e => e.preventDefault()} onClick={() => props.type(key.data)}>{key.label}</button>}</For></div>
         </div>
         <div id="saved-command-panel" role="tabpanel" aria-labelledby="saved-command-tab" hidden={tab() !== "saved"}>
-          <SavedCommands enabled={props.enabled} run={command => { props.type(`${command}\r`); setOpen(false); }} />
+          <SavedItems kind="command" enabled={props.enabled} use={command => { props.type(`${command}\r`); setOpen(false); }} />
+        </div>
+        <div id="saved-prompt-panel" role="tabpanel" aria-labelledby="saved-prompt-tab" hidden={tab() !== "prompts"}>
+          <SavedItems kind="prompt" enabled={props.enabled} use={prompt => { props.paste(prompt); setOpen(false); props.focus(); }} />
         </div>
       </div>
     </Portal></Show>
