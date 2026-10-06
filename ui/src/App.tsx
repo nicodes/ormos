@@ -91,16 +91,16 @@ export default function App() {
           <PreviewPane origin={previewOrigin()} onError={setError} collapsed={previewCollapsed()} onToggle={togglePreview} />
         </section>
         <section class="pane terminal-pane" classList={{ collapsed: terminalCollapsed() }} aria-label="Terminal">
-          <div class="terminal-header">
-          <div class="tabbar" role="tablist" aria-label="Terminal tabs">
+          <div class="pane-header terminal-header">
             <PaneToggle name="terminal" collapsed={terminalCollapsed()} onToggle={toggleTerminal} controls="terminal-content" />
+          <div class="tabbar" role="tablist" aria-label="Terminal tabs">
             <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }}>
               <button role="tab" aria-selected={active() === tab.id} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
                 <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />{tab.label}
               </button>
-              <button class="tab-close" aria-label={`Close ${tab.label}`} onClick={() => void closeTerminal(tab.id)}>×</button>
+              <button class="header-icon tab-close" aria-label={`Close ${tab.label}`} onClick={() => void closeTerminal(tab.id)}>×</button>
             </div>}</For>
-            <button class="tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
+            <button class="header-icon tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
           </div>
           <TerminalMenu enabled={!!active()} focus={() => { if (terminalCollapsed()) toggleTerminal(); controls.get(active())?.focus(); }} type={data => controls.get(active())?.type(data)} />
           </div>
