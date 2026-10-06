@@ -5,6 +5,8 @@ import SavedItems from "./SavedItems";
 export default function TerminalMenu(props: { enabled: boolean; focus: () => void; type: (data: string) => void; paste: (data: string) => void }) {
   const [open, setOpen] = createSignal(false);
   const [tab, setTab] = createSignal<"keyboard" | "saved" | "prompts">("keyboard");
+  const [createCommand, setCreateCommand] = createSignal(0);
+  const [createPrompt, setCreatePrompt] = createSignal(0);
   const [position, setPosition] = createSignal({ top: "0px", right: "8px", "max-height": "280px" });
   let trigger!: HTMLButtonElement;
   let panel: HTMLDivElement | undefined;
@@ -45,7 +47,7 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
     </button>
     <Show when={open()}><Portal>
       <div ref={panel} id="terminal-controls" class="terminal-menu" role="dialog" aria-label="Terminal tools" style={position()}>
-        <div class="terminal-menu-tabs" role="tablist" aria-label="Terminal tools tabs" onKeyDown={event => {
+        <div class="terminal-menu-tabbar"><div class="terminal-menu-tabs" role="tablist" aria-label="Terminal tools tabs" onKeyDown={event => {
           if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
             event.preventDefault();
             const tabs = ["keyboard", "saved", "prompts"] as const;
@@ -64,15 +66,18 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H7l-4 3V7a4 4 0 0 1 4-4h6a8 8 0 0 1 8 8ZM7 8h10M7 12h7" /></svg>
           </button>
         </div>
+        <Show when={tab() !== "keyboard"}><button class="saved-item-add" type="button" aria-label={tab() === "saved" ? "Add command" : "Add prompt"} title={tab() === "saved" ? "Add command" : "Add prompt"} onClick={() => tab() === "saved" ? setCreateCommand(count => count + 1) : setCreatePrompt(count => count + 1)}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+        </button></Show></div>
         <div id="shortcut-panel" class="shortcut-controls" role="tabpanel" aria-labelledby="shortcut-tab" hidden={tab() !== "keyboard"}>
           <button disabled={!props.enabled} onClick={() => { setOpen(false); props.focus(); }}>Keyboard</button>
           <div class="terminal-menu-keys"><For each={keys}>{key => <button disabled={!props.enabled} aria-label={key.name ?? key.label} onPointerDown={e => e.preventDefault()} onClick={() => props.type(key.data)}>{key.label}</button>}</For></div>
         </div>
         <div id="saved-command-panel" role="tabpanel" aria-labelledby="saved-command-tab" hidden={tab() !== "saved"}>
-          <SavedItems kind="command" enabled={props.enabled} use={command => { props.type(`${command}\r`); setOpen(false); }} />
+          <SavedItems createRequest={createCommand()} kind="command" enabled={props.enabled} use={command => { props.type(`${command}\r`); setOpen(false); }} />
         </div>
         <div id="saved-prompt-panel" role="tabpanel" aria-labelledby="saved-prompt-tab" hidden={tab() !== "prompts"}>
-          <SavedItems kind="prompt" enabled={props.enabled} use={prompt => { props.paste(prompt); setOpen(false); props.focus(); }} />
+          <SavedItems createRequest={createPrompt()} kind="prompt" enabled={props.enabled} use={prompt => { props.paste(prompt); setOpen(false); props.focus(); }} />
         </div>
       </div>
     </Portal></Show>
