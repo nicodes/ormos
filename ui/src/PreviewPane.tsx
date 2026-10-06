@@ -112,6 +112,9 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
         <button type="button" aria-label="Forward" title="Forward" disabled={current().index >= current().history.length - 1} onClick={() => move(1)}>›</button>
         <button type="button" aria-label="Refresh preview" title="Refresh" disabled={!target()} onClick={() => setNavigation(n => n + 1)}>↻</button>
         <input aria-label="Preview address" placeholder="Port or localhost URL" enterkeyhint="go" autocomplete="off" autocapitalize="none" spellcheck={false} value={address()} onInput={e => setAddress(e.currentTarget.value)} />
+        <a class="preview-open" role="button" aria-label="Open preview in new tab" title="Open in new tab" aria-disabled={!target() || !props.origin} tabindex={target() && props.origin ? 0 : -1} href={target() && props.origin ? `${props.origin.replace(/\/$/, "")}/__ormos_preview/${target()!.port}/?path=${encodeURIComponent(target()!.path)}` : undefined} target="_blank" rel="noopener noreferrer">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3h7v7m0-7L10 14M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5" /></svg>
+        </a>
       </form>
       <div id="preview-content" class="pane-content" hidden={props.collapsed}>
       <Show when={source()} fallback={<div class="empty"><div class="preview-symbol">↗</div><h1>Your app, right here.</h1><p>Enter a local port or URL above.</p></div>}>
