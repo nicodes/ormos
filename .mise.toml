@@ -1,5 +1,5 @@
 [tools]
-# Must be >= the `go` directive in go.mod, which is currently 1.25.13.
+# Must be >= the `go` directive in go.mod.
 #
 # CI used to read the version straight out of go.mod via setup-go, so there was
 # only ever one place for it to live. Moving to mise makes the toolchain
@@ -17,3 +17,4 @@ go = "1.27.0"
 # actually calls, so a green run means no reachable CVE, not merely that go.sum
 # is current. Pinned like the toolchain so the check is reproducible.
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
+shellcheck = "0.11.0"
