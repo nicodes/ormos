@@ -111,6 +111,7 @@ type uiServer struct {
 	hosts        []string
 	previewURL   string
 	defaultCwd   string
+	controlPort  int
 	blockedPorts []int
 }
 
@@ -120,7 +121,7 @@ func RunUI(args []string, version string) error {
 	port := fsflags.Int("port", uiDefaultPort, "port to listen on")
 	previewPort := fsflags.Int("preview-port", 8482, "loopback port for isolated app previews")
 	previewURL := fsflags.String("preview-url", "", "public preview origin, e.g. https://box.tailnet.ts.net:8482")
-	cwd := fsflags.String("cwd", "", "initial working directory for the terminal")
+	cwd := fsflags.String("cwd", "", "initial working directory for terminals (default home)")
 	hosts := fsflags.String("hosts", "", "comma-separated allowed proxy host:port names")
 	if err := fsflags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
@@ -146,7 +147,7 @@ func RunUI(args []string, version string) error {
 		}
 	}
 	if *cwd == "" {
-		*cwd, _ = os.Getwd()
+		*cwd, _ = os.UserHomeDir()
 	}
 	if _, err := validateUICwd(*cwd, false, nil); err != nil {
 		return err
@@ -175,7 +176,7 @@ func RunUI(args []string, version string) error {
 	}
 	local := &uiServer{version: version, static: static, hostname: host,
 		terms: map[string]*uiTerminal{}, hosts: strings.Split(*hosts, ","),
-		previewURL: previewOrigin, defaultCwd: *cwd, blockedPorts: []int{*port, *previewPort}}
+		previewURL: previewOrigin, defaultCwd: *cwd, controlPort: *port, blockedPorts: []int{*port, *previewPort}}
 	defer local.closeTerminals()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -423,6 +424,9 @@ func (s *uiServer) apiActionOpen(w http.ResponseWriter, body uiActionBody) {
 		return
 	}
 	cwd := body.Cwd
+	if cwd == "" {
+		cwd = s.defaultCwd
+	}
 	if cwd == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			cwd = home

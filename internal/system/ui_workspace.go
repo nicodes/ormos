@@ -200,6 +200,17 @@ func (s *uiServer) previewRoutes() http.Handler {
 			http.Error(w, "host not allowed", http.StatusMisdirectedRequest)
 			return
 		}
+		if r.URL.Path == "/__ormos_bridge.js" {
+			if r.Method != http.MethodGet {
+				http.Error(w, "GET only", http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Write(s.previewBridge())
+			return
+		}
 		port := 0
 		selecting := strings.HasPrefix(r.URL.Path, "/__ormos_preview/")
 		if selecting {
@@ -228,8 +239,14 @@ func (s *uiServer) previewRoutes() http.Handler {
 				http.Error(w, "GET only", http.StatusMethodNotAllowed)
 				return
 			}
+			w.Header().Set("Cache-Control", "no-store")
 			http.SetCookie(w, &http.Cookie{Name: "ormos_preview_port", Value: strconv.Itoa(port), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
-			http.Redirect(w, r, "/", http.StatusFound)
+			path, err := localPreviewPath(r.URL.Query().Get("path"))
+			if err != nil {
+				http.Error(w, "use a local preview path", http.StatusBadRequest)
+				return
+			}
+			http.Redirect(w, r, path, http.StatusFound)
 			return
 		}
 		target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
@@ -238,6 +255,7 @@ func (s *uiServer) previewRoutes() http.Handler {
 		proxy.Director = func(req *http.Request) {
 			director(req)
 			req.Host = target.Host
+			req.Header.Set("Accept-Encoding", "identity")
 			// Ormos's selector belongs to the proxy, never to the app.
 			cookies := req.Cookies()
 			req.Header.Del("Cookie")
@@ -256,7 +274,7 @@ func (s *uiServer) previewRoutes() http.Handler {
 					res.Header.Set("Location", u.String())
 				}
 			}
-			return nil
+			return injectPreviewBridge(res)
 		}
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 			http.Error(w, "No app listening on this port. Start your app in the terminal, then reload the preview.", http.StatusBadGateway)

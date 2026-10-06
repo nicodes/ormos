@@ -114,7 +114,7 @@ usage:
 UI options:
   --port N                 terminal UI port (default 8481)
   --preview-port N         separate loopback app preview port (default 8482)
-  --cwd PATH               initial terminal directory (default launch directory)
+  --cwd PATH               initial terminal directory (default home)
   --hosts HOST:PORT,...     allowed proxy hostnames, including their ports
   --preview-url ORIGIN     externally reachable preview origin
   --bind IP                UI bind address (default 127.0.0.1)
