@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 0a6fc84bce362250c1960dddea50f1ecb56566ce15aa7fed57b714c4360845cd -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 519a885c6b5146b785d4af923042c945b4376d32ae3feb3295071eda2bcd3625 -->
 
 # Ormos
 
@@ -13,7 +13,7 @@ go install github.com/nicodes/ormos@latest
 ormos ui
 ```
 
-Bare `ormos` also starts the local UI. Open `http://127.0.0.1:8481`. A single shared header switches between a full-height terminal and local app preview. In terminal view, click the preview icon at the left to show your app; in preview view, click the terminal icon to return to your shells. Both keep running when hidden, and the selected view is remembered after a reload. A fresh workspace starts in terminal view.
+Bare `ormos` also starts the local UI. Open `http://127.0.0.1:8481`. A single shared header switches between a full-height terminal and local app preview. In terminal view, click the preview icon at the left to show your app; in preview view, click the terminal icon to return to your shells. Switching uses a short opacity fade in both directions, skipped when reduced motion is requested. Both keep running when hidden, and the selected view is remembered after a reload. A fresh workspace starts in terminal view.
 
 The terminal header has tabs and a **+** button. Each tab keeps an independent shell running. Only the selected tab shows its editable name and close button. Click its name to edit directly: Enter or leaving the field saves, Escape cancels, and an empty name keeps the previous name. Names are limited to 24 characters, display in full, and survive reloads without restarting shells. Selecting a tab does not change its width. Closing a tab ends only that shell. The right-hand hamburger has three icon tabs. The keyboard tab provides Keyboard, Esc, Tab, Ctrl C, Ctrl D and arrow-key controls. The bookmark tab lists saved commands with their titles and command text; Add command, edit and delete manage them. Click a saved command’s title or text to send it to the active terminal and execute it. The speech-bubble tab provides a separate saved-prompts list with the same create, edit and delete controls. Click a saved prompt’s title or text to paste it into the active terminal without pressing Enter. Both lists show borderless, transparent edit/delete icons beside the title and a single-line text preview with an ellipsis; editing reveals the full text. Commands and prompts are saved in this browser, not shared between devices. Escape or clicking outside dismisses the popup.
 

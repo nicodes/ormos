@@ -137,7 +137,7 @@ export default function App() {
           <section class="pane preview-pane" aria-label="App preview" aria-hidden={view() !== "preview"} inert={view() !== "preview"}>
             <Show when={headerMount()}>{mount => <PreviewPane origin={previewOrigin()} onError={setError} header={mount()} visible={view() === "preview"} />}</Show>
           </section>
-          <section class="pane terminal-pane" aria-label="Terminal" hidden={view() !== "terminal"}>
+          <section class="pane terminal-pane" aria-label="Terminal" aria-hidden={view() !== "terminal"} inert={view() !== "terminal"}>
           <div id="terminal-content" class="pane-content">
           <div class="terminal-stack">
             <For each={tabs().map(tab => tab.id)}>{id => <div class="terminal-session" hidden={active() !== id}>

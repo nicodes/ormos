@@ -16,7 +16,9 @@ input:focus, button:focus-visible { outline: 2px solid #9ca3af; outline-offset: 
 .workspace-body { position: relative; display: flex; flex: 1; min-height: 0; }
 .header-controls, .terminal-toolbar, .browserbar { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; }
 .preview-toolbar { display: contents; }
-.pane { position: absolute; inset: 0; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.pane { position: absolute; inset: 0; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; opacity: 1; transition: opacity 160ms ease; }
+.pane[aria-hidden="true"] { opacity: 0; pointer-events: none; }
+@media (prefers-reduced-motion: reduce) { .pane { transition: none; } }
 .terminal-pane { z-index: 1; background: #0b0f19; }
 .preview-pane { background: #0b0f19; }
 .pane-content { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
