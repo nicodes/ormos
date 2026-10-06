@@ -1,6 +1,8 @@
-import { createEffect, createSignal, on, onCleanup, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 
 import { Portal } from "solid-js/web";
+import BrowserMenu from "./BrowserMenu";
+import { request } from "./api";
 
 export type PreviewTarget = { port: number; path: string };
 type PreviewHistory = { history: PreviewTarget[]; index: number };
@@ -54,10 +56,57 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
     return { history: [], index: -1 };
   };
   const [current, setCurrent] = createSignal(loadHistory());
+  const uniqueRecent = (rows: PreviewTarget[]) => {
+    const seen = new Set<string>();
+    return rows.filter(item => { const key = addressFor(item); if (seen.has(key)) return false; seen.add(key); return true; }).slice(0, 50);
+  };
+  const loadRecent = () => {
+    try {
+      const saved = JSON.parse(localStorage.getItem("ormos.previewRecent") ?? "null");
+      if (Array.isArray(saved) && validHistory({ history: saved, index: -1 })) return uniqueRecent(saved);
+    } catch { /* seed recent visits from existing navigation history */ }
+    return uniqueRecent([...current().history].reverse());
+  };
+  const [recent, setRecent] = createSignal(loadRecent());
+  const remember = (item?: PreviewTarget) => {
+    if (!item) return;
+    setRecent(rows => uniqueRecent([item, ...rows]));
+    localStorage.setItem("ormos.previewRecent", JSON.stringify(recent()));
+  };
   const target = () => current().history[current().index];
   const [address, setAddress] = createSignal(addressFor(target()));
   const [navigation, setNavigation] = createSignal(0);
   let frame: HTMLIFrameElement | undefined;
+  let addressInput!: HTMLInputElement;
+  let historyPanel: HTMLDivElement | undefined;
+  const [addressFocused, setAddressFocused] = createSignal(false);
+  const [historyDismissed, setHistoryDismissed] = createSignal(false);
+  const [historyIndex, setHistoryIndex] = createSignal(-1);
+  const [activePorts, setActivePorts] = createSignal<Set<number> | null>(null);
+  const historyShown = () => props.visible && addressFocused() && !historyDismissed();
+  const filteredRecent = createMemo(() => {
+    const query = address().trim().toLowerCase();
+    return recent().filter(item => [addressFor(item), `http://localhost:${addressFor(item)}`, `http://127.0.0.1:${addressFor(item)}`, `http://${location.hostname}:${addressFor(item)}`].some(value => value.toLowerCase().includes(query)));
+  });
+  const [historyPosition, setHistoryPosition] = createSignal({ top: "0px", left: "0px", width: "200px", "max-height": "240px" });
+  const placeHistory = () => {
+    const rect = addressInput.getBoundingClientRect();
+    const height = window.visualViewport?.height ?? window.innerHeight;
+    setHistoryPosition({ top: `${rect.bottom + 4}px`, left: `${rect.left}px`, width: `${rect.width}px`, "max-height": `${Math.max(40, Math.min(240, height - rect.bottom - 12))}px` });
+  };
+  createEffect(on(historyShown, shown => {
+    if (!shown) return;
+    placeHistory(); setActivePorts(null);
+    let live = true;
+    const refreshPorts = async () => {
+      try {
+        const data = await request<{ ports: { port: number }[] }>("/api/ports");
+        if (live) setActivePorts(new Set(data.ports.map(row => row.port)));
+      } catch { if (live) setActivePorts(null); }
+    };
+    void refreshPorts(); const timer = window.setInterval(() => void refreshPorts(), 3000);
+    onCleanup(() => { live = false; window.clearInterval(timer); });
+  }));
   const persist = () => {
     localStorage.setItem("ormos.previewHistory", JSON.stringify(current()));
     localStorage.removeItem("ormos.previewTabs");
@@ -65,6 +114,7 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
     localStorage.removeItem("ormos.previewPort");
   };
   const record = (next: PreviewTarget, replace = false) => {
+    remember(next);
     const previous = target();
     if (previous?.port === next.port && previous.path === next.path) { setAddress(addressFor(next)); return; }
     setCurrent(row => {
@@ -78,13 +128,23 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
   const navigate = () => {
     try {
       const next = parsePreviewAddress(address(), target()?.port);
-      props.onError(""); record(next); setNavigation(n => n + 1);
+      props.onError(""); record(next); setNavigation(n => n + 1); setHistoryDismissed(true);
     } catch (e) { props.onError(String(e)); }
   };
   const move = (offset: number) => {
     const tab = current(); const index = tab.index + offset;
     if (index < 0 || index >= tab.history.length) return;
-    setCurrent(row => ({ ...row, index })); persist(); setAddress(addressFor(target())); setNavigation(n => n + 1);
+    setCurrent(row => ({ ...row, index })); remember(target()); persist(); setAddress(addressFor(target())); setNavigation(n => n + 1);
+  };
+  const visitRecent = (item: PreviewTarget) => { setAddress(addressFor(item)); navigate(); setHistoryDismissed(true); addressInput.blur(); };
+  const historyKey = (event: KeyboardEvent) => {
+    if (!historyShown()) return;
+    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setHistoryDismissed(true); }
+    else if (["ArrowDown", "ArrowUp"].includes(event.key) && filteredRecent().length) {
+      event.preventDefault();
+      setHistoryIndex(index => (index + (event.key === "ArrowDown" ? 1 : index < 0 ? 0 : -1) + filteredRecent().length) % filteredRecent().length);
+      historyPanel?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
+    } else if (event.key === "Enter" && historyIndex() >= 0) { event.preventDefault(); visitRecent(filteredRecent()[historyIndex()]); }
   };
   const [source, setSource] = createSignal("");
   createEffect(on(() => [navigation(), props.origin], () => {
@@ -101,22 +161,27 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
       const item = target(); if (!item) return;
       try { record(parsePreviewAddress(event.data.path, item.port), event.data.replace === true); } catch { /* never accept a foreign target */ }
     };
-    window.addEventListener("message", receive);
-    onCleanup(() => window.removeEventListener("message", receive));
+    const resize = () => { if (historyShown()) placeHistory(); };
+    window.addEventListener("message", receive); window.addEventListener("resize", resize); window.visualViewport?.addEventListener("resize", resize);
+    onCleanup(() => { window.removeEventListener("message", receive); window.removeEventListener("resize", resize); window.visualViewport?.removeEventListener("resize", resize); });
   });
   return (
     <>
       <Portal mount={props.header} ref={element => { element.className = "preview-toolbar"; }}>
       <form class="browserbar" hidden={!props.visible} onSubmit={e => { e.preventDefault(); navigate(); }}>
-        <button class="header-icon" type="button" aria-label="Back" title="Back" disabled={current().index <= 0} onClick={() => move(-1)}>‹</button>
-        <button class="header-icon" type="button" aria-label="Forward" title="Forward" disabled={current().index >= current().history.length - 1} onClick={() => move(1)}>›</button>
-        <button class="header-icon" type="button" aria-label="Refresh preview" title="Refresh" disabled={!target()} onClick={() => setNavigation(n => n + 1)}>↻</button>
-        <input aria-label="Preview address" placeholder="Port or localhost URL" enterkeyhint="go" autocomplete="off" autocapitalize="none" spellcheck={false} value={address()} onInput={e => setAddress(e.currentTarget.value)} />
-        <a class="header-icon preview-open" role="button" aria-label="Open preview in new tab" title="Open in new tab" aria-disabled={!target() || !props.origin} tabindex={target() && props.origin ? 0 : -1} href={target() && props.origin ? `${props.origin.replace(/\/$/, "")}/__ormos_preview/${target()!.port}/?path=${encodeURIComponent(target()!.path)}` : undefined} target="_blank" rel="noopener noreferrer">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3h7v7m0-7L10 14M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5" /></svg>
-        </a>
+        <input ref={addressInput} role="combobox" aria-expanded={historyShown()} aria-controls="preview-history-list" aria-activedescendant={historyShown() && historyIndex() >= 0 ? `preview-history-${historyIndex()}` : undefined} aria-autocomplete="none" aria-label="Preview address" placeholder="Port or localhost URL" enterkeyhint="go" autocomplete="off" autocapitalize="none" spellcheck={false} value={address()} onFocus={() => { setHistoryDismissed(false); setHistoryIndex(-1); setAddressFocused(true); }} onBlur={() => setAddressFocused(false)} onKeyDown={historyKey} onInput={e => { setAddress(e.currentTarget.value); setHistoryDismissed(false); setHistoryIndex(-1); }} />
+        <BrowserMenu visible={props.visible} canGoBack={current().index > 0} canGoForward={current().index < current().history.length - 1} canRefresh={!!target()} back={() => move(-1)} forward={() => move(1)} refresh={() => { remember(target()); setNavigation(n => n + 1); }} openURL={target() && props.origin ? `${props.origin.replace(/\/$/, "")}/__ormos_preview/${target()!.port}/?path=${encodeURIComponent(target()!.path)}` : ""} />
       </form>
       </Portal>
+      <Show when={historyShown()}><Portal>
+        <div ref={historyPanel} class="preview-history" style={historyPosition()} onPointerDown={event => event.preventDefault()}>
+          <Show when={filteredRecent().length} fallback={<p>{address().trim() ? "No matching history" : "No browser history"}</p>}>
+            <div id="preview-history-list" role="listbox" aria-label="Recent previews"><For each={filteredRecent()}>{(item, index) => <button id={`preview-history-${index()}`} type="button" role="option" aria-selected={historyIndex() === index()} onClick={() => visitRecent(item)}>
+              <span class="status-dot" classList={{ online: activePorts()?.has(item.port) === true }} role="img" aria-label={activePorts() === null ? "Port status unavailable" : activePorts()!.has(item.port) ? "Port active" : "Port inactive"} title={activePorts() === null ? "Port status unavailable" : activePorts()!.has(item.port) ? "Port active" : "Port inactive"} /><span>{addressFor(item)}</span>
+            </button>}</For></div>
+          </Show>
+        </div>
+      </Portal></Show>
       <div id="preview-content" class="pane-content">
       <Show when={source()} fallback={<div class="empty"><div class="preview-symbol">↗</div><h1>Your app, right here.</h1><p>Enter a local port or URL above.</p></div>}>
         <Show keyed when={source()}>
