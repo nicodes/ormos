@@ -11,9 +11,10 @@ stage_dir=
 fail() { printf 'ormos: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'HELP'
-Usage: install.sh [--version vX.Y.Z] [--install-dir /absolute/path]
+Usage: install.sh [--version X.Y.Z|latest] [--install-dir /absolute/path]
 
 Defaults: latest published release, ~/.local/bin.
+-v is the short form of --version; a leading v on versions is optional.
 Run this command again to update. No services or Tailscale routes are started.
 HELP
 }
@@ -28,10 +29,10 @@ trap 'exit 143' TERM
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --version|--install-dir)
+        --version|-v|--install-dir)
             [ "$#" -ge 2 ] || fail "$1 needs a value."
             case "$1" in
-                --version) release=$2 ;;
+                --version|-v) release=$2 ;;
                 --install-dir) install_dir=$2 ;;
             esac
             shift 2
