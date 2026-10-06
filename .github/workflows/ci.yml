@@ -60,6 +60,7 @@ jobs:
           set -euo pipefail
           cd ui
           npm ci
+          npm run typecheck
           npm run build
           cd ..
           if ! git diff --exit-code --stat internal/ui/dist; then

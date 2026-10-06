@@ -70,8 +70,11 @@ var uiMainFn = RunUI
 var runSystemFn = runSystem
 
 func Main(args []string, version string) {
+	if len(args) == 0 {
+		args = []string{"ui"}
+	}
 	switch {
-	case len(args) == 0:
+	case len(args) == 1 && args[0] == "relay":
 	case len(args) == 1 && args[0] == "--help":
 		usage()
 		return
@@ -100,39 +103,30 @@ func Main(args []string, version string) {
 	runSystemFn()
 }
 
-var usageText = `ormos — personal remote-access system
+var usageText = `ormos — a local terminal and app preview
 
 usage:
-  ormos                    run the system
-  ormos --config PATH      run with a different config file
+  ormos                    serve the local web UI
+  ormos ui [options]       serve the local web UI with explicit options
   ormos --help             show this
   ormos --version          print the version
-  ormos --protocol-version print the advertised tunnel protocol version
-  ormos ui [--bind IP] [--port N]  serve the local web UI (loopback default)
 
-Just run ormos. If this machine isn't registered yet (or its credentials were
-revoked by forgetting it in the UI), it shows a short pairing code — approve it
-in the web app and the system starts. The dashboard appears when stdout is a
-terminal; otherwise it runs headless.
+UI options:
+  --port N                 terminal UI port (default 8481)
+  --preview-port N         separate loopback app preview port (default 8482)
+  --cwd PATH               initial terminal directory (default home)
+  --hosts HOST:PORT,...     allowed proxy hostnames, including their ports
+  --preview-url ORIGIN     externally reachable preview origin
+  --bind IP                UI bind address (default 127.0.0.1)
 
-environment:
-  ORMOS_API_URL    ws base URL of the ormos API (default wss://api.ormos.dev)
-  ORMOS_INSECURE=1 allow a cleartext (ws://) remote relay — otherwise fatal
-  SHELL            shell for spawned terminals (default /bin/bash)
+Serve the loopback listeners privately through Tailscale Serve for phone access.
+There is no application account or login. Trusted network access is required.
+Terminals end when Ormos stops; browser disconnects leave them running.
 
-Pairing never asks for a password in this terminal: the relay issues a
-short-lived code and a human approves it in the web app, so there is no flag
-and no environment variable for credentials — and nothing sensitive to leak
-through /proc, shell history, or child processes.
-
---config points at the login config file, default ~/.config/ormos/config.json.
-policy.json and sessions.log live beside it, so a second config keeps a machine's
-whole local state separate — which is how a dev pairing is kept from overwriting
-the one this machine holds for production.
-
-To sign this machine out, delete the saved config (or press L in the dashboard):
-  rm ~/.config/ormos/config.json
-That does not delete the system from the account; use the app to forget it.
+Legacy compatibility (deprecated hosted backend):
+  ormos relay              run the former relay-connected agent
+  ormos --config PATH      run that agent with a separate config file
+  ormos --protocol-version print its tunnel protocol version
 `
 
 func usage() {

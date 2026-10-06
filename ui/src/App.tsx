@@ -1,220 +1,153 @@
-import { createEffect, createSignal, For, onCleanup, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import TerminalPane, { type TerminalControls } from "./TerminalPane";
+import PreviewPane from "./PreviewPane";
+import TerminalMenu from "./TerminalMenu";
+import { APIError, request, type TerminalRow } from "./api";
 
-type SystemInfo = {
-  version: string;
-  hostname: string;
-  os: string;
-  arch: string;
-  shell: string;
-  configDir: string;
-  hasConfig: boolean;
-  hasPolicy: boolean;
-  allowedRoots: string[];
-  terminals: number;
-};
-type PortRow = { port: number; allowed: boolean };
-type TerminalRow = {
-  id: string;
-  shell: string;
-  cwd: string;
-  started: string;
-  alive: boolean;
-};
-type AuditEntry = { at: string; event: string; detail?: string; allowed: boolean };
-
-async function getJSON<T>(path: string): Promise<T> {
-  const res = await fetch(path);
-  if (!res.ok) throw new Error(`${path}: ${res.status}`);
-  return (await res.json()) as T;
-}
-
-function Card(props: { title: string; children: any }) {
-  return (
-    <section class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow">
-      <h2 class="mb-2 text-sm font-semibold uppercase tracking-wide text-zinc-400">
-        {props.title}
-      </h2>
-      {props.children}
-    </section>
-  );
+type TerminalTab = { id: string; label: string };
+function savedTerminals(): TerminalTab[] {
+  try {
+    const rows = JSON.parse(localStorage.getItem("ormos.terminalTabs") ?? "null");
+    if (Array.isArray(rows) && rows.every(row => typeof row.id === "string" && typeof row.label === "string")) return rows.map(row => ({ ...row, label: row.label.slice(0, 24) }));
+  } catch { /* start with a fresh terminal if stored state is invalid */ }
+  const old = localStorage.getItem("ormos.terminal");
+  return old ? [{ id: old, label: "Terminal 1" }] : [];
 }
 
 export default function App() {
-  const [system, setSystem] = createSignal<SystemInfo | null>(null);
-  const [ports, setPorts] = createSignal<PortRow[]>([]);
-  const [terminals, setTerminals] = createSignal<TerminalRow[]>([]);
-  const [audit, setAudit] = createSignal<AuditEntry[]>([]);
-  const [cwd, setCwd] = createSignal("");
+  const [tabs, setTabs] = createSignal<TerminalTab[]>([]);
+  const [active, setActive] = createSignal("");
+  const [editing, setEditing] = createSignal("");
+  const [draftName, setDraftName] = createSignal("");
+  const [statuses, setStatuses] = createSignal<Record<string, string>>({});
+  const [previewOrigin, setPreviewOrigin] = createSignal("");
   const [error, setError] = createSignal("");
-  const [busy, setBusy] = createSignal(false);
-  const [output, setOutput] = createSignal<Record<string, string>>({});
-
-  const refresh = async () => {
+  const [busy, setBusy] = createSignal(true);
+  const [view, setView] = createSignal<"terminal" | "preview">(localStorage.getItem("ormos.view") === "preview" ? "preview" : "terminal");
+  const [headerMount, setHeaderMount] = createSignal<HTMLDivElement>();
+  const switchView = () => {
+    saveName();
+    setView(previous => previous === "terminal" ? "preview" : "terminal");
+    localStorage.setItem("ormos.view", view());
+  };
+  const controls = new Map<string, TerminalControls>();
+  let nextNumber = 1;
+  let disposed = false;
+  const persist = () => {
+    localStorage.setItem("ormos.terminalTabs", JSON.stringify(tabs()));
+    localStorage.setItem("ormos.activeTerminal", active());
+  };
+  const rename = (tab: TerminalTab) => {
+    setDraftName(tab.label); setEditing(tab.id);
+  };
+  const saveName = () => {
+    const id = editing(); if (!id) return;
+    const label = draftName().trim().slice(0, 24); setEditing("");
+    if (label) setTabs(rows => rows.map(tab => tab.id === id ? { ...tab, label } : tab));
+    persist();
+  };
+  const select = (id: string) => { saveName(); setActive(id); persist(); };
+  const addTerminal = async () => {
+    if (busy()) return;
+    setBusy(true); setError("");
     try {
-      setError("");
-      setSystem(await getJSON<SystemInfo>("/api/system"));
-      setPorts((await getJSON<{ ports: PortRow[] }>("/api/ports")).ports ?? []);
-      setTerminals((await getJSON<{ terminals: TerminalRow[] }>("/api/terminals")).terminals ?? []);
+      // Omit cwd: the server opens new tabs in the user's home by default.
+      const row = await request<{ id: string }>("/api/action", { action: "open" });
+      if (disposed) return;
+      setTabs(rows => [...rows, { id: row.id, label: `Terminal ${nextNumber++}` }]); select(row.id);
+    } catch (e) { if (!disposed) setError(String(e)); }
+    finally { if (!disposed) setBusy(false); }
+  };
+  const closeTerminal = async (id: string) => {
+    saveName();
+    try {
+      await request("/api/action", { action: "kill", id });
     } catch (e) {
-      setError(String(e));
+      if (!(e instanceof APIError && e.status === 404)) { setError(String(e)); return; }
     }
+    if (disposed) return;
+    const rows = tabs(); const index = rows.findIndex(tab => tab.id === id);
+    setTabs(rows.filter(tab => tab.id !== id));
+    if (active() === id) setActive(tabs()[Math.max(0, index - 1)]?.id ?? "");
+    setStatuses(previous => { const next = { ...previous }; delete next[id]; return next; });
+    persist();
+    if (!tabs().length) await addTerminal();
   };
-
-  const refreshOutput = async (id: string) => {
-    try {
-      const o = await getJSON<{ output: string }>(`/api/terminal/${id}/output`);
-      setOutput((prev) => ({ ...prev, [id]: o.output }));
-    } catch {
-      /* stale session */
-    }
-  };
-
-  const action = async (body: Record<string, unknown>) => {
-    setBusy(true);
-    setError("");
-    try {
-      const res = await fetch("/api/action", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) {
-        const t = await res.json().catch(() => ({}));
-        throw new Error((t as any).error ?? `${res.status}`);
-      }
-      await refresh();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  createEffect(() => {
-    void refresh();
-    void getJSON<{ entries: AuditEntry[] }>("/api/audit")
-      .then((r) => setAudit(r.entries ?? []))
-      .catch(() => setAudit([]));
-    const tick = setInterval(() => {
-      void refresh();
-      for (const t of terminals()) void refreshOutput(t.id);
-    }, 5000);
-    onCleanup(() => clearInterval(tick));
+  const setStatus = (id: string, status: string) => setStatuses(previous => ({ ...previous, [id]: status }));
+  onMount(() => {
+    const viewport = window.visualViewport;
+    const updateHeight = () => document.documentElement.style.setProperty("--viewport-height", `${viewport?.height ?? window.innerHeight}px`);
+    viewport?.addEventListener("resize", updateHeight); updateHeight();
+    void (async () => {
+      try {
+        const [workspace, terminals] = await Promise.all([
+          request<{ previewURL: string }>("/api/workspace"), request<{ terminals: TerminalRow[] }>("/api/terminals"),
+        ]);
+        if (disposed) return;
+        setPreviewOrigin(workspace.previewURL);
+        const saved = savedTerminals();
+        nextNumber = Math.max(0, ...saved.map(tab => Number(/\d+$/.exec(tab.label)?.[0] ?? 0))) + 1;
+        const retained = saved.filter(tab => terminals.terminals.some(row => row.id === tab.id && row.alive));
+        setTabs(retained);
+        const previous = localStorage.getItem("ormos.activeTerminal");
+        setActive(retained.find(tab => tab.id === previous)?.id ?? retained[0]?.id ?? "");
+        setBusy(false);
+        if (!retained.length) await addTerminal(); else persist();
+      } catch (e) { if (!disposed) { setError(String(e)); setBusy(false); } }
+    })();
+    onCleanup(() => { disposed = true; viewport?.removeEventListener("resize", updateHeight); });
   });
-
   return (
-    <main class="mx-auto flex max-w-2xl flex-col gap-4 p-4 pb-16">
-      <header class="flex items-baseline justify-between">
-        <h1 class="text-xl font-bold">ormos ui</h1>
-        <Show when={system()}>
-          <span class="text-sm text-zinc-400">
-            {system()!.hostname} · v{system()!.version}
-          </span>
-        </Show>
-      </header>
-      <Show when={error()}>
-        <p class="rounded-lg border border-red-800 bg-red-950/60 p-3 text-sm text-red-300">
-          {error()}
-        </p>
-      </Show>
-
-      <Show when={system()}>
-        <Card title="This machine">
-          <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-            <dt class="text-zinc-500">os</dt>
-            <dd>{system()!.os}/{system()!.arch}</dd>
-            <dt class="text-zinc-500">shell</dt>
-            <dd class="font-mono">{system()!.shell}</dd>
-            <dt class="text-zinc-500">state dir</dt>
-            <dd class="truncate font-mono">{system()!.configDir}</dd>
-            <dt class="text-zinc-500">policy</dt>
-            <dd>{system()!.hasPolicy ? "active" : "none (agent defaults)"}</dd>
-          </dl>
-        </Card>
-      </Show>
-
-      <Card title="Listening ports">
-        <Show when={ports().length > 0} fallback={<p class="text-sm text-zinc-500">No policy-allowed listeners.</p>}>
-          <ul class="divide-y divide-zinc-800 text-sm font-mono">
-            <For each={ports()}>
-              {(p) => (
-                <li class="flex justify-between py-1.5">
-                  <span>:{p.port}</span>
-                  <span class={p.allowed ? "text-emerald-400" : "text-zinc-500"}>
-                    {p.allowed ? "exposable" : "blocked by policy"}
-                  </span>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
-      </Card>
-
-      <Card title="Terminals">
-        <div class="mb-3 flex gap-2">
-          <input
-            class="min-w-0 flex-1 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm"
-            placeholder="cwd (optional)"
-            value={cwd()}
-            onInput={(e) => setCwd(e.currentTarget.value)}
-          />
-          <button
-            class="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold disabled:opacity-40"
-            disabled={busy()}
-            onClick={() => void action({ action: "open", cwd: cwd() || undefined })}
-          >
-            Open
+    <main class="app">
+      <Show when={error()}><div class="error" role="alert">{error()}<button aria-label="Dismiss error" onClick={() => setError("")}>×</button></div></Show>
+      <div class="workspace">
+        <header class="pane-header" aria-label="Workspace controls">
+          <button class="header-icon" type="button" aria-label={view() === "terminal" ? "Show preview" : "Show terminal"} title={view() === "terminal" ? "Show preview" : "Show terminal"} aria-controls={view() === "terminal" ? "preview-content" : "terminal-content"} onClick={switchView}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3" y="4" width="18" height="16" rx="2" />
+              <Show when={view() === "terminal"} fallback={<path d="m7 8 4 4-4 4m6 0h4" />}><path d="M3 9h18M6 6.5h.01M9 6.5h.01" /></Show>
+            </svg>
           </button>
-        </div>
-        <Show when={terminals().length > 0} fallback={<p class="text-sm text-zinc-500">No terminals opened from this UI.</p>}>
-          <ul class="flex flex-col gap-3">
-            <For each={terminals()}>
-              {(t) => (
-                <li class="rounded-lg border border-zinc-800 bg-zinc-950 p-3">
-                  <div class="mb-1 flex items-center justify-between text-sm">
-                    <span class="font-mono">{t.shell} · {t.cwd}</span>
-                    <button
-                      class="rounded-md border border-red-800 px-2 py-1 text-xs text-red-300"
-                      disabled={!t.alive || busy()}
-                      onClick={() => void action({ action: "kill", id: t.id })}
-                    >
-                      kill
-                    </button>
-                  </div>
-                  <pre class="max-h-48 overflow-auto whitespace-pre-wrap font-mono text-xs text-zinc-300">
-                    {output()[t.id] ?? "…"}
-                  </pre>
-                  <div class="mt-1 text-xs text-zinc-500">
-                    {t.alive ? "alive" : "exited"} · {t.id}
-                  </div>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
-      </Card>
-
-      <Card title="Agent audit (sessions.log tail)">
-        <Show when={audit().length > 0} fallback={<p class="text-sm text-zinc-500">No audit entries yet.</p>}>
-          <ul class="max-h-64 space-y-1 overflow-auto font-mono text-xs">
-            <For each={audit()}>
-              {(a) => (
-                <li class="flex gap-2">
-                  <span class="shrink-0 text-zinc-500">{a.at.slice(11, 19)}</span>
-                  <span class={a.allowed ? "text-zinc-300" : "text-amber-400"}>
-                    {a.event}{a.detail ? ` — ${a.detail}` : ""}
+          <div class="header-controls">
+          <div class="terminal-toolbar" hidden={view() !== "terminal"}>
+          <Show when={view() === "terminal"}>
+          <div class="tabbar" role="tablist" aria-label="Terminal tabs">
+            <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }} role={active() === tab.id ? "tab" : undefined} aria-selected={active() === tab.id ? true : undefined}>
+              <Show when={active() === tab.id} fallback={<button class="tab-title" role="tab" aria-selected={false} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
+                <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />{tab.label}
+              </button>}>
+                <div class="tab-title">
+                  <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />
+                  <span class="tab-name-wrap"><span class="tab-name-size" aria-hidden="true">{editing() === tab.id ? draftName() || " " : tab.label}</span>
+                    <input class="tab-name" aria-label="Terminal tab name" maxlength={24} value={editing() === tab.id ? draftName() : tab.label} onFocus={() => rename(tab)} onInput={event => setDraftName(event.currentTarget.value)} onBlur={saveName} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); saveName(); controls.get(active())?.focus(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(""); controls.get(active())?.focus(); } }} />
                   </span>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
-      </Card>
-
-      <footer class="text-center text-xs text-zinc-600">
-        Loopback by default · no auth — reachability is the boundary · actions are
-        server-allowlisted
-      </footer>
+                </div>
+              </Show>
+              <button class="header-icon tab-close" classList={{ "inactive-close": active() !== tab.id }} aria-hidden={active() !== tab.id} tabindex={active() === tab.id ? 0 : -1} disabled={active() !== tab.id} aria-label={`Close ${tab.label}`} onClick={() => void closeTerminal(tab.id)}>×</button>
+            </div>}</For>
+            <button class="header-icon tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
+          </div>
+          <TerminalMenu enabled={!!active()} focus={() => controls.get(active())?.focus()} type={data => controls.get(active())?.type(data)} paste={data => controls.get(active())?.paste(data)} />
+          </Show>
+          </div>
+          <div class="preview-toolbar" ref={setHeaderMount} />
+          </div>
+        </header>
+        <div class="workspace-body">
+          <section class="pane preview-pane" aria-label="App preview" aria-hidden={view() !== "preview"} inert={view() !== "preview"}>
+            <Show when={headerMount()}>{mount => <PreviewPane origin={previewOrigin()} onError={setError} header={mount()} visible={view() === "preview"} />}</Show>
+          </section>
+          <section class="pane terminal-pane" aria-label="Terminal" aria-hidden={view() !== "terminal"} inert={view() !== "terminal"}>
+          <div id="terminal-content" class="pane-content">
+          <div class="terminal-stack">
+            <For each={tabs().map(tab => tab.id)}>{id => <div class="terminal-session" hidden={active() !== id}>
+              <TerminalPane id={id} onStatus={status => setStatus(id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
+            </div>}</For>
+          </div>
+          </div>
+          </section>
+        </div>
+      </div>
     </main>
   );
 }
