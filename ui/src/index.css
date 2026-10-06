@@ -88,3 +88,15 @@ button, .header-icon { -webkit-tap-highlight-color: transparent; }
 .saved-command-form textarea { width: 100%; min-height: 104px; padding: 8px; resize: vertical; border: 1px solid #374151; border-radius: 6px; background: #0b0f19; color: #f9fafb; font: 16px ui-monospace, monospace; }
 .saved-command-form textarea:focus { outline: 2px solid #9ca3af; outline-offset: -2px; }
 .saved-command-error { font-size: 12px; color: #fca5a5; }
+
+.browser-menu { width: 200px; display: flex; flex-direction: column; gap: 4px; }
+.browser-menu button, .browser-menu a { display: flex; align-items: center; gap: 10px; min-height: 36px; padding: 8px; border: 0; background: transparent; color: #d1d5db; font-size: 13px; text-decoration: none; }
+.browser-menu a[aria-disabled="true"] { opacity: .4; pointer-events: none; }
+.browser-menu a:focus-visible { outline: 2px solid #9ca3af; outline-offset: -2px; }
+@media (hover: hover) and (pointer: fine) { .browser-menu a:not([aria-disabled="true"]):hover { background: #374151; color: #fff; } }
+
+.preview-history { position: fixed; z-index: 10; padding: 4px; overflow-y: auto; border: 1px solid #374151; border-radius: 6px; background: #111827; box-shadow: 0 8px 24px #0008; }
+.preview-history button { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px; padding: 8px; border: 0; background: transparent; text-align: left; font-size: 13px; }
+.preview-history button > span:last-child { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.preview-history button[aria-selected="true"] { background: #1f2937; }
+.preview-history p { margin: 8px; color: #9ca3af; font-size: 12px; text-align: center; }
