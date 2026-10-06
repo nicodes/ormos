@@ -57,7 +57,7 @@ var (
 
 const (
 	uiDefaultBind = "127.0.0.1"
-	uiDefaultPort = 8481
+	uiDefaultPort = 4242
 	uiAuditLines  = 50
 	uiAuditBytes  = 256 << 10
 )
