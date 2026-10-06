@@ -1,5 +1,6 @@
-import { createEffect, createSignal, For, on, Show } from "solid-js";
+import { createEffect, createSignal, For, on, onCleanup, Show } from "solid-js";
 
+export type SavedEditor = { editing: boolean; canSave: boolean; save: () => void };
 type SavedItem = { id: string; title: string; text: string };
 const load = (storageKey: string, kind: "command" | "prompt"): SavedItem[] => {
   try {
@@ -9,7 +10,7 @@ const load = (storageKey: string, kind: "command" | "prompt"): SavedItem[] => {
   return [];
 };
 
-export default function SavedItems(props: { kind: "command" | "prompt"; createRequest: number; enabled: boolean; use: (text: string) => void }) {
+export default function SavedItems(props: { kind: "command" | "prompt"; createRequest: number; visible: boolean; registerEditor: (editor?: SavedEditor) => void; enabled: boolean; use: (text: string) => void }) {
   const kind = props.kind;
   const storageKey = kind === "command" ? "ormos.savedCommands" : "ormos.savedPrompts";
   const action = kind === "command" ? "Run" : "Paste";
@@ -24,6 +25,8 @@ export default function SavedItems(props: { kind: "command" | "prompt"; createRe
     titleInput?.focus();
   };
   createEffect(on(() => props.createRequest, () => edit(), { defer: true }));
+  createEffect(on(() => props.visible, visible => { if (!visible) { setEditing(null); setError(""); } }));
+  onCleanup(() => props.registerEditor());
   const persist = (rows: SavedItem[]) => {
     try { localStorage.setItem(storageKey, JSON.stringify(rows.map(row => ({ id: row.id, title: row.title, [kind]: row.text })))); setCommands(rows); setError(""); return true; }
     catch { setError(`Could not save ${kind}s in this browser.`); return false; }
@@ -34,6 +37,7 @@ export default function SavedItems(props: { kind: "command" | "prompt"; createRe
     const rows = id ? commands().map(previous => previous.id === id ? row : previous) : [...commands(), row];
     if (persist(rows)) setEditing(null);
   };
+  createEffect(() => props.registerEditor({ editing: editing() !== null, canSave: !!title().trim() && !!command().trim(), save }));
   return <div class="saved-commands">
     <Show when={error()}><p class="saved-command-error" role="alert">{error()}</p></Show>
     <Show when={editing() !== null} fallback={<>
@@ -50,7 +54,6 @@ export default function SavedItems(props: { kind: "command" | "prompt"; createRe
       <form class="saved-command-form" onSubmit={event => { event.preventDefault(); save(); }}>
         <label>Title<input ref={element => { titleInput = element; }} aria-label={kind === "command" ? "Command title" : "Prompt title"} maxlength={80} required value={title()} onInput={event => setTitle(event.currentTarget.value)} /></label>
         <label>{kind === "command" ? "Command" : "Prompt"}<textarea aria-label={`Saved ${kind}`} rows={4} maxlength={kind === "command" ? 8192 : 65536} required spellcheck={false} autocapitalize="none" autocomplete="off" value={command()} onInput={event => setCommand(event.currentTarget.value)} /></label>
-        <div class="saved-command-actions"><button type="submit" disabled={!title().trim() || !command().trim()}>{`Save ${kind}`}</button><button type="button" onClick={() => { setEditing(null); setError(""); }}>Cancel</button></div>
       </form>
     </Show>
   </div>;

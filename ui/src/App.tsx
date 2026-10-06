@@ -8,7 +8,7 @@ type TerminalTab = { id: string; label: string };
 function savedTerminals(): TerminalTab[] {
   try {
     const rows = JSON.parse(localStorage.getItem("ormos.terminalTabs") ?? "null");
-    if (Array.isArray(rows) && rows.every(row => typeof row.id === "string" && typeof row.label === "string")) return rows;
+    if (Array.isArray(rows) && rows.every(row => typeof row.id === "string" && typeof row.label === "string")) return rows.map(row => ({ ...row, label: row.label.slice(0, 24) }));
   } catch { /* start with a fresh terminal if stored state is invalid */ }
   const old = localStorage.getItem("ormos.terminal");
   return old ? [{ id: old, label: "Terminal 1" }] : [];
@@ -42,7 +42,7 @@ export default function App() {
   };
   const saveName = () => {
     const id = editing(); if (!id) return;
-    const label = draftName().trim(); setEditing("");
+    const label = draftName().trim().slice(0, 24); setEditing("");
     if (label) setTabs(rows => rows.map(tab => tab.id === id ? { ...tab, label } : tab));
     persist();
   };
@@ -113,15 +113,17 @@ export default function App() {
           <Show when={view() === "terminal"}>
           <div class="tabbar" role="tablist" aria-label="Terminal tabs">
             <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }} role={active() === tab.id ? "tab" : undefined} aria-selected={active() === tab.id ? true : undefined}>
-              <Show when={active() === tab.id} fallback={<button role="tab" aria-selected={false} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
+              <Show when={active() === tab.id} fallback={<button class="tab-title" role="tab" aria-selected={false} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
                 <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />{tab.label}
               </button>}>
-                <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />
-                <input class="tab-name" aria-label="Terminal tab name" maxlength={80} value={editing() === tab.id ? draftName() : tab.label} onFocus={() => rename(tab)} onInput={event => setDraftName(event.currentTarget.value)} onBlur={saveName} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); saveName(); controls.get(active())?.focus(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(""); controls.get(active())?.focus(); } }} />
+                <div class="tab-title">
+                  <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />
+                  <span class="tab-name-wrap"><span class="tab-name-size" aria-hidden="true">{editing() === tab.id ? draftName() || " " : tab.label}</span>
+                    <input class="tab-name" aria-label="Terminal tab name" maxlength={24} value={editing() === tab.id ? draftName() : tab.label} onFocus={() => rename(tab)} onInput={event => setDraftName(event.currentTarget.value)} onBlur={saveName} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); saveName(); controls.get(active())?.focus(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(""); controls.get(active())?.focus(); } }} />
+                  </span>
+                </div>
               </Show>
-              <Show when={active() === tab.id}>
-              <button class="header-icon tab-close" aria-label={`Close ${tab.label}`} onClick={() => void closeTerminal(tab.id)}>×</button>
-              </Show>
+              <button class="header-icon tab-close" classList={{ "inactive-close": active() !== tab.id }} aria-hidden={active() !== tab.id} tabindex={active() === tab.id ? 0 : -1} disabled={active() !== tab.id} aria-label={`Close ${tab.label}`} onClick={() => void closeTerminal(tab.id)}>×</button>
             </div>}</For>
             <button class="header-icon tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
           </div>
