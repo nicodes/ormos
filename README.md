@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: dbca524a90f3994d01a2eb21c13dc3cfbe5142978a919859fdd7f256d42f8515 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 0a6fc84bce362250c1960dddea50f1ecb56566ce15aa7fed57b714c4360845cd -->
 
 # Ormos
 
@@ -42,3 +42,5 @@ Terminals belong to the running Ormos process and end when it stops. The preview
 In the terminal popup, the plus icon at the right of the tabs adds a command or prompt to the selected list. While editing, it becomes a checkmark that saves the item; switching tabs or closing the popup discards unsaved changes. It is hidden on the keyboard tab.
 
 Saved command and prompt lists use plain rows without card outlines or a storage-caption row. Empty lists show a centered “No saved commands” or “No saved prompts.”
+
+Terminal content fills the pane below the shared header without an inset border or padding.
