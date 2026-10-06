@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 40568c9468355f0ac3f12faed30bd7588f2038afce4f080e93b3b008ec399149 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: ab70eebcb3305129f46311597aa0a26b0e8d184ca938ddd53af938dd6b689706 -->
 
 # Ormos
 
@@ -17,11 +17,11 @@ The installer detects your platform, checks the archive's SHA-256 digest and bin
 To pin a version or choose another writable directory:
 
 ```sh
-curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --version 0.2.0
+curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --version 0.2.1
 curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --install-dir "$HOME/bin"
 ```
 
-The short form is `-v 0.2.0`. Omitting a version uses `latest`; `--version latest` and `-v latest` also work. A leading `v` on a version is optional. Custom install directories must be on your PATH. The installer is also included in release assets starting with v0.2.0. The local UI described below requires v0.2.0 or later. You can also manually extract a platform archive from [Releases](https://github.com/nicodes/ormos/releases), or use Go matching `go.mod` and `.mise.toml`:
+The short form is `-v 0.2.1`. Omitting a version uses `latest`; `--version latest` and `-v latest` also work. A leading `v` on a version is optional. Custom install directories must be on your PATH. The installer is also included in release assets starting with v0.2.0. The local UI described below requires v0.2.0 or later. You can also manually extract a platform archive from [Releases](https://github.com/nicodes/ormos/releases), or use Go matching `go.mod` and `.mise.toml`:
 
 ```sh
 go install github.com/nicodes/ormos@latest
@@ -33,7 +33,7 @@ Start the UI:
 ormos ui
 ```
 
-Bare `ormos` also starts the local UI. Open the address printed at startup. Development builds default to `http://127.0.0.1:4242`; published v0.2.0 defaults to port 8481. Set a port explicitly with `ormos ui --port 4242` (or another port from 1 through 65535). A single shared header switches between a full-height terminal and local app preview. In terminal view, click the preview icon at the left to show your app; in preview view, click the terminal icon to return to your shells. Switching uses a short opacity fade in both directions, skipped when reduced motion is requested. Both keep running when hidden, and the selected view is remembered after a reload. A fresh workspace starts in terminal view.
+Bare `ormos` also starts the local UI. Open the address printed at startup. The default is `http://127.0.0.1:4242` in v0.2.1 and later; v0.2.0 defaults to port 8481. Set a port explicitly with `ormos ui --port 4242` (or another port from 1 through 65535). A single shared header switches between a full-height terminal and local app preview. In terminal view, click the preview icon at the left to show your app; in preview view, click the terminal icon to return to your shells. Switching uses a short opacity fade in both directions, skipped when reduced motion is requested. Both keep running when hidden, and the selected view is remembered after a reload. A fresh workspace starts in terminal view.
 
 The terminal header has tabs and a **+** button. Each tab keeps an independent shell running. Only the selected tab shows its editable name and close button. Click its name to edit directly: Enter or leaving the field saves, Escape cancels, and an empty name keeps the previous name. Names are limited to 24 characters, display in full, and survive reloads without restarting shells. Selecting a tab does not change its width. Closing a tab ends only that shell. The right-hand hamburger has three icon tabs. The keyboard tab provides Keyboard, Esc, Tab, Ctrl C, Ctrl D and arrow-key controls. The bookmark tab lists saved commands with their titles and command text; Add command, edit and delete manage them. Click a saved command’s title or text to send it to the active terminal and execute it. The speech-bubble tab provides a separate saved-prompts list with the same create, edit and delete controls. Click a saved prompt’s title or text to paste it into the active terminal without pressing Enter. Both lists show borderless, transparent edit/delete icons beside the title and a single-line text preview with an ellipsis; editing reveals the full text. Commands and prompts are saved in this browser, not shared between devices. Escape or clicking outside dismisses the popup.
 
