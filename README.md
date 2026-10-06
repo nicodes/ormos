@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: a8e681813639f3cfc3dd9a40aeb6bed3d4554eea8bc313bbd3f479a2a9e64bc6 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: ffbd236962a154bf8c9065da698ea8318a5a6f9dabc93f503157589cde364157 -->
 
 # Ormos
 
@@ -43,16 +43,19 @@ New terminals open automatically at `~`; use `--cwd /path/to/work` to change it.
 
 ## Private access through Tailscale
 
-Keep Ormos on loopback and expose its UI privately with Tailscale Serve. This is a one-time UI setup; app ports are handled automatically. The following example uses HTTP and a placeholder MagicDNS name:
+Development builds automatically expose `http://box/ormos/`, where `box` is this machine's Tailscale MagicDNS name. Start `ormos ui`; it prints the stable private address. The UI stays on loopback, preferring port 8481 and choosing a free port if that default is busy. An explicit `--port` is respected; `--port 0` chooses a free port. `--share=false` disables automatic UI sharing. Missing Tailscale, insufficient permissions or a conflicting port-80 route leave the local UI running and print a setup message. Automatic sharing requires the default IPv4 loopback bind.
+
+The stable-address feature is not included in the published v0.2.0 release yet. With v0.2.0, use the earlier manual UI setup:
 
 ```sh
 ormos ui --hosts box:8481
-
 # In another terminal; preserve any existing Serve routes.
 tailscale serve --bg --http=8481 http://127.0.0.1:8481
 ```
 
-Visit `http://box:8481` from a device on the same tailnet. Start your app normally in the terminal, then enter its port, such as `3000`, in Preview. If the app is already reachable, it opens directly. Otherwise Ormos checks that the app is listening on localhost and starts a temporary private Tailscale Serve route on that port, then retries. There is no per-app setup command. Network access rules must permit both ports. Tailscale encrypts the connection between devices. HTTPS setups need the full Tailscale DNS name and HTTPS exposure for both UI and apps.
+Visit `http://box:8481` for v0.2.0, or `http://box/ormos/` with the stable-address development build. Start your app normally in the terminal, then enter its port, such as `3000`, in Preview. If the app is already reachable, it opens directly. Otherwise Ormos checks that the app is listening on localhost and starts a temporary private Tailscale Serve route on that port, then retries. There is no per-app setup command. Network access rules must permit UI port 80 (or the manually configured UI port) and the app ports. Tailscale encrypts the connection between devices. HTTPS setups need the full Tailscale DNS name and HTTPS exposure for both UI and apps.
+
+The automatic UI route is owned by the running process and removed when it stops normally. An existing compatible route is reused without claiming ownership; other port-80 routes are preserved and reported as a conflict. Other apps cannot share that browser origin because they would gain access to terminal controls. Changing from the port-based URL to the stable URL creates a new browser storage origin; saved commands, prompts and tab names from the old URL stay there.
 
 There is no application login: anyone permitted to reach the UI can control its terminals as its operating-system user. Keep it private and limit network access to trusted users/devices. Ormos rejects foreign origins for terminal mutations and WebSocket upgrades, and unlisted UI hostnames. Terminal controls cannot be embedded in an iframe. Direct previews use a different port/origin from the UI and are sandboxed.
 

@@ -7,6 +7,7 @@ import tailwindcss from "@tailwindcss/vite";
 // that here; the gate failing means the committed bytes stopped being what
 // this source produces.
 export default defineConfig({
+  base: "./",
   plugins: [solid(), tailwindcss()],
   build: {
     // Into the package that embeds it: internal/ui's go:embed reads this

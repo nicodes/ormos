@@ -117,7 +117,8 @@ type uiServer struct {
 func RunUI(args []string, version string) error {
 	fsflags := flag.NewFlagSet("ui", flag.ContinueOnError)
 	bind := fsflags.String("bind", uiDefaultBind, "address to listen on (default loopback; set the tailnet interface address to reach it from your tailnet)")
-	port := fsflags.Int("port", uiDefaultPort, "port to listen on")
+	port := fsflags.Int("port", uiDefaultPort, "port to listen on (0 chooses a free port; a busy default falls back to a free port)")
+	share := fsflags.Bool("share", true, "automatically expose /ormos/ privately through Tailscale on HTTP port 80")
 	cwd := fsflags.String("cwd", "", "initial working directory for terminals (default home)")
 	hosts := fsflags.String("hosts", "", "comma-separated allowed UI host:port names")
 	if err := fsflags.Parse(args); err != nil {
@@ -132,8 +133,8 @@ func RunUI(args []string, version string) error {
 	if err := validateUIBind(*bind); err != nil {
 		return err
 	}
-	if *port < 1 || *port > 65535 {
-		return fmt.Errorf("--port must be 1-65535, got %d", *port)
+	if *port < 0 || *port > 65535 {
+		return fmt.Errorf("--port must be 0-65535, got %d", *port)
 	}
 	if *cwd == "" {
 		*cwd, _ = os.UserHomeDir()
@@ -149,19 +150,30 @@ func RunUI(args []string, version string) error {
 	if err != nil {
 		return err
 	}
-	ln, err := net.Listen("tcp", net.JoinHostPort(*bind, strconv.Itoa(*port)))
+	explicitPort := false
+	fsflags.Visit(func(f *flag.Flag) { explicitPort = explicitPort || f.Name == "port" })
+	ln, err := listenUI(*bind, *port, explicitPort)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
 	local := &uiServer{version: version, static: static, hostname: host,
 		terms: map[string]*uiTerminal{}, hosts: strings.Split(*hosts, ","),
-		defaultCwd: *cwd, controlPort: *port}
+		defaultCwd: *cwd, controlPort: ln.Addr().(*net.TCPAddr).Port}
 	defer local.closeTerminals()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	local.previewServe = newPreviewServe(ctx)
 	defer local.previewServe.close()
+	if *share {
+		address, session, err := shareUI(ctx, ln.Addr().(*net.TCPAddr), local)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ormos: private address unavailable: %v; local UI remains available\n", err)
+		} else {
+			defer stopServeSession(session)
+			fmt.Printf("ormos private UI on %s\n", address)
+		}
+	}
 	srv := &http.Server{Handler: local.routes(), ReadHeaderTimeout: 10 * time.Second}
 	defer srv.Close()
 	failed := make(chan error, 1)
@@ -213,7 +225,25 @@ func (s *uiServer) routes() http.Handler {
 		uiError(w, http.StatusNotFound, "no such read")
 	})
 	mux.HandleFunc("/", s.spa)
-	return s.guard(mux)
+	root := http.NewServeMux()
+	root.HandleFunc("/ormos", func(w http.ResponseWriter, r *http.Request) {
+		location := "/ormos/"
+		if r.URL.RawQuery != "" {
+			location += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, location, http.StatusPermanentRedirect)
+	})
+	root.Handle("/ormos/", http.StripPrefix("/ormos", mux))
+	root.Handle("/", mux)
+	return s.guard(root)
+}
+
+func listenUI(bind string, port int, explicit bool) (net.Listener, error) {
+	ln, err := net.Listen("tcp", net.JoinHostPort(bind, strconv.Itoa(port)))
+	if !explicit && port == uiDefaultPort && errors.Is(err, syscall.EADDRINUSE) {
+		return net.Listen("tcp", net.JoinHostPort(bind, "0"))
+	}
+	return ln, err
 }
 
 func uiJSON(w http.ResponseWriter, value any) {

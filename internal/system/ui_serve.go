@@ -42,7 +42,7 @@ type serveSession struct {
 type serveConfig struct {
 	TCP map[string]json.RawMessage
 	Web map[string]struct {
-		Handlers map[string]struct{ Proxy, Path, Text string }
+		Handlers map[string]struct{ Proxy, Path, Text, Redirect string }
 	}
 	AllowFunnel map[string]bool
 	Foreground  map[string]*serveConfig
@@ -71,10 +71,14 @@ func loopbackAppListening(ctx context.Context, port int) error {
 
 // Inspect all host-level sessions; service VIPs have their own port namespace.
 func (c *serveConfig) route(port int, scheme string) (exists, compatible bool) {
+	number := strconv.Itoa(port)
+	return c.routeTarget(number, scheme, "/", "http://127.0.0.1:"+number)
+}
+
+func (c *serveConfig) routeTarget(number, scheme, mount, target string) (exists, compatible bool) {
 	if c == nil {
 		return false, false
 	}
-	number := strconv.Itoa(port)
 	raw, hasTCP := c.TCP[number]
 	exists = hasTCP
 	var listener struct {
@@ -90,8 +94,11 @@ func (c *serveConfig) route(port int, scheme string) (exists, compatible bool) {
 			continue
 		}
 		exists = true
-		handler, ok := web.Handlers["/"]
-		if !ok || len(web.Handlers) != 1 || handler.Proxy != "http://127.0.0.1:"+number || handler.Path != "" || handler.Text != "" {
+		handler, ok := web.Handlers[mount]
+		if !ok && mount != "/" {
+			handler, ok = web.Handlers[mount+"/"]
+		}
+		if !ok || len(web.Handlers) != 1 || handler.Proxy != target || handler.Path != "" || handler.Text != "" || handler.Redirect != "" {
 			matching = false
 		}
 		roots++
@@ -106,7 +113,7 @@ func (c *serveConfig) route(port int, scheme string) (exists, compatible bool) {
 	}
 	compatible = matching
 	for _, foreground := range c.Foreground {
-		used, match := foreground.route(port, scheme)
+		used, match := foreground.routeTarget(number, scheme, mount, target)
 		if used {
 			compatible = match && !exists
 			exists = true
@@ -199,18 +206,22 @@ func (s *previewServe) close() {
 // Bound status output and discard CLI diagnostics: raw output can contain
 // account/setup details and is never returned to the browser.
 func readServeStatus(ctx context.Context) (*serveConfig, error) {
-	cmd := exec.CommandContext(ctx, "tailscale", "serve", "status", "--json")
+	var cfg serveConfig
+	if err := readTailscaleJSON(ctx, &cfg, "serve", "status", "--json"); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func readTailscaleJSON(ctx context.Context, value any, args ...string) error {
+	cmd := exec.CommandContext(ctx, "tailscale", args...)
 	output := &boundedServeOutput{}
 	cmd.Stdout = output
 	cmd.Stderr = io.Discard
 	if err := cmd.Run(); err != nil {
-		return nil, err
+		return err
 	}
-	var cfg serveConfig
-	if err := json.Unmarshal(output.Bytes(), &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return json.Unmarshal(output.Bytes(), value)
 }
 
 type boundedServeOutput struct{ bytes.Buffer }
@@ -240,10 +251,14 @@ func (b *serveReadyOutput) Write(p []byte) (int, error) {
 }
 
 func startServeSession(parent context.Context, scheme string, port int) (*serveSession, error) {
+	return startServeCommand(parent, scheme, "--"+scheme+"="+strconv.Itoa(port), "http://127.0.0.1:"+strconv.Itoa(port))
+}
+
+func startServeCommand(parent context.Context, scheme string, args ...string) (*serveSession, error) {
 	ctx, cancel := context.WithCancel(parent)
 	session := &serveSession{scheme: scheme, ready: make(chan struct{}), done: make(chan struct{}), stop: cancel}
 	// No shell, background mode, --yes, Funnel or destructive config commands.
-	cmd := exec.CommandContext(ctx, "tailscale", "serve", "--"+scheme+"="+strconv.Itoa(port), "http://127.0.0.1:"+strconv.Itoa(port))
+	cmd := exec.CommandContext(ctx, "tailscale", append([]string{"serve"}, args...)...)
 	cmd.Stdout = &serveReadyOutput{ready: session.ready}
 	cmd.Stderr = io.Discard
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
