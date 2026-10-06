@@ -1,6 +1,6 @@
 import { createEffect, createSignal, on, onCleanup, onMount, Show } from "solid-js";
 
-import PaneToggle from "./PaneToggle";
+import { Portal } from "solid-js/web";
 
 export type PreviewTarget = { port: number; path: string };
 type PreviewHistory = { history: PreviewTarget[]; index: number };
@@ -28,7 +28,7 @@ export function parsePreviewAddress(raw: string, currentPort?: number): PreviewT
   return { port, path: normalized.pathname + normalized.search + normalized.hash };
 }
 
-export default function PreviewPane(props: { origin: string; onError: (error: string) => void; collapsed: boolean; onToggle: () => void }) {
+export default function PreviewPane(props: { origin: string; onError: (error: string) => void; header: HTMLDivElement; visible: boolean }) {
   const validHistory = (value: unknown): value is PreviewHistory => {
     if (!value || typeof value !== "object") return false;
     const row = value as PreviewHistory;
@@ -106,8 +106,8 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
   });
   return (
     <>
-      <form class="pane-header browserbar" onSubmit={e => { e.preventDefault(); navigate(); }}>
-        <PaneToggle name="preview" collapsed={props.collapsed} onToggle={props.onToggle} controls="preview-content" />
+      <Portal mount={props.header} ref={element => { element.className = "preview-toolbar"; }}>
+      <form class="browserbar" hidden={!props.visible} onSubmit={e => { e.preventDefault(); navigate(); }}>
         <button class="header-icon" type="button" aria-label="Back" title="Back" disabled={current().index <= 0} onClick={() => move(-1)}>‹</button>
         <button class="header-icon" type="button" aria-label="Forward" title="Forward" disabled={current().index >= current().history.length - 1} onClick={() => move(1)}>›</button>
         <button class="header-icon" type="button" aria-label="Refresh preview" title="Refresh" disabled={!target()} onClick={() => setNavigation(n => n + 1)}>↻</button>
@@ -116,7 +116,8 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3h7v7m0-7L10 14M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5" /></svg>
         </a>
       </form>
-      <div id="preview-content" class="pane-content" hidden={props.collapsed}>
+      </Portal>
+      <div id="preview-content" class="pane-content">
       <Show when={source()} fallback={<div class="empty"><div class="preview-symbol">↗</div><h1>Your app, right here.</h1><p>Enter a local port or URL above.</p></div>}>
         <Show keyed when={source()}>
           {url => <iframe title="Local app preview" ref={element => { frame = element; }} src={url} onLoad={connectBridge} sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups" referrerpolicy="no-referrer" allow="" />}
