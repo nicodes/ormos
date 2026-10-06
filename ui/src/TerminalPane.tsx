@@ -22,16 +22,17 @@ export default function TerminalPane(props: {
     });
     const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
     // xterm handles wheels, but its custom viewport does not handle touch swipes.
-    // Scroll the local buffer without turning gestures into shell input.
+    // Reuse xterm's wheel handling for apps that own scrolling/mouse input.
+    // Ordinary shell swipes only scroll the local buffer.
     let touch: { x: number; y: number; scrolling: boolean } | undefined;
     const touchStart = (event: TouchEvent) => {
-      touch = event.touches.length === 1 && terminal.buffer.active.type === "normal"
+      touch = event.touches.length === 1
         ? { x: event.touches[0].clientX, y: event.touches[0].clientY, scrolling: false }
         : undefined;
     };
     const touchEnd = () => { touch = undefined; };
     const touchMove = (event: TouchEvent) => {
-      if (!touch || event.touches.length !== 1 || terminal.buffer.active.type !== "normal") {
+      if (!touch || event.touches.length !== 1) {
         touchEnd(); return;
       }
       const point = event.touches[0];
@@ -46,7 +47,18 @@ export default function TerminalPane(props: {
       if (!height) return;
       const lineHeight = height / terminal.rows;
       const lines = Math.trunc(distance / lineHeight);
-      if (lines) { terminal.scrollLines(-lines); touch.y += lines * lineHeight; }
+      if (lines) {
+        if (terminal.buffer.active.type === "alternate" || terminal.modes.mouseTrackingMode !== "none") {
+          const screen = terminal.element?.querySelector(".xterm-screen");
+          for (let i = 0; i < Math.abs(lines); i++) {
+            screen?.dispatchEvent(new WheelEvent("wheel", {
+              bubbles: true, cancelable: true, deltaMode: WheelEvent.DOM_DELTA_LINE,
+              deltaY: -Math.sign(lines), clientX: point.clientX, clientY: point.clientY,
+            }));
+          }
+        } else terminal.scrollLines(-lines);
+        touch.y += lines * lineHeight;
+      }
     };
     container.addEventListener("touchstart", touchStart, { passive: true });
     container.addEventListener("touchmove", touchMove, { passive: false });
