@@ -3,7 +3,9 @@
 package system
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -38,7 +41,7 @@ import (
 // The verbs are the lifecycle pair, enforced HERE, server-side: a request for
 // anything else is refused whatever the page sent. `open` spawns a PTY on this
 // machine with no relay involved, bounded, and `kill` ends one this UI opened.
-// Input (typing) is deliberately not here in v1 -- read-mostly, plus this pair.
+// Interactive input and resize travel over the same-origin terminal WebSocket.
 var uiActions = map[string]bool{"open": true, "kill": true}
 
 // Fixture seams: tests point these at stubs. Production defaults read this
@@ -70,6 +73,9 @@ type uiTerminal struct {
 	mu      sync.Mutex
 	buf     []byte
 	kill    func()
+	input   func([]byte) error
+	resize  func(uint16, uint16) error
+	readers map[chan []byte]bool
 }
 
 func (t *uiTerminal) output() string {
@@ -82,23 +88,40 @@ func (t *uiTerminal) append(p []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.buf = append(t.buf, p...)
+	for reader := range t.readers {
+		select {
+		case reader <- append([]byte(nil), p...):
+		default:
+			close(reader)
+			delete(t.readers, reader)
+		}
+	}
 	if len(t.buf) > uiTerminalBufMax {
 		t.buf = t.buf[len(t.buf)-uiTerminalBufMax:]
 	}
 }
 
 type uiServer struct {
-	version  string
-	static   fs.FS
-	hostname string
-	mu       sync.Mutex
-	terms    map[string]*uiTerminal
+	version      string
+	static       fs.FS
+	hostname     string
+	mu           sync.Mutex
+	terms        map[string]*uiTerminal
+	starting     int
+	hosts        []string
+	previewURL   string
+	defaultCwd   string
+	blockedPorts []int
 }
 
 func RunUI(args []string, version string) error {
 	fsflags := flag.NewFlagSet("ui", flag.ContinueOnError)
 	bind := fsflags.String("bind", uiDefaultBind, "address to listen on (default loopback; set the tailnet interface address to reach it from your tailnet)")
 	port := fsflags.Int("port", uiDefaultPort, "port to listen on")
+	previewPort := fsflags.Int("preview-port", 8482, "loopback port for isolated app previews")
+	previewURL := fsflags.String("preview-url", "", "public preview origin, e.g. https://box.tailnet.ts.net:8482")
+	cwd := fsflags.String("cwd", "", "initial working directory for the terminal")
+	hosts := fsflags.String("hosts", "", "comma-separated allowed proxy host:port names")
 	if err := fsflags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return nil
@@ -114,6 +137,20 @@ func RunUI(args []string, version string) error {
 	if *port < 1 || *port > 65535 {
 		return fmt.Errorf("--port must be 1-65535, got %d", *port)
 	}
+	if *previewPort < 1 || *previewPort > 65535 || *previewPort == *port {
+		return fmt.Errorf("--preview-port must be 1-65535 and different from --port")
+	}
+	if *previewURL != "" {
+		if err := validatePreviewOrigin(*previewURL); err != nil {
+			return err
+		}
+	}
+	if *cwd == "" {
+		*cwd, _ = os.Getwd()
+	}
+	if _, err := validateUICwd(*cwd, false, nil); err != nil {
+		return err
+	}
 	static, err := ui.Dist()
 	if err != nil {
 		return err
@@ -126,17 +163,40 @@ func RunUI(args []string, version string) error {
 	if err != nil {
 		return err
 	}
-	if ip := net.ParseIP(*bind); ip != nil && ip.IsUnspecified() {
-		fmt.Fprintf(os.Stderr, "ormos ui: --bind %s listens on every interface. There is no auth: anyone who can reach it can read this machine and open terminals on it.\n", *bind)
-	} else if *bind != "127.0.0.1" && *bind != "localhost" && *bind != "::1" {
-		fmt.Fprintf(os.Stderr, "ormos ui: --bind %s: no auth beyond reachability -- that address is the boundary.\n", *bind)
+	defer ln.Close()
+	previewLn, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(*previewPort)))
+	if err != nil {
+		return err
 	}
-	fmt.Printf("ormos ui on http://%s\n", ln.Addr())
-	srv := &http.Server{
-		Handler:           (&uiServer{version: version, static: static, hostname: host, terms: map[string]*uiTerminal{}}).routes(),
-		ReadHeaderTimeout: 10 * time.Second,
+	defer previewLn.Close()
+	previewOrigin := *previewURL
+	if previewOrigin == "" {
+		previewOrigin = "http://127.0.0.1:" + strconv.Itoa(*previewPort)
 	}
-	return srv.Serve(ln)
+	local := &uiServer{version: version, static: static, hostname: host,
+		terms: map[string]*uiTerminal{}, hosts: strings.Split(*hosts, ","),
+		previewURL: previewOrigin, defaultCwd: *cwd, blockedPorts: []int{*port, *previewPort}}
+	defer local.closeTerminals()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	srv := &http.Server{Handler: local.routes(), ReadHeaderTimeout: 10 * time.Second}
+	previews := &http.Server{Handler: local.previewRoutes(), ReadHeaderTimeout: 10 * time.Second}
+	defer srv.Close()
+	defer previews.Close()
+	failed := make(chan error, 2)
+	go func() { failed <- srv.Serve(ln) }()
+	go func() { failed <- previews.Serve(previewLn) }()
+	fmt.Printf("ormos ui on http://%s (preview %s)\n", ln.Addr(), previewOrigin)
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-failed:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+
 }
 
 // validateUIBind keeps the listen address an address. The wildcard is not
@@ -155,6 +215,10 @@ func validateUIBind(bind string) error {
 func (s *uiServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/system", s.apiSystem)
+	mux.HandleFunc("GET /api/workspace", func(w http.ResponseWriter, r *http.Request) {
+		uiJSON(w, map[string]any{"previewURL": s.previewURL, "defaultCwd": s.defaultCwd})
+	})
+	mux.HandleFunc("GET /api/terminal/{id}/ws", s.terminalWS)
 	mux.HandleFunc("GET /api/ports", s.apiPorts)
 	mux.HandleFunc("GET /api/terminals", s.apiTerminals)
 	mux.HandleFunc("GET /api/audit", s.apiAudit)
@@ -171,7 +235,7 @@ func (s *uiServer) routes() http.Handler {
 		uiError(w, http.StatusNotFound, "no such read")
 	})
 	mux.HandleFunc("/", s.spa)
-	return mux
+	return s.guard(mux)
 }
 
 func uiJSON(w http.ResponseWriter, value any) {
@@ -342,6 +406,10 @@ func (s *uiServer) apiAction(w http.ResponseWriter, r *http.Request) {
 
 func (s *uiServer) apiActionOpen(w http.ResponseWriter, body uiActionBody) {
 	pol, polErr := uiLoadPolicy()
+	if polErr != nil && !os.IsNotExist(polErr) {
+		uiError(w, http.StatusForbidden, "local policy unreadable")
+		return
+	}
 	if polErr == nil && pol.TerminalsDisabled {
 		uiError(w, http.StatusForbidden, "local policy disables terminals")
 		return
@@ -368,12 +436,22 @@ func (s *uiServer) apiActionOpen(w http.ResponseWriter, body uiActionBody) {
 		return
 	}
 	s.mu.Lock()
-	if len(s.terms) >= uiMaxTerminals {
+	for id, term := range s.terms {
+		term.mu.Lock()
+		alive := term.alive
+		term.mu.Unlock()
+		if !alive {
+			delete(s.terms, id)
+		}
+	}
+	if len(s.terms)+s.starting >= uiMaxTerminals {
 		s.mu.Unlock()
 		uiError(w, http.StatusTooManyRequests, "terminal limit reached")
 		return
 	}
+	s.starting++
 	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.starting--; s.mu.Unlock() }()
 	term, err := uiSpawnTerminal(shell, resolved)
 	if err != nil {
 		uiError(w, http.StatusInternalServerError, err.Error())
@@ -468,7 +546,8 @@ func spawnUITerminal(shell, cwd string) (*uiTerminal, error) {
 	id := newUIID()
 	cmd := exec.Command(shell)
 	cmd.Dir = cwd
-	ptmx, err := pty.Start(cmd)
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 80})
 	if err != nil {
 		return nil, err
 	}
@@ -478,6 +557,9 @@ func spawnUITerminal(shell, cwd string) (*uiTerminal, error) {
 		cwd:     cwd,
 		started: time.Now(),
 		alive:   true,
+		readers: map[chan []byte]bool{},
+		input:   func(data []byte) error { _, err := ptmx.Write(data); return err },
+		resize:  func(cols, rows uint16) error { return pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols}) },
 	}
 	t.kill = func() {
 		t.mu.Lock()
@@ -505,6 +587,10 @@ func spawnUITerminal(shell, cwd string) (*uiTerminal, error) {
 		_ = cmd.Wait()
 		t.mu.Lock()
 		t.alive = false
+		for reader := range t.readers {
+			close(reader)
+			delete(t.readers, reader)
+		}
 		t.mu.Unlock()
 		_ = ptmx.Close()
 	}()
