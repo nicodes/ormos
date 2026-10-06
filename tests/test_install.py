@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -134,8 +135,9 @@ else:
                 self.assert_failure_preserves_install()
 
     def test_wrong_binary_version_and_symlink_are_rejected(self):
-        self.archive(reported="0.1.15")
-        self.assert_failure_preserves_install()
+        for version in ["0.1.15", "dev", "v0.2.0-0.20261006190000-7c79e160410c"]:
+            self.archive(reported=version)
+            self.assert_failure_preserves_install()
         self.archive(symlink=True)
         self.assert_failure_preserves_install()
 
@@ -177,9 +179,9 @@ else:
         shutil.copyfile(fixture, path)
         (self.assets / "checksums.txt").write_text(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n")
         version = os.environ.get("ORMOS_INSTALL_TEST_VERSION", "0.2.0")
-        if version == "dev":
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
             result = self.assert_failure_preserves_install("--version", "v0.2.0")
-            self.assertIn("The binary reports dev", result.stderr)
+            self.assertIn(f"The binary reports {version}, expected 0.2.0", result.stderr)
         else:
             self.env["TEST_RELEASE_TAG"] = "v"+version
             result = self.run_install("--version", "v"+version)
