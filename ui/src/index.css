@@ -13,9 +13,10 @@ input:focus, button:focus-visible { outline: 2px solid #4ade80; outline-offset: 
 .error { display: flex; align-items: center; justify-content: space-between; padding: 6px 12px; font-size: 13px; color: #fca5a5; background: #351c25; flex: none; }
 .error button { border: 0; background: transparent; padding: 2px 8px; }
 .workspace { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.workspace-body { display: flex; flex: 1; min-height: 0; }
+.header-controls, .terminal-toolbar, .browserbar { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; }
+.preview-toolbar { display: contents; }
 .pane { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
-.terminal-pane { border-top: 1px solid #374151; }
-.pane.collapsed { flex: none; }
 .pane-content { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .pane-header { display: flex; align-items: center; gap: 4px; padding: 4px; height: 45px; min-width: 0; flex: none; background: #111827; border-bottom: 1px solid #1f2937; }
 .pane-header .header-icon { display: flex; align-items: center; justify-content: center; flex: none; width: 36px; height: 36px; min-width: 36px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #9ca3af; font-size: 20px; line-height: 1; cursor: pointer; }
