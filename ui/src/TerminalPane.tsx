@@ -16,9 +16,9 @@ export default function TerminalPane(props: {
     let retry: ReturnType<typeof setTimeout> | undefined;
     let socket: WebSocket | undefined;
     const terminal = new Terminal({
-      cursorBlink: true, fontSize: 14, scrollback: 5000,
+      cursorBlink: true, cursorStyle: "bar", fontSize: 14, scrollback: 5000,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-      theme: { background: "#0b0f19", foreground: "#d1d5db", cursor: "#4ade80", selectionBackground: "#374151" },
+      theme: { background: "#0b0f19", foreground: "#d1d5db", cursor: "#d1d5db", selectionBackground: "#374151" },
     });
     const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
     const send = (message: object) => {

@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: e55c7e2d33c365af3f10b529e87076b25dd764e68679adb3e58328680cbdce0f -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 2a7c61aadaaedcfb756d605cd586a616307ba2ec8f7df336634fc1602b3b20e5 -->
 
 # Ormos
 
@@ -46,3 +46,5 @@ Saved command and prompt lists use plain rows without card outlines or a storage
 Terminal content fills the pane below the shared header with a small 6-pixel inset and no frame border.
 
 When the selected port has no reachable app, the preview displays a dark, centered “No app listening” page with only a title and a short instruction to start the app and refresh. The response is not cached, so Refresh can pick up an app once it starts.
+
+The terminal uses a blinking light-gray vertical-bar cursor.
