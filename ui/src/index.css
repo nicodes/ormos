@@ -57,3 +57,15 @@ iframe { flex: 1; width: 100%; min-height: 0; border: 0; background: white; }
 @media (max-width: 760px) {
  .terminal { padding: 7px 4px 2px 8px; }
 }
+
+/* Shared sizing for every icon control in the two pane headers. */
+.browserbar { height: 45px; padding: 4px; }
+.terminal-header { height: 45px; border-bottom: 1px solid #1f2937; }
+.terminal-header .tabbar { height: 44px; min-height: 44px; align-items: center; border-bottom: 0; }
+.terminal-header .tab { align-self: stretch; }
+.browserbar button, .browserbar .pane-toggle, .preview-open, .terminal-header .pane-toggle, .terminal-header .tab-add, .terminal-header .tab-close, .terminal-menu-toggle {
+ display: flex; align-items: center; justify-content: center; flex: none; align-self: center;
+ width: 36px; height: 36px; min-width: 36px; min-height: 36px;
+ padding: 0; border: 0; border-radius: 6px; font-size: 20px; line-height: 1;
+}
+.browserbar svg, .terminal-header svg { width: 20px; height: 20px; flex: none; }
