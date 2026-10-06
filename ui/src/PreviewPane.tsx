@@ -2,7 +2,7 @@ import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Sh
 
 import { Portal } from "solid-js/web";
 import BrowserMenu from "./BrowserMenu";
-import { request } from "./api";
+import { APIError, request } from "./api";
 import { parsePreviewAddress, previewURL, type PreviewTarget } from "./preview";
 
 type PreviewHistory = { history: PreviewTarget[]; index: number };
@@ -126,6 +126,7 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
     } else if (event.key === "Enter" && historyIndex() >= 0) { event.preventDefault(); visitRecent(filteredRecent()[historyIndex()]); }
   };
   const [frameTarget, setFrameTarget] = createSignal<{ url: string }>();
+  const [unavailableMessage, setUnavailableMessage] = createSignal("Start your app in the terminal, then refresh.");
   const [availability, setAvailability] = createSignal<"empty" | "checking" | "ready" | "unavailable">("empty");
   createEffect(on(navigation, () => {
     const item = target();
@@ -135,12 +136,27 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
     setAvailability("checking");
     const controller = new AbortController();
     let live = true;
-    const timeout = window.setTimeout(() => controller.abort(), 5000);
-    // An opaque response confirms reachability without requiring app CORS.
-    // HEAD does not download the app or send its browser credentials.
-    void fetch(url, { method: "HEAD", mode: "no-cors", credentials: "omit", cache: "no-store", signal: controller.signal })
-      .then(() => { if (live) { setFrameTarget({ url }); setAvailability("ready"); } })
-      .catch(() => { if (live) setAvailability("unavailable"); })
+    const timeout = window.setTimeout(() => controller.abort(), 20000);
+    const probe = async () => {
+      const attempt = new AbortController();
+      const abort = () => attempt.abort();
+      controller.signal.addEventListener("abort", abort, { once: true });
+      if (controller.signal.aborted) attempt.abort();
+      const timer = window.setTimeout(abort, 3000);
+      try { await fetch(url, { method: "HEAD", mode: "no-cors", credentials: "omit", cache: "no-store", signal: attempt.signal }); }
+      finally { window.clearTimeout(timer); controller.signal.removeEventListener("abort", abort); }
+    };
+    void (async () => {
+      try { await probe(); }
+      catch {
+        if (!live) return;
+        if (controller.signal.aborted) throw new Error("Preview timed out");
+        await request("/api/preview", { port: item.port, scheme: workspace.protocol.slice(0, -1) }, controller.signal);
+        await probe();
+      }
+      if (live) { setFrameTarget({ url }); setAvailability("ready"); }
+    })()
+      .catch(error => { if (live) { setUnavailableMessage(error instanceof APIError ? error.message : "This app is not reachable yet. Check Tailscale access, then refresh."); setAvailability("unavailable"); } })
       .finally(() => window.clearTimeout(timeout));
     onCleanup(() => { live = false; window.clearTimeout(timeout); controller.abort(); });
   }));
@@ -171,7 +187,7 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
       <div id="preview-content" class="pane-content">
       <Show keyed when={frameTarget()} fallback={<div class="empty"><div class="preview-empty-content" role="status">
         <h1>{availability() === "unavailable" ? "App unavailable" : availability() === "checking" ? "Opening app" : address().trim() ? "Ready to preview" : "Enter a port"}</h1>
-        <p>{availability() === "unavailable" ? "Make this port reachable over Tailscale, then refresh." : availability() === "checking" ? "Connecting to this port." : address().trim() ? "Press Enter to open your address." : "Open a local app, right here."}</p>
+        <p>{availability() === "unavailable" ? unavailableMessage() : availability() === "checking" ? "Connecting to this port." : address().trim() ? "Press Enter to open your address." : "Open a local app, right here."}</p>
       </div></div>}>
         {item => <iframe title="Local app preview" src={item.url} sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups" referrerpolicy="no-referrer" allow="" />}
       </Show>

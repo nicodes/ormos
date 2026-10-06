@@ -102,14 +102,16 @@ func (t *uiTerminal) append(p []byte) {
 }
 
 type uiServer struct {
-	version    string
-	static     fs.FS
-	hostname   string
-	mu         sync.Mutex
-	terms      map[string]*uiTerminal
-	starting   int
-	hosts      []string
-	defaultCwd string
+	version      string
+	static       fs.FS
+	hostname     string
+	mu           sync.Mutex
+	terms        map[string]*uiTerminal
+	starting     int
+	hosts        []string
+	defaultCwd   string
+	controlPort  int
+	previewServe *previewServe
 }
 
 func RunUI(args []string, version string) error {
@@ -154,10 +156,12 @@ func RunUI(args []string, version string) error {
 	defer ln.Close()
 	local := &uiServer{version: version, static: static, hostname: host,
 		terms: map[string]*uiTerminal{}, hosts: strings.Split(*hosts, ","),
-		defaultCwd: *cwd}
+		defaultCwd: *cwd, controlPort: *port}
 	defer local.closeTerminals()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	local.previewServe = newPreviewServe(ctx)
+	defer local.previewServe.close()
 	srv := &http.Server{Handler: local.routes(), ReadHeaderTimeout: 10 * time.Second}
 	defer srv.Close()
 	failed := make(chan error, 1)
@@ -193,6 +197,7 @@ func (s *uiServer) routes() http.Handler {
 	mux.HandleFunc("GET /api/system", s.apiSystem)
 	mux.HandleFunc("GET /api/terminal/{id}/ws", s.terminalWS)
 	mux.HandleFunc("GET /api/ports", s.apiPorts)
+	mux.HandleFunc("/api/preview", s.apiPreview)
 	mux.HandleFunc("GET /api/terminals", s.apiTerminals)
 	mux.HandleFunc("GET /api/audit", s.apiAudit)
 	mux.HandleFunc("GET /api/terminal/{id}/output", s.apiTerminalOutput)
