@@ -37,8 +37,7 @@ export default function SavedItems(props: { kind: "command" | "prompt"; createRe
   return <div class="saved-commands">
     <Show when={error()}><p class="saved-command-error" role="alert">{error()}</p></Show>
     <Show when={editing() !== null} fallback={<>
-      <div class="saved-command-heading"><span>Saved in this browser</span></div>
-      <Show when={commands().length} fallback={<p class="saved-command-empty">{`No saved ${kind}s yet.`}</p>}>
+      <Show when={commands().length} fallback={<p class="saved-command-empty">{`No saved ${kind}s`}</p>}>
         <ul class="saved-command-list"><For each={commands()}>{row => <li>
           <div class="saved-command-row"><strong>{row.title}</strong>
           <div class="saved-command-actions">
