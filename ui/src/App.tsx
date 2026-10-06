@@ -19,7 +19,6 @@ export default function App() {
   const [active, setActive] = createSignal("");
   const [editing, setEditing] = createSignal("");
   const [draftName, setDraftName] = createSignal("");
-  let nameInput: HTMLInputElement | undefined;
   const [statuses, setStatuses] = createSignal<Record<string, string>>({});
   const [previewOrigin, setPreviewOrigin] = createSignal("");
   const [error, setError] = createSignal("");
@@ -40,7 +39,6 @@ export default function App() {
   };
   const rename = (tab: TerminalTab) => {
     setDraftName(tab.label); setEditing(tab.id);
-    nameInput?.focus(); nameInput?.select();
   };
   const saveName = () => {
     const id = editing(); if (!id) return;
@@ -114,22 +112,20 @@ export default function App() {
           <div class="terminal-toolbar" hidden={view() !== "terminal"}>
           <Show when={view() === "terminal"}>
           <div class="tabbar" role="tablist" aria-label="Terminal tabs">
-            <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }}>
-              <Show when={editing() === tab.id} fallback={<button role="tab" aria-selected={active() === tab.id} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
+            <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }} role={active() === tab.id ? "tab" : undefined} aria-selected={active() === tab.id ? true : undefined}>
+              <Show when={active() === tab.id} fallback={<button role="tab" aria-selected={false} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
                 <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />{tab.label}
               </button>}>
-                <input class="tab-name" aria-label="Terminal tab name" maxlength={80} value={draftName()} ref={element => { nameInput = element; }} onInput={event => setDraftName(event.currentTarget.value)} onBlur={saveName} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); saveName(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(""); } }} />
+                <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />
+                <input class="tab-name" aria-label="Terminal tab name" maxlength={80} value={editing() === tab.id ? draftName() : tab.label} onFocus={() => rename(tab)} onInput={event => setDraftName(event.currentTarget.value)} onBlur={saveName} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); saveName(); controls.get(active())?.focus(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(""); controls.get(active())?.focus(); } }} />
               </Show>
               <Show when={active() === tab.id}>
-                <Show when={editing() !== tab.id}><button class="header-icon" aria-label={`Rename ${tab.label}`} title="Rename terminal" onClick={() => rename(tab)}>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 3 5 5-12 12-6 1 1-6L16 3Zm-2 2 5 5" /></svg>
-                </button></Show>
               <button class="header-icon tab-close" aria-label={`Close ${tab.label}`} onClick={() => void closeTerminal(tab.id)}>×</button>
               </Show>
             </div>}</For>
             <button class="header-icon tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
           </div>
-          <TerminalMenu enabled={!!active()} focus={() => controls.get(active())?.focus()} type={data => controls.get(active())?.type(data)} />
+          <TerminalMenu enabled={!!active()} focus={() => controls.get(active())?.focus()} type={data => controls.get(active())?.type(data)} paste={data => controls.get(active())?.paste(data)} />
           </Show>
           </div>
           <div class="preview-toolbar" ref={setHeaderMount} />

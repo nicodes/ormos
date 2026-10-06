@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { request, type TerminalRow } from "./api";
 
-export type TerminalControls = { focus: () => void; type: (data: string) => void };
+export type TerminalControls = { focus: () => void; type: (data: string) => void; paste: (data: string) => void };
 export default function TerminalPane(props: {
   id: string; onStatus: (status: string) => void;
   register: (id: string, controls?: TerminalControls) => void;
@@ -57,7 +57,7 @@ export default function TerminalPane(props: {
     };
     const input = terminal.onData(type);
     const observer = new ResizeObserver(resize); observer.observe(container);
-    props.register(props.id, { focus: () => terminal.focus(), type });
+    props.register(props.id, { focus: () => terminal.focus(), type, paste: data => terminal.paste(data) });
     connect();
     onCleanup(() => {
       disposed = true; generation++; clearTimeout(retry); observer.disconnect(); socket?.close();
