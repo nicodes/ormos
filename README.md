@@ -1,8 +1,10 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: ab70eebcb3305129f46311597aa0a26b0e8d184ca938ddd53af938dd6b689706 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: e9a86ca9f04c7ff2a5d1d645914590808aedf3fc34d2a9d21d1980a7a2431044 -->
 
 # Ormos
 
 A terminal and local app preview in your browser. One executable serves the SolidJS UI and interactive terminals on your machine. Local use needs no account, hosted backend, or Clerk.
+
+Automatic preview forwarding is currently a development feature. Published v0.2.2 uses direct app previews; the forwarding behavior below is available in the preview branch until its next release.
 
 ## Install and run
 
