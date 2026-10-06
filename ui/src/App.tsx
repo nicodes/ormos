@@ -1,6 +1,7 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import TerminalPane, { type TerminalControls } from "./TerminalPane";
 import PreviewPane from "./PreviewPane";
+import PaneToggle from "./PaneToggle";
 import { APIError, request, type TerminalRow } from "./api";
 
 type TerminalTab = { id: string; label: string };
@@ -20,6 +21,10 @@ export default function App() {
   const [previewOrigin, setPreviewOrigin] = createSignal("");
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(true);
+  const [terminalCollapsed, setTerminalCollapsed] = createSignal(localStorage.getItem("ormos.terminalCollapsed") === "true");
+  const [previewCollapsed, setPreviewCollapsed] = createSignal(localStorage.getItem("ormos.previewCollapsed") === "true");
+  const toggleTerminal = () => { setTerminalCollapsed(value => !value); localStorage.setItem("ormos.terminalCollapsed", String(terminalCollapsed())); };
+  const togglePreview = () => { setPreviewCollapsed(value => !value); localStorage.setItem("ormos.previewCollapsed", String(previewCollapsed())); };
   const controls = new Map<string, TerminalControls>();
   let nextNumber = 1;
   let disposed = false;
@@ -86,8 +91,12 @@ export default function App() {
     <main class="app">
       <Show when={error()}><div class="error" role="alert">{error()}<button aria-label="Dismiss error" onClick={() => setError("")}>×</button></div></Show>
       <div class="workspace">
-        <section class="pane terminal-pane" aria-label="Terminal">
+        <section class="pane preview-pane" classList={{ collapsed: previewCollapsed() }} aria-label="App preview">
+          <PreviewPane origin={previewOrigin()} onError={setError} collapsed={previewCollapsed()} onToggle={togglePreview} />
+        </section>
+        <section class="pane terminal-pane" classList={{ collapsed: terminalCollapsed() }} aria-label="Terminal">
           <div class="tabbar" role="tablist" aria-label="Terminal tabs">
+            <PaneToggle name="terminal" collapsed={terminalCollapsed()} onToggle={toggleTerminal} controls="terminal-content" />
             <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }}>
               <button role="tab" aria-selected={active() === tab.id} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
                 <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />{tab.label}
@@ -96,6 +105,7 @@ export default function App() {
             </div>}</For>
             <button class="tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
           </div>
+          <div id="terminal-content" class="pane-content" hidden={terminalCollapsed()}>
           <div class="terminal-stack">
             <For each={tabs()}>{tab => <div class="terminal-session" hidden={active() !== tab.id}>
               <TerminalPane id={tab.id} onStatus={status => setStatus(tab.id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
@@ -105,8 +115,8 @@ export default function App() {
             <button onClick={() => controls.get(active())?.focus()}>Keyboard</button>
             <For each={keys}>{key => <button onPointerDown={e => e.preventDefault()} onClick={() => controls.get(active())?.type(key.data)}>{key.label}</button>}</For>
           </div>
+          </div>
         </section>
-        <section class="pane preview-pane" aria-label="App preview"><PreviewPane origin={previewOrigin()} onError={setError} /></section>
       </div>
     </main>
   );

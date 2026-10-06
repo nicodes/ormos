@@ -1,5 +1,7 @@
 import { batch, createEffect, createSignal, on, For, onCleanup, onMount, Show } from "solid-js";
 
+import PaneToggle from "./PaneToggle";
+
 export type PreviewTarget = { port: number; path: string };
 type PreviewTab = { id: string; history: PreviewTarget[]; index: number };
 let sequence = 0;
@@ -28,7 +30,7 @@ export function parsePreviewAddress(raw: string, currentPort?: number): PreviewT
   return { port, path: normalized.pathname + normalized.search + normalized.hash };
 }
 
-export default function PreviewPane(props: { origin: string; onError: (error: string) => void }) {
+export default function PreviewPane(props: { origin: string; onError: (error: string) => void; collapsed: boolean; onToggle: () => void }) {
   const loadTabs = (): PreviewTab[] => {
     try {
       const parsed = JSON.parse(localStorage.getItem("ormos.previewTabs") ?? "null");
@@ -114,12 +116,14 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
   return (
     <>
       <div class="tabbar" role="tablist" aria-label="Preview tabs">
+        <PaneToggle name="preview" collapsed={props.collapsed} onToggle={props.onToggle} controls="preview-content" />
         <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }}>
           <button role="tab" aria-selected={active() === tab.id} onClick={() => select(tab.id)}>{tab.history[tab.index] ? `:${tab.history[tab.index].port}` : "New tab"}</button>
           <button class="tab-close" aria-label={`Close preview ${tab.history[tab.index]?.port ?? "tab"}`} onClick={() => close(tab.id)}>×</button>
         </div>}</For>
         <button class="tab-add" aria-label="New preview tab" onClick={add}>+</button>
       </div>
+      <div id="preview-content" class="pane-content" hidden={props.collapsed}>
       <form class="browserbar" onSubmit={e => { e.preventDefault(); navigate(); }}>
         <button type="button" aria-label="Back" title="Back" disabled={current().index <= 0} onClick={() => move(-1)}>‹</button>
         <button type="button" aria-label="Forward" title="Forward" disabled={current().index >= current().history.length - 1} onClick={() => move(1)}>›</button>
@@ -131,6 +135,7 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
           {url => <iframe title="Local app preview" ref={element => { frame = element; }} src={url} onLoad={connectBridge} sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups" referrerpolicy="no-referrer" allow="" />}
         </Show>
       </Show>
+      </div>
     </>
   );
 }

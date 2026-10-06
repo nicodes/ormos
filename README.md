@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 8ef8bf6ba4aa5b3e8e284f6357cf6e06caa0566f893ceb112fda987d875baf27 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 4a13b13635f5a8fbf35d99bb63ca98a4670fb508e371b0b4d07da2ae53a3bf30 -->
 
 # Ormos
 
@@ -13,7 +13,7 @@ go install github.com/nicodes/ormos@latest
 ormos ui
 ```
 
-Bare `ormos` also starts the local UI. Open `http://127.0.0.1:8481`. Type in the terminal, start a web app, then enter its local port or localhost URL in the preview address bar. Terminal and preview panes sit beside each other on desktop and stack on a phone. The Keyboard button and extra terminal keys support touch devices. Each pane has tabs and a **+** button. Terminal tabs keep independent shells running; closing a terminal tab ends that shell. Preview tabs remember their local port and navigation history, with back, forward and refresh controls. The address bar accepts a port (`3000`), a port with a path (`3000/about`), a localhost HTTP URL, or a path within the current app. Normal links and SPA history update the address bar. Reloading Ormos restores its tabs and reconnects to live terminal sessions. There is no global header or side navigation.
+Bare `ormos` also starts the local UI. Open `http://127.0.0.1:8481`. Type in the terminal, start a web app, then enter its local port or localhost URL in the preview address bar. The preview sits above the terminal on both desktop and phone. The eye button before each pane’s first tab collapses or expands that pane; its tab row remains available and the other pane fills the freed space. Collapsing preserves running shells and the current preview, and the choice is remembered after a reload. The Keyboard button and extra terminal keys support touch devices. Each pane has tabs and a **+** button. Terminal tabs keep independent shells running; closing a terminal tab ends that shell. Preview tabs remember their local port and navigation history, with back, forward and refresh controls. The address bar accepts a port (`3000`), a port with a path (`3000/about`), a localhost HTTP URL, or a path within the current app. Normal links and SPA history update the address bar. Reloading Ormos restores its tabs and reconnects to live terminal sessions. There is no global header or side navigation.
 
 New terminals open automatically at `~`; use `--cwd /path/to/work` to change it. `--port` defaults to 8481, and the separate loopback preview listener's `--preview-port` defaults to 8482. Local `policy.json` restrictions apply to terminal directories and preview ports; malformed policy files deny access. App previews use a separate browser origin from terminal controls. Apps that prohibit embedding may need a separate browser window. Preview navigation tracking requires the app to permit the injected navigation bridge script.
 
