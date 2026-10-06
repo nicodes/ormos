@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: efd42a7e7e643f1da6734399072632bc099c898a672c7f08ef4cd47c92632448 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 311d28a221b7f56e9b268af08d8384d9fb88ce4e482acf7785bb2d46d7a54b56 -->
 
 # Ormos
 
@@ -23,23 +23,22 @@ New terminals open automatically at `~`; use `--cwd /path/to/work` to change it.
 
 ## Private access through Tailscale
 
-Keep Ormos on loopback and expose its UI privately with Tailscale Serve. Expose each localhost app separately, or bind the app to the machine's Tailscale IP. The following example uses HTTP and a placeholder MagicDNS name:
+Keep Ormos on loopback and expose its UI privately with Tailscale Serve. This is a one-time UI setup; app ports are handled automatically. The following example uses HTTP and a placeholder MagicDNS name:
 
 ```sh
 ormos ui --hosts box:8481
 
 # In another terminal; preserve any existing Serve routes.
 tailscale serve --bg --http=8481 http://127.0.0.1:8481
-
-# For an app listening only on localhost:3000:
-tailscale serve --bg --http=3000 http://127.0.0.1:3000
 ```
 
-Visit `http://box:8481` from a device on the same tailnet, then enter `3000` to load `http://box:3000` directly. Network access rules must permit both ports. Tailscale encrypts the connection between devices. HTTPS setups need the full Tailscale DNS name and HTTPS exposure for both UI and apps.
+Visit `http://box:8481` from a device on the same tailnet. Start your app normally in the terminal, then enter its port, such as `3000`, in Preview. If the app is already reachable, it opens directly. Otherwise Ormos checks that the app is listening on localhost and starts a temporary private Tailscale Serve route on that port, then retries. There is no per-app setup command. Network access rules must permit both ports. Tailscale encrypts the connection between devices. HTTPS setups need the full Tailscale DNS name and HTTPS exposure for both UI and apps.
 
 There is no application login: anyone permitted to reach the UI can control its terminals as its operating-system user. Keep it private and limit network access to trusted users/devices. Ormos rejects foreign origins for terminal mutations and WebSocket upgrades, and unlisted UI hostnames. Terminal controls cannot be embedded in an iframe. Direct previews use a different port/origin from the UI and are sandboxed.
 
-Ormos does not forward app requests, inject scripts, or select ports through a cookie. Each window's iframe connects independently. App access is governed by its listener configuration, Tailscale rules and the app itself; Ormos's legacy port policy does not control direct browser access. Terminals belong to the running Ormos process and end when it stops. `ormos relay` and `ormos --config PATH` remain for legacy compatibility; the former hosted backend is deprecated.
+Tailscale must be installed and connected on the machine, and the user running Ormos must have permission to manage Serve. This permission is configured once for that operating-system user; Ormos does not elevate privileges. Compatible existing routes are reused, conflicting routes are preserved and reported, and public Funnel routes are never created. Only routes Ormos creates are owned by its foreground CLI sessions; those routes end when Ormos shuts down normally. Apps keep running independently, and existing Serve routes remain configured. At most 32 temporary app routes are retained per Ormos process.
+
+Ormos does not forward app requests, inject scripts, or select ports through a cookie. Each window's iframe connects independently. App access is governed by its listener configuration, Tailscale rules and the app itself; Local `policy.json` port rules control automatic exposure and deny sensitive ports by default; unreadable policy fails closed. These rules do not restrict an app's preexisting direct network access. Terminals belong to the running Ormos process and end when it stops. `ormos relay` and `ormos --config PATH` remain for legacy compatibility; the former hosted backend is deprecated.
 
 In the terminal popup, the plus icon at the right of the tabs adds a command or prompt to the selected list. While editing, it becomes a checkmark that saves the item; switching tabs or closing the popup discards unsaved changes. It is hidden on the keyboard tab.
 
@@ -47,6 +46,6 @@ Saved command and prompt lists use plain rows without card outlines or a storage
 
 Terminal content fills the pane below the shared header with a small 6-pixel inset and no frame border.
 
-Before loading an app, the browser makes a credential-free HEAD reachability check, with a five-second timeout. Connection failure shows a centered “App unavailable” title and a short subtitle to expose the port through Tailscale and refresh. This check does not certify that embedding is permitted; use Open in new tab if the app blocks iframes. Refresh checks the address again and reloads it. Navigation history retains up to 200 entered addresses; recent history retains 50 unique entries.
+Before loading an app, the browser makes a credential-free HEAD reachability check, with a three-second timeout per attempt. If needed, automatic Serve setup and a second check follow, bounded by a 20-second overall timeout. Failure shows a centered “App unavailable” title and a short subtitle identifying the next step, such as starting the app or checking Tailscale permissions. This check does not certify that embedding is permitted; use Open in new tab if the app blocks iframes. Refresh checks the address again and reloads it. Navigation history retains up to 200 entered addresses; recent history retains 50 unique entries.
 
 The terminal uses a blinking light-gray vertical-bar cursor.

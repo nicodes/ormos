@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, mkdir, writeFile, readFile } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -86,6 +86,7 @@ test('direct previews work without app CORS, proxy cookies or rewritten HTML', {
         await frame().getByRole('heading', { name: 'First app' }).waitFor();
         assert.equal(await page.locator('iframe').getAttribute('src'), `http://127.0.0.1:${firstPort}/?entered=1#part`);
         assert(!requests.some(url => url.includes('__ormos')));
+        assert(!requests.some(url => url.endsWith('/api/preview')), 'Already reachable apps must not configure Serve');
         assert((await context.cookies()).every(cookie => cookie.name !== 'ormos_preview_port'));
         await frame().getByRole('button', { name: 'Change state' }).click();
         await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
@@ -149,4 +150,96 @@ test('direct previews work without app CORS, proxy cookies or rewritten HTML', {
       } finally { await context.close(); }
     });
   }
+});
+
+
+// A foreground CLI double exercises process lifetime without mutating the test
+// machine's Tailscale configuration. Real Serve behavior is checked on devbox.
+test('unreachable preview provisions one temporary route and preserves existing routes on shutdown', { timeout: 30000 }, async t => {
+  const home = await mkdtemp(path.join(tmpdir(), 'ormos-auto-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const bin = path.join(home, 'bin');
+  await mkdir(bin);
+  const state = path.join(home, 'serve.json');
+  const calls = path.join(home, 'calls.jsonl');
+  const existing = { TCP: { '8443': { HTTPS: true } }, Web: { 'existing.test:8443': { Handlers: { '/': { Proxy: 'http://127.0.0.1:7000' } } } } };
+  await writeFile(state, JSON.stringify(existing));
+  await writeFile(path.join(bin, 'tailscale'), `#!${process.execPath}
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.TEST_SERVE_CALLS, JSON.stringify(args)+'\\n');
+if (args.join(' ') === 'serve status --json') {
+ process.stdout.write(fs.readFileSync(process.env.TEST_SERVE_STATE));
+} else {
+ if (args.length !== 3 || !/^--http=\\d+$/.test(args[1])) process.exit(2);
+ const port = args[1].slice(7);
+ if (args[2] !== 'http://127.0.0.1:'+port) process.exit(3);
+ const cfg = JSON.parse(fs.readFileSync(process.env.TEST_SERVE_STATE));
+ cfg.Foreground = { [process.pid]: { TCP: { [port]: { HTTP: true } }, Web: { ['box.test:'+port]: { Handlers: { '/': { Proxy: args[2] } } } } } };
+ fs.writeFileSync(process.env.TEST_SERVE_STATE, JSON.stringify(cfg));
+ process.on('SIGINT', () => {
+  const cfg = JSON.parse(fs.readFileSync(process.env.TEST_SERVE_STATE));
+  delete cfg.Foreground[process.pid];
+  if (!Object.keys(cfg.Foreground).length) delete cfg.Foreground;
+  fs.writeFileSync(process.env.TEST_SERVE_STATE, JSON.stringify(cfg));
+  process.exit(0);
+ });
+ process.stdout.write('Available within your tailnet:\\n');
+ setInterval(() => {}, 1000);
+}
+`, { mode: 0o700 });
+  const target = await app('Automatic app');
+  t.after(() => close(target));
+  const targetPort = target.address().port;
+  const placeholder = await listen((_req, res) => res.end());
+  const port = placeholder.address().port;
+  await close(placeholder);
+  const child = spawn(process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port)], {
+    env: { ...process.env, HOME: home, XDG_CONFIG_HOME: home, SHELL: '/bin/sh', PATH: bin+path.delimiter+process.env.PATH, TEST_SERVE_STATE: state, TEST_SERVE_CALLS: calls },
+    stdio: 'ignore',
+  });
+  const stop = async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = once(child, 'exit'); child.kill('SIGTERM'); await exited;
+    }
+  };
+  t.after(stop);
+  const origin = `http://127.0.0.1:${port}`;
+  for (let n = 0; ; n++) {
+    try { await fetch(origin); break; }
+    catch { assert(n < 100 && child.exitCode === null); await new Promise(resolve => setTimeout(resolve, 50)); }
+  }
+  const browser = await chromium.launch();
+  t.after(() => browser.close());
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  const page = await context.newPage();
+  await page.goto(origin);
+  await page.getByRole('button', { name: 'Show preview', exact: true }).click();
+  // Simulate a phone that cannot reach a localhost-only app yet. The first
+  // probe fails; the second succeeds only after the setup endpoint returns.
+  const setups = [];
+  page.on('request', req => { if (req.url().endsWith('/api/preview')) setups.push(req.postDataJSON()); });
+  let failNextProbe = true;
+  await page.route(`http://127.0.0.1:${targetPort}/`, route => {
+    if (route.request().method() === 'HEAD' && failNextProbe) { failNextProbe = false; return route.abort('connectionrefused'); }
+    return route.continue();
+  });
+  const address = page.getByRole('combobox', { name: 'Preview address' });
+  await address.fill(String(targetPort)); await address.press('Enter');
+  await page.frameLocator('iframe').getByRole('heading', { name: 'Automatic app' }).waitFor({ timeout: 15000 });
+  assert.deepEqual(setups, [{ port: targetPort, scheme: 'http' }]);
+  const active = JSON.parse(await readFile(state, 'utf8'));
+  assert.deepEqual(active.TCP, existing.TCP);
+  assert.deepEqual(active.Web, existing.Web);
+  assert.equal(Object.keys(active.Foreground).length, 1);
+  failNextProbe = true;
+  await address.fill(String(targetPort)); await address.press('Enter');
+  await page.frameLocator('iframe').getByRole('heading', { name: 'Automatic app' }).waitFor({ timeout: 15000 });
+  assert.equal(setups.length, 2);
+  const commands = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(commands, [['serve', 'status', '--json'], ['serve', '--http='+targetPort, 'http://127.0.0.1:'+targetPort]]);
+  // Graceful server shutdown also closes its own idle test PTY.
+  await context.close();
+  await stop();
+  assert.deepEqual(JSON.parse(await readFile(state, 'utf8')), existing);
 });
