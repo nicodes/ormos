@@ -35,7 +35,7 @@ test('direct previews work without app CORS, proxy cookies or rewritten HTML', {
   const firstPort = first.address().port;
   const secondPort = second.address().port;
   t.after(async () => { await close(first); await close(second); });
-  const child = spawn(globalThis.process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port)], {
+  const child = spawn(globalThis.process.env.ORMOS_TEST_BINARY, ['ui', '--share=false', '--port', String(port)], {
     env: { ...globalThis.process.env, HOME: home, XDG_CONFIG_HOME: home, SHELL: '/bin/sh' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -59,8 +59,8 @@ test('direct previews work without app CORS, proxy cookies or rewritten HTML', {
   }
   const browser = await chromium.launch();
   t.after(() => browser.close());
-  for (const touch of [false, true]) {
-    await t.test(touch ? 'phone layout' : 'desktop layout', async () => {
+  for (const [touch, prefix] of [[false, ""], [true, ""], [false, "/ormos/"], [true, "/ormos/"]]) {
+    await t.test((touch ? 'phone layout' : 'desktop layout') + (prefix ? ' under /ormos/' : ' at root'), async () => {
       const context = await browser.newContext({ viewport: touch ? { width: 390, height: 844 } : { width: 1440, height: 900 }, hasTouch: touch, isMobile: touch });
       try {
         const page = await context.newPage();
@@ -68,7 +68,7 @@ test('direct previews work without app CORS, proxy cookies or rewritten HTML', {
         const errors = [];
         page.on('request', request => requests.push(request.url()));
         page.on('pageerror', error => errors.push(error));
-        await page.goto(origin);
+        await page.goto(origin + prefix);
         await page.waitForFunction(() => document.querySelector('.status-dot.online'));
         await page.locator('.xterm-helper-textarea').focus();
         await page.keyboard.type("DIRECT_STATE=kept; printf 'DIRECT_%s\\n' OK");
@@ -105,7 +105,7 @@ test('direct previews work without app CORS, proxy cookies or rewritten HTML', {
         await action('Forward');
         await frame().getByRole('heading', { name: 'Second app' }).waitFor();
         const other = await context.newPage();
-        await other.goto(origin);
+        await other.goto(origin + prefix);
         const otherAddress = other.getByRole('combobox', { name: 'Preview address' });
         await otherAddress.fill(String(firstPort));
         await otherAddress.press('Enter');
@@ -194,7 +194,7 @@ if (args.join(' ') === 'serve status --json') {
   const placeholder = await listen((_req, res) => res.end());
   const port = placeholder.address().port;
   await close(placeholder);
-  const child = spawn(process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port)], {
+  const child = spawn(process.env.ORMOS_TEST_BINARY, ['ui', '--share=false', '--port', String(port)], {
     env: { ...process.env, HOME: home, XDG_CONFIG_HOME: home, SHELL: '/bin/sh', PATH: bin+path.delimiter+process.env.PATH, TEST_SERVE_STATE: state, TEST_SERVE_CALLS: calls },
     stdio: 'ignore',
   });

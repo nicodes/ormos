@@ -2,7 +2,7 @@ import { onCleanup, onMount } from "solid-js";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { request, type TerminalRow } from "./api";
+import { apiURL, request, type TerminalRow } from "./api";
 
 export type TerminalControls = { focus: () => void; type: (data: string) => void; paste: (data: string) => void };
 export default function TerminalPane(props: {
@@ -35,7 +35,7 @@ export default function TerminalPane(props: {
       clearTimeout(retry);
       const current = ++generation;
       socket?.close(); terminal.reset(); props.onStatus("Connecting");
-      const url = new URL(`/api/terminal/${props.id}/ws`, location.href);
+      const url = apiURL(`/api/terminal/${props.id}/ws`);
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(url); socket = ws; ws.binaryType = "arraybuffer";
       ws.onopen = () => { if (current === generation) { props.onStatus("Connected"); resize(); } };
