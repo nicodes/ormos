@@ -113,13 +113,13 @@ usage:
 
 UI options:
   --port N                 terminal UI port (default 8481)
-  --preview-port N         separate loopback app preview port (default 8482)
   --cwd PATH               initial terminal directory (default home)
-  --hosts HOST:PORT,...     allowed proxy hostnames, including their ports
-  --preview-url ORIGIN     externally reachable preview origin
+  --hosts HOST:PORT,...     allowed UI hostnames, including their ports
   --bind IP                UI bind address (default 127.0.0.1)
 
-Serve the loopback listeners privately through Tailscale Serve for phone access.
+Serve the loopback UI privately through Tailscale Serve for phone access.
+App previews load directly from this machine's hostname and the chosen port.
+Expose each app through Tailscale Serve or bind it to the Tailscale IP.
 There is no application account or login. Trusted network access is required.
 Terminals end when Ormos stops; browser disconnects leave them running.
 
