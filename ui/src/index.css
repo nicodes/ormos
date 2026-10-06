@@ -44,6 +44,11 @@ input:focus, button:focus-visible { outline: 2px solid #9ca3af; outline-offset: 
 .terminal-session { width: 100%; height: 100%; }
 .terminal-container { height: 100%; padding: 6px; overflow: hidden; background: #0b0f19; touch-action: pinch-zoom; }
 .terminal-container .xterm { height: 100%; }
+.terminal-container .xterm .xterm-scrollable-element > .scrollbar > .slider { background: transparent !important; }
+.terminal-container .xterm .scrollbar > .slider::before { content: ""; position: absolute; inset: 0 5px; border-radius: 999px; background: rgb(148 163 184 / 25%); transition: background 120ms ease; }
+.terminal-container .xterm .scrollbar > .slider:hover::before { background: rgb(148 163 184 / 45%); }
+.terminal-container .xterm .scrollbar > .slider.active::before { background: rgb(148 163 184 / 65%); }
+@media (prefers-reduced-motion: reduce) { .terminal-container .xterm .scrollbar > .slider::before { transition: none; } }
 .terminal-menu { position: fixed; z-index: 10; width: 320px; max-width: calc(100vw - 16px); max-height: calc(var(--viewport-height, 100dvh) - 16px); overflow-y: auto; padding: 10px; border: 1px solid #374151; border-radius: 8px; background: #111827; box-shadow: 0 8px 24px #0008; }
 .shortcut-controls > button { width: 100%; margin-bottom: 8px; }
 .terminal-menu-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
