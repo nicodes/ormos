@@ -2,6 +2,7 @@ import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import TerminalPane, { type TerminalControls } from "./TerminalPane";
 import PreviewPane from "./PreviewPane";
 import PaneToggle from "./PaneToggle";
+import TerminalMenu from "./TerminalMenu";
 import { APIError, request, type TerminalRow } from "./api";
 
 type TerminalTab = { id: string; label: string };
@@ -82,11 +83,6 @@ export default function App() {
     })();
     onCleanup(() => { disposed = true; viewport?.removeEventListener("resize", updateHeight); });
   });
-  const keys = [
-    { label: "Esc", data: "\x1b" }, { label: "Tab", data: "\t" }, { label: "Ctrl C", data: "\x03" },
-    { label: "Ctrl D", data: "\x04" }, { label: "↑", data: "\x1b[A" }, { label: "↓", data: "\x1b[B" },
-    { label: "←", data: "\x1b[D" }, { label: "→", data: "\x1b[C" },
-  ];
   return (
     <main class="app">
       <Show when={error()}><div class="error" role="alert">{error()}<button aria-label="Dismiss error" onClick={() => setError("")}>×</button></div></Show>
@@ -95,6 +91,7 @@ export default function App() {
           <PreviewPane origin={previewOrigin()} onError={setError} collapsed={previewCollapsed()} onToggle={togglePreview} />
         </section>
         <section class="pane terminal-pane" classList={{ collapsed: terminalCollapsed() }} aria-label="Terminal">
+          <div class="terminal-header">
           <div class="tabbar" role="tablist" aria-label="Terminal tabs">
             <PaneToggle name="terminal" collapsed={terminalCollapsed()} onToggle={toggleTerminal} controls="terminal-content" />
             <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }}>
@@ -105,15 +102,13 @@ export default function App() {
             </div>}</For>
             <button class="tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
           </div>
+          <TerminalMenu enabled={!!active()} focus={() => { if (terminalCollapsed()) toggleTerminal(); controls.get(active())?.focus(); }} type={data => controls.get(active())?.type(data)} />
+          </div>
           <div id="terminal-content" class="pane-content" hidden={terminalCollapsed()}>
           <div class="terminal-stack">
             <For each={tabs()}>{tab => <div class="terminal-session" hidden={active() !== tab.id}>
               <TerminalPane id={tab.id} onStatus={status => setStatus(tab.id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
             </div>}</For>
-          </div>
-          <div class="terminal-keys">
-            <button onClick={() => controls.get(active())?.focus()}>Keyboard</button>
-            <For each={keys}>{key => <button onPointerDown={e => e.preventDefault()} onClick={() => controls.get(active())?.type(key.data)}>{key.label}</button>}</For>
           </div>
           </div>
         </section>

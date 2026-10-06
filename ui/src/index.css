@@ -37,8 +37,18 @@ input:focus, button:focus-visible { outline: 2px solid #4ade80; outline-offset: 
 .terminal-session { width: 100%; height: 100%; }
 .terminal { height: 100%; padding: 10px 8px 4px 12px; overflow: hidden; }
 .terminal .xterm { height: 100%; }
-.terminal-keys { display: flex; gap: 5px; padding: 6px 8px; border-top: 1px solid #1f2937; overflow-x: auto; flex: none; }
-.terminal-keys button { font-size: 12px; padding: 7px 10px; min-height: 34px; }
+.terminal-header { display: flex; flex: none; min-width: 0; background: #111827; }
+.terminal-header .tabbar { flex: 1; min-width: 0; }
+.terminal-menu-toggle { display: flex; align-items: center; justify-content: center; flex: none; width: 42px; border: 0; border-bottom: 1px solid #1f2937; border-left: 1px solid #1f2937; border-radius: 0; padding: 9px; background: #111827; }
+.terminal-menu-toggle svg, .preview-open svg { width: 20px; height: 20px; }
+.preview-open { display: flex; align-items: center; justify-content: center; flex: none; width: 32px; height: 32px; border-radius: 6px; color: #d1d5db; }
+.preview-open:hover { background: #374151; color: #fff; }
+.preview-open:focus-visible { outline: 2px solid #4ade80; }
+.preview-open[aria-disabled="true"] { opacity: .4; pointer-events: none; }
+.terminal-menu { position: fixed; z-index: 10; width: 224px; max-width: calc(100vw - 16px); max-height: calc(var(--viewport-height, 100dvh) - 16px); overflow-y: auto; padding: 10px; border: 1px solid #374151; border-radius: 8px; background: #111827; box-shadow: 0 8px 24px #0008; }
+.terminal-menu > button { width: 100%; margin-bottom: 8px; }
+.terminal-menu-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.terminal-menu button { font-size: 13px; min-height: 36px; }
 iframe { flex: 1; width: 100%; min-height: 0; border: 0; background: white; }
 .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; text-align: center; }
 .preview-symbol { font-size: 30px; color: #4ade80; margin-bottom: 15px; }
@@ -46,5 +56,4 @@ iframe { flex: 1; width: 100%; min-height: 0; border: 0; background: white; }
 .empty p { font-size: 14px; color: #9ca3af; line-height: 1.7; margin: 0; }
 @media (max-width: 760px) {
  .terminal { padding: 7px 4px 2px 8px; }
- .terminal-keys { padding: 5px 8px; }
 }
