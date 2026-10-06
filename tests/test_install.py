@@ -113,6 +113,17 @@ else:
         calls = [json.loads(row) for row in self.calls.read_text().splitlines()]
         self.assertFalse(any(arg.endswith('/latest') for call in calls for arg in call))
 
+    def test_version_alias_and_explicit_latest(self):
+        for flag in ["--version", "-v"]:
+            for version in ["0.2.0", "v0.2.0", "latest"]:
+                with self.subTest(flag=flag, version=version):
+                    result = self.run_install(flag, version)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+        for flag in ["--version", "-v"]:
+            result = self.run_install(flag)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("needs a value", result.stderr)
+
     def test_rosetta_uses_native_arm64(self):
         self.env.update(TEST_OS="Darwin", TEST_ARCH="x86_64", TEST_ROSETTA="1")
         self.archive("Darwin", "arm64")
