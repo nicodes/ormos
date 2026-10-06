@@ -64,5 +64,5 @@ export default function TerminalPane(props: {
       input.dispose(); terminal.dispose(); props.register(props.id);
     });
   });
-  return <div class="terminal" ref={container} />;
+  return <div class="terminal-container" ref={container} />;
 }
