@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from "solid-js";
+import { createEffect, createSignal, For, on, Show } from "solid-js";
 
 type SavedItem = { id: string; title: string; text: string };
 const load = (storageKey: string, kind: "command" | "prompt"): SavedItem[] => {
@@ -9,7 +9,7 @@ const load = (storageKey: string, kind: "command" | "prompt"): SavedItem[] => {
   return [];
 };
 
-export default function SavedItems(props: { kind: "command" | "prompt"; enabled: boolean; use: (text: string) => void }) {
+export default function SavedItems(props: { kind: "command" | "prompt"; createRequest: number; enabled: boolean; use: (text: string) => void }) {
   const kind = props.kind;
   const storageKey = kind === "command" ? "ormos.savedCommands" : "ormos.savedPrompts";
   const action = kind === "command" ? "Run" : "Paste";
@@ -23,6 +23,7 @@ export default function SavedItems(props: { kind: "command" | "prompt"; enabled:
     setTitle(row?.title ?? ""); setCommand(row?.text ?? ""); setError(""); setEditing(row?.id ?? "");
     titleInput?.focus();
   };
+  createEffect(on(() => props.createRequest, () => edit(), { defer: true }));
   const persist = (rows: SavedItem[]) => {
     try { localStorage.setItem(storageKey, JSON.stringify(rows.map(row => ({ id: row.id, title: row.title, [kind]: row.text })))); setCommands(rows); setError(""); return true; }
     catch { setError(`Could not save ${kind}s in this browser.`); return false; }
@@ -36,7 +37,7 @@ export default function SavedItems(props: { kind: "command" | "prompt"; enabled:
   return <div class="saved-commands">
     <Show when={error()}><p class="saved-command-error" role="alert">{error()}</p></Show>
     <Show when={editing() !== null} fallback={<>
-      <div class="saved-command-heading"><span>Saved in this browser</span><button type="button" onClick={() => edit()}>{`Add ${kind}`}</button></div>
+      <div class="saved-command-heading"><span>Saved in this browser</span></div>
       <Show when={commands().length} fallback={<p class="saved-command-empty">{`No saved ${kind}s yet.`}</p>}>
         <ul class="saved-command-list"><For each={commands()}>{row => <li>
           <div class="saved-command-row"><strong>{row.title}</strong>

@@ -63,8 +63,9 @@ iframe { flex: 1; width: 100%; min-height: 0; border: 0; background: #0b0f19; }
 }
 button, .header-icon { -webkit-tap-highlight-color: transparent; }
 
-.terminal-menu-tabs { display: flex; gap: 6px; position: sticky; top: -10px; z-index: 1; margin-bottom: 10px; padding: 0 0 8px; border-bottom: 1px solid #374151; background: #111827; }
-.terminal-menu-tabs button { display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 7px; border: 1px solid transparent; background: transparent; }
+.terminal-menu-tabbar { display: flex; align-items: center; gap: 6px; position: sticky; top: -10px; z-index: 1; margin-bottom: 10px; padding: 0 0 8px; border-bottom: 1px solid #374151; background: #111827; }
+.terminal-menu-tabs { display: flex; flex: 1; gap: 6px; }
+.terminal-menu-tabs button, .saved-item-add { display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; padding: 7px; border: 1px solid transparent; background: transparent; }
 .terminal-menu-tabs button[aria-selected="true"] { border-color: #4ade80; background: #0b0f19; }
 .terminal-menu svg { width: 20px; height: 20px; flex: none; }
 .saved-command-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

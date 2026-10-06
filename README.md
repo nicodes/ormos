@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: edaf3b29ae11dd4ae11b7443f7271f936250e87d5119565cf3682eabd66aa7f0 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 54151be621338673bec567b3248275c851168d6120f6693c2340f6dc0ea4be20 -->
 
 # Ormos
 
@@ -38,3 +38,5 @@ tailscale serve --bg --https=8482 http://127.0.0.1:8482
 Visit `https://box.example.ts.net:8481` from a device on the same tailnet with network permission to reach both ports. There is no application login: anyone permitted to reach the listener can control its terminals. Keep this service private and grant access only to trusted devices/users. Ormos rejects foreign browser origins and unlisted proxy hostnames.
 
 Terminals belong to the running Ormos process and end when it stops. The preview keeps one address and navigation history. The proxy's selected port is shared across separate Ormos browser windows, so use one workspace window when previewing different apps. `ormos relay` and `ormos --config PATH` remain for legacy compatibility; the former hosted backend is deprecated.
+
+In the terminal popup, the plus icon at the right of the tabs adds a command or prompt to the selected list. It is hidden on the keyboard tab.
