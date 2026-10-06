@@ -72,10 +72,13 @@ button, .header-icon { -webkit-tap-highlight-color: transparent; }
 .saved-command-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 12px; }
 .saved-command-list li { min-width: 0; }
 .saved-command-row { display: flex; align-items: center; gap: 8px; }
-.saved-command-row strong { flex: 1; min-width: 0; font-size: 14px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.saved-command-row strong { display: block; font-size: 14px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .saved-command-row .saved-command-actions { flex-shrink: 0; }
-.saved-command-row button { width: 32px; height: 36px; padding: 6px; border: 0; background: transparent; }
-.saved-command-row button:not(:disabled):hover, .saved-command-row button:not(:disabled):active { background: transparent; }
+.saved-command-row .saved-command-actions button { width: 32px; height: 36px; padding: 6px; border: 0; background: transparent; }
+.saved-command-list button:not(:disabled):hover, .saved-command-list button:not(:disabled):active { background: transparent; }
+.saved-item-title, .saved-item-text { min-width: 0; padding: 0; border: 0; background: transparent; text-align: left; }
+.saved-item-title { flex: 1; overflow: hidden; }
+.saved-item-text { display: block; width: 100%; }
 .saved-command-list code { display: block; margin: 6px 0 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; color: #9ca3af; }
 .saved-command-actions { display: flex; align-items: center; gap: 6px; }
 .saved-command-actions button { display: flex; align-items: center; justify-content: center; }

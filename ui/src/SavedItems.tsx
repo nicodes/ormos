@@ -39,12 +39,11 @@ export default function SavedItems(props: { kind: "command" | "prompt"; createRe
     <Show when={editing() !== null} fallback={<>
       <Show when={commands().length} fallback={<p class="saved-command-empty">{`No saved ${kind}s`}</p>}>
         <ul class="saved-command-list"><For each={commands()}>{row => <li>
-          <div class="saved-command-row"><strong>{row.title}</strong>
+          <div class="saved-command-row"><button class="saved-item-title" type="button" disabled={!props.enabled} aria-label={`${action} ${row.title}`} title={`${action} ${row.title}`} onClick={() => props.use(row.text)}><strong>{row.title}</strong></button>
           <div class="saved-command-actions">
-            <button type="button" disabled={!props.enabled} aria-label={`${action} ${row.title}`} title={action} onClick={() => props.use(row.text)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><Show when={kind === "command"} fallback={<><rect x="6" y="5" width="14" height="16" rx="2" /><path d="M9 5V3H3v14h3M10 10h6M10 14h6" /></>}><path d="m8 4 12 8-12 8V4Z" /></Show></svg></button>
             <button type="button" aria-label={`Edit ${row.title}`} title={`Edit ${kind}`} onClick={() => edit(row)}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 3 5 5-12 12-6 1 1-6L16 3Zm-2 2 5 5" /></svg></button>
             <button type="button" aria-label={`Delete ${row.title}`} title={`Delete ${kind}`} onClick={() => persist(commands().filter(item => item.id !== row.id))}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7" /></svg></button>
-          </div></div><code title={row.text}>{row.text}</code>
+          </div></div><button class="saved-item-text" type="button" disabled={!props.enabled} aria-label={`${action} ${kind}: ${row.title}`} title={row.text} onClick={() => props.use(row.text)}><code>{row.text}</code></button>
         </li>}</For></ul>
       </Show>
     </>}>
