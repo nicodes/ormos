@@ -94,3 +94,21 @@ func TestUsageNamesTheUI(t *testing.T) {
 		t.Fatal("usage() does not name `ormos ui`")
 	}
 }
+
+func TestMainDefaultsToLocalUIWithoutRelay(t *testing.T) {
+	oldUI, oldRun := uiMainFn, runSystemFn
+	t.Cleanup(func() { uiMainFn, runSystemFn = oldUI, oldRun })
+	calls := 0
+	uiMainFn = func(args []string, version string) error {
+		calls++
+		if len(args) != 0 {
+			t.Fatal(args)
+		}
+		return nil
+	}
+	runSystemFn = func() { t.Fatal("default startup reached deprecated relay") }
+	Main(nil, "test")
+	if calls != 1 {
+		t.Fatalf("UI calls: %d", calls)
+	}
+}

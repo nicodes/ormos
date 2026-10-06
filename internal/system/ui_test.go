@@ -79,7 +79,14 @@ func (f *uiFixture) start(t *testing.T) *httptest.Server {
 
 func postJSON(t *testing.T, url string, body string) (int, map[string]any) {
 	t.Helper()
-	res, err := http.Post(url, "application/json", bytes.NewBufferString(body))
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	origin := url[:strings.Index(url[7:], "/")+7]
+	req.Header.Set("Origin", origin)
+	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
