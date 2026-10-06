@@ -5,13 +5,10 @@ package system
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -103,55 +100,36 @@ func TestUIWebSocketRejectsForeignOrigin(t *testing.T) {
 	}
 }
 
-func TestUIPreviewRootAssetsAndPolicy(t *testing.T) {
-	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmtBody := r.URL.Path + "?" + r.URL.RawQuery
-		io.WriteString(w, fmtBody)
-	}))
-	defer app.Close()
-	u, _ := url.Parse(app.URL)
-	port, _ := strconv.Atoi(u.Port())
+func TestUIDirectAppsCannotControlTerminals(t *testing.T) {
 	fix := newUIFixture(t, nil)
-	uiLoadPolicy = func() (policy, error) { return policy{AllowedPorts: []int{port}}, nil }
-	preview := httptest.NewServer(fix.srv.previewRoutes())
-	defer preview.Close()
-	req, _ := http.NewRequest(http.MethodGet, preview.URL+"/assets/app.js?v=2", nil)
-	req.AddCookie(&http.Cookie{Name: "ormos_preview_port", Value: strconv.Itoa(port)})
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+	fix.srv.hosts = []string{"devbox:8481"}
+	for _, origin := range []string{"http://devbox:3000", "http://devbox:39123"} {
+		req := httptest.NewRequest(http.MethodPost, "http://devbox:8481/api/action", strings.NewReader(`{"action":"open"}`))
+		req.Header.Set("Origin", origin)
+		res := httptest.NewRecorder()
+		fix.srv.routes().ServeHTTP(res, req)
+		if res.Code != http.StatusForbidden {
+			t.Fatalf("app origin %q could control terminals: %d", origin, res.Code)
+		}
 	}
-	data, _ := io.ReadAll(res.Body)
-	res.Body.Close()
-	if res.StatusCode != 200 || string(data) != "/assets/app.js?v=2" {
-		t.Fatalf("asset proxy: %d %q", res.StatusCode, data)
+	if fix.spawnLog.Len() != 0 {
+		t.Fatal("preview app spawned a shell")
 	}
-	req, _ = http.NewRequest(http.MethodGet, preview.URL+"/__ormos_preview/5432/", nil)
-	res, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestUIDirectPreviewContentPolicy(t *testing.T) {
+	fix := newUIFixture(t, nil)
+	fix.srv.hosts = []string{"devbox:8481"}
+	res := httptest.NewRecorder()
+	fix.srv.routes().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "http://devbox:8481/", nil))
+	csp := res.Header().Get("Content-Security-Policy")
+	for _, directive := range []string{"script-src 'self'", "frame-src http://devbox:* https://devbox:*", "connect-src 'self' http://devbox:* https://devbox:*", "frame-ancestors 'none'"} {
+		if !strings.Contains(csp, directive) {
+			t.Fatalf("missing %q in CSP %q", directive, csp)
+		}
 	}
-	res.Body.Close()
-	if res.StatusCode != http.StatusForbidden {
-		t.Fatalf("database proxy: %d", res.StatusCode)
-	}
-	fix.srv.blockedPorts = []int{port}
-	res, err = http.Get(preview.URL + "/__ormos_preview/" + strconv.Itoa(port) + "/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	res.Body.Close()
-	if res.StatusCode != http.StatusForbidden {
-		t.Fatalf("self proxy: %d", res.StatusCode)
-	}
-	uiLoadPolicy = func() (policy, error) { return policy{}, os.ErrPermission }
-	res, err = http.Get(preview.URL + "/__ormos_preview/3000/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	res.Body.Close()
-	if res.StatusCode != http.StatusForbidden {
-		t.Fatalf("unreadable policy: %d", res.StatusCode)
+	if strings.Contains(csp, "http://*:*") || strings.Contains(csp, "https://*:*") {
+		t.Fatal("content policy permits unrelated preview hosts")
 	}
 }
 
@@ -172,85 +150,21 @@ func TestUIExitedTerminalDoesNotConsumeCapacity(t *testing.T) {
 	}
 }
 
-func TestUIPreviewWebSocketUpgrade(t *testing.T) {
-	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, err := r.Cookie("ormos_preview_port"); err == nil {
-			t.Error("selector cookie leaked upstream")
-		}
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{OriginPatterns: []string{"*"}})
-		if err != nil {
-			return
-		}
-		defer conn.CloseNow()
-		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
-		defer cancel()
-		kind, data, err := conn.Read(ctx)
-		if err == nil {
-			conn.Write(ctx, kind, data)
-		}
-	}))
-	defer app.Close()
-	u, _ := url.Parse(app.URL)
-	port, _ := strconv.Atoi(u.Port())
+func TestUINewTerminalUsesHomeByDefault(t *testing.T) {
 	fix := newUIFixture(t, nil)
-	uiLoadPolicy = func() (policy, error) { return policy{AllowedPorts: []int{port}}, nil }
-	preview := httptest.NewServer(fix.srv.previewRoutes())
-	defer preview.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(preview.URL, "http")+"/hmr", &websocket.DialOptions{HTTPHeader: http.Header{
-		"Origin": []string{preview.URL}, "Cookie": []string{"ormos_preview_port=" + strconv.Itoa(port)},
-	}})
+	server := fix.start(t)
+	if code, _ := postJSON(t, server.URL+"/api/action", `{"action":"open","shell":"/bin/sh"}`); code != 200 {
+		t.Fatal(code)
+	}
+	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.CloseNow()
-	if err := conn.Write(ctx, websocket.MessageText, []byte("hot reload")); err != nil {
-		t.Fatal(err)
-	}
-	_, data, err := conn.Read(ctx)
-	if err != nil || string(data) != "hot reload" {
-		t.Fatalf("upgrade: %q %v", data, err)
-	}
-}
-
-func TestUIPreviewUnavailablePage(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	home, err = filepath.EvalSymlinks(home)
 	if err != nil {
 		t.Fatal(err)
 	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
-	fix := newUIFixture(t, nil)
-	uiLoadPolicy = func() (policy, error) { return policy{AllowedPorts: []int{port}}, nil }
-	preview := httptest.NewServer(fix.srv.previewRoutes())
-	defer preview.Close()
-	req, _ := http.NewRequest(http.MethodGet, preview.URL+"/", nil)
-	req.AddCookie(&http.Cookie{Name: "ormos_preview_port", Value: strconv.Itoa(port)})
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	data, err := io.ReadAll(res.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if res.StatusCode != http.StatusBadGateway {
-		t.Fatalf("status: %d", res.StatusCode)
-	}
-	if res.Header.Get("Content-Type") != "text/html; charset=utf-8" {
-		t.Fatalf("content type: %q", res.Header.Get("Content-Type"))
-	}
-	if res.Header.Get("Cache-Control") != "no-store" {
-		t.Fatal("unavailable preview could be cached after the app starts")
-	}
-	for _, text := range []string{"<h1>No app listening</h1>", "refresh the preview."} {
-		if !strings.Contains(string(data), text) {
-			t.Fatalf("missing %q in unavailable page", text)
-		}
-	}
-	if strings.Contains(string(data), "connect: connection refused") {
-		t.Fatal("raw proxy error leaked into the page")
+	if !strings.Contains(fix.spawnLog.String(), "/bin/sh\x00"+home+"\n") {
+		t.Fatalf("default terminal cwd: %q", fix.spawnLog.String())
 	}
 }

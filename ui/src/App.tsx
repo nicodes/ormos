@@ -20,7 +20,6 @@ export default function App() {
   const [editing, setEditing] = createSignal("");
   const [draftName, setDraftName] = createSignal("");
   const [statuses, setStatuses] = createSignal<Record<string, string>>({});
-  const [previewOrigin, setPreviewOrigin] = createSignal("");
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(true);
   const [view, setView] = createSignal<"terminal" | "preview">(localStorage.getItem("ormos.view") === "preview" ? "preview" : "terminal");
@@ -80,11 +79,8 @@ export default function App() {
     viewport?.addEventListener("resize", updateHeight); updateHeight();
     void (async () => {
       try {
-        const [workspace, terminals] = await Promise.all([
-          request<{ previewURL: string }>("/api/workspace"), request<{ terminals: TerminalRow[] }>("/api/terminals"),
-        ]);
+        const terminals = await request<{ terminals: TerminalRow[] }>("/api/terminals");
         if (disposed) return;
-        setPreviewOrigin(workspace.previewURL);
         const saved = savedTerminals();
         nextNumber = Math.max(0, ...saved.map(tab => Number(/\d+$/.exec(tab.label)?.[0] ?? 0))) + 1;
         const retained = saved.filter(tab => terminals.terminals.some(row => row.id === tab.id && row.alive));
@@ -135,7 +131,7 @@ export default function App() {
         </header>
         <div class="workspace-body">
           <section class="pane preview-pane" aria-label="App preview" aria-hidden={view() !== "preview"} inert={view() !== "preview"}>
-            <Show when={headerMount()}>{mount => <PreviewPane origin={previewOrigin()} onError={setError} header={mount()} visible={view() === "preview"} />}</Show>
+            <Show when={headerMount()}>{mount => <PreviewPane onError={setError} header={mount()} visible={view() === "preview"} />}</Show>
           </section>
           <section class="pane terminal-pane" aria-label="Terminal" aria-hidden={view() !== "terminal"} inert={view() !== "terminal"}>
           <div id="terminal-content" class="pane-content">

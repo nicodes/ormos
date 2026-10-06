@@ -102,27 +102,22 @@ func (t *uiTerminal) append(p []byte) {
 }
 
 type uiServer struct {
-	version      string
-	static       fs.FS
-	hostname     string
-	mu           sync.Mutex
-	terms        map[string]*uiTerminal
-	starting     int
-	hosts        []string
-	previewURL   string
-	defaultCwd   string
-	controlPort  int
-	blockedPorts []int
+	version    string
+	static     fs.FS
+	hostname   string
+	mu         sync.Mutex
+	terms      map[string]*uiTerminal
+	starting   int
+	hosts      []string
+	defaultCwd string
 }
 
 func RunUI(args []string, version string) error {
 	fsflags := flag.NewFlagSet("ui", flag.ContinueOnError)
 	bind := fsflags.String("bind", uiDefaultBind, "address to listen on (default loopback; set the tailnet interface address to reach it from your tailnet)")
 	port := fsflags.Int("port", uiDefaultPort, "port to listen on")
-	previewPort := fsflags.Int("preview-port", 8482, "loopback port for isolated app previews")
-	previewURL := fsflags.String("preview-url", "", "public preview origin, e.g. https://box.tailnet.ts.net:8482")
 	cwd := fsflags.String("cwd", "", "initial working directory for terminals (default home)")
-	hosts := fsflags.String("hosts", "", "comma-separated allowed proxy host:port names")
+	hosts := fsflags.String("hosts", "", "comma-separated allowed UI host:port names")
 	if err := fsflags.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return nil
@@ -137,14 +132,6 @@ func RunUI(args []string, version string) error {
 	}
 	if *port < 1 || *port > 65535 {
 		return fmt.Errorf("--port must be 1-65535, got %d", *port)
-	}
-	if *previewPort < 1 || *previewPort > 65535 || *previewPort == *port {
-		return fmt.Errorf("--preview-port must be 1-65535 and different from --port")
-	}
-	if *previewURL != "" {
-		if err := validatePreviewOrigin(*previewURL); err != nil {
-			return err
-		}
 	}
 	if *cwd == "" {
 		*cwd, _ = os.UserHomeDir()
@@ -165,29 +152,17 @@ func RunUI(args []string, version string) error {
 		return err
 	}
 	defer ln.Close()
-	previewLn, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(*previewPort)))
-	if err != nil {
-		return err
-	}
-	defer previewLn.Close()
-	previewOrigin := *previewURL
-	if previewOrigin == "" {
-		previewOrigin = "http://127.0.0.1:" + strconv.Itoa(*previewPort)
-	}
 	local := &uiServer{version: version, static: static, hostname: host,
 		terms: map[string]*uiTerminal{}, hosts: strings.Split(*hosts, ","),
-		previewURL: previewOrigin, defaultCwd: *cwd, controlPort: *port, blockedPorts: []int{*port, *previewPort}}
+		defaultCwd: *cwd}
 	defer local.closeTerminals()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	srv := &http.Server{Handler: local.routes(), ReadHeaderTimeout: 10 * time.Second}
-	previews := &http.Server{Handler: local.previewRoutes(), ReadHeaderTimeout: 10 * time.Second}
 	defer srv.Close()
-	defer previews.Close()
-	failed := make(chan error, 2)
+	failed := make(chan error, 1)
 	go func() { failed <- srv.Serve(ln) }()
-	go func() { failed <- previews.Serve(previewLn) }()
-	fmt.Printf("ormos ui on http://%s (preview %s)\n", ln.Addr(), previewOrigin)
+	fmt.Printf("ormos ui on http://%s\n", ln.Addr())
 	select {
 	case <-ctx.Done():
 		return nil
@@ -216,9 +191,6 @@ func validateUIBind(bind string) error {
 func (s *uiServer) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/system", s.apiSystem)
-	mux.HandleFunc("GET /api/workspace", func(w http.ResponseWriter, r *http.Request) {
-		uiJSON(w, map[string]any{"previewURL": s.previewURL, "defaultCwd": s.defaultCwd})
-	})
 	mux.HandleFunc("GET /api/terminal/{id}/ws", s.terminalWS)
 	mux.HandleFunc("GET /api/ports", s.apiPorts)
 	mux.HandleFunc("GET /api/terminals", s.apiTerminals)
@@ -545,7 +517,7 @@ func expandUIRoot(root string) (string, error) {
 
 // spawnUITerminal opens one PTY on this machine. There is no relay in this
 // path: no admission, no fence, no handshake -- the local UI is the only
-// client, and the session dies when it does.
+// client. The PTY belongs to this server and survives browser disconnects.
 func spawnUITerminal(shell, cwd string) (*uiTerminal, error) {
 	id := newUIID()
 	cmd := exec.Command(shell)

@@ -61,6 +61,7 @@ jobs:
           cd ui
           npm ci
           npm run typecheck
+          npm test
           npm run build
           cd ..
           if ! git diff --exit-code --stat internal/ui/dist; then
@@ -75,6 +76,14 @@ jobs:
       # comment and the header above said "build, then test".)
       - name: Build
         uses: ./.github/actions/build
+
+      - name: Direct preview browser regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd ui
+          npx playwright install --with-deps chromium
+          ORMOS_TEST_BINARY="$GITHUB_WORKSPACE/dist/ormos_Linux_x86_64/ormos" npm run test:browser
 
       - name: Test
         uses: ./.github/actions/test
