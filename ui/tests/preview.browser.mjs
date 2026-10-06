@@ -27,6 +27,30 @@ test('direct previews work without app CORS, proxy cookies or rewritten HTML', {
   assert(process.env.ORMOS_TEST_BINARY, 'Set ORMOS_TEST_BINARY to a built Ormos executable.');
   const home = await mkdtemp(path.join(tmpdir(), 'ormos-direct-'));
   t.after(() => rm(home, { recursive: true, force: true }));
+  // A local fullscreen app exercises the same alternate-screen/mouse protocol
+  // as interactive coding tools, without credentials or API calls.
+  await writeFile(path.join(home, 'scroll-app.py'), `import sys, tty, termios, re
+original = termios.tcgetattr(0)
+tty.setraw(0)
+position = 100
+pending = ''
+try:
+    sys.stdout.write('\\x1b[?1049h\\x1b[?1000h\\x1b[?1006h\\x1b[2J\\x1b[HAPP_SCROLL_0100')
+    sys.stdout.flush()
+    while True:
+        pending += sys.stdin.read(1)
+        if 'q' in pending: break
+        match = re.search(r'\\x1b\\[<(64|65);(\\d+);(\\d+)M', pending)
+        if match:
+            position += -1 if match[1] == '64' else 1
+            pending = pending[match.end():]
+            sys.stdout.write('\\x1b[H\\x1b[2KAPP_SCROLL_%04d' % position)
+            sys.stdout.flush()
+finally:
+    sys.stdout.write('\\x1b[?1006l\\x1b[?1000l\\x1b[?1049l')
+    sys.stdout.flush()
+    termios.tcsetattr(0, termios.TCSADRAIN, original)
+`);
   const first = await app('First app');
   const second = await app('Second app');
   const unused = await listen((_req, res) => res.end());
@@ -74,6 +98,43 @@ test('direct previews work without app CORS, proxy cookies or rewritten HTML', {
         await page.keyboard.type("DIRECT_STATE=kept; printf 'DIRECT_%s\\n' OK");
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('DIRECT_OK'));
+        await page.keyboard.type("i=1; while [ \"$i\" -le 200 ]; do printf 'SCROLL_ROW_%04d\\n' \"$i\"; i=$((i+1)); done");
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
+        const screen = await page.locator('.xterm-screen').boundingBox();
+        const x = screen.x + screen.width / 2;
+        const y = screen.y + screen.height / 2;
+        const scroll = async distance => {
+          if (!touch) { await page.mouse.move(x, y); await page.mouse.wheel(0, -distance); return; }
+          const session = await context.newCDPSession(page);
+          try {
+            await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+            for (let step = 1; step <= 10; step++) {
+              await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + distance * step / 10 }] });
+            }
+            await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+          } finally { await session.detach(); }
+        };
+        await scroll(240);
+        await page.waitForFunction(() => {
+          const lines = document.querySelector('.xterm-screen').textContent.match(/SCROLL_ROW_(\d+)/g) || [];
+          return lines.length > 0 && !lines.includes('SCROLL_ROW_0200');
+        }, null, { timeout: 3000 });
+        assert.equal(await page.evaluate(() => window.scrollY), 0, 'Scrolling must stay inside the terminal');
+        await scroll(-240);
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
+        await page.locator('.xterm-helper-textarea').focus();
+        await page.keyboard.type('python3 "$HOME/scroll-app.py"');
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('APP_SCROLL_0100'));
+        const appPosition = () => page.evaluate(() => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]));
+        await scroll(240);
+        await page.waitForFunction(() => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]) < 100, null, { timeout: 3000 });
+        const previous = await appPosition();
+        await scroll(-240);
+        await page.waitForFunction(previous => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]) > previous, previous, { timeout: 3000 });
+        await page.keyboard.type('q');
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
         await page.getByRole('button', { name: 'Show preview', exact: true }).click();
         const address = page.getByRole('combobox', { name: 'Preview address' });
         const navigate = async value => { await address.fill(value); await address.press('Enter'); };
