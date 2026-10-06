@@ -10,6 +10,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.3.3",
+    "playwright": "1.63.0",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2",
     "vite": "8.3.0",
@@ -18,7 +19,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test:browser": "node --test tests/preview.browser.mjs"
   },
   "overrides": {
     "seroval": "1.6.8",
