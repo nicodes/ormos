@@ -18,6 +18,17 @@ description: >
 runs:
   using: composite
   steps:
+    - name: Installer regression
+      shell: bash
+      run: |
+        set -euo pipefail
+        shellcheck install.sh
+        if [ -f dist/ormos_Linux_x86_64.tar.gz ]; then
+          export ORMOS_INSTALL_TEST_ARCHIVE="$PWD/dist/ormos_Linux_x86_64.tar.gz"
+          export ORMOS_INSTALL_TEST_VERSION="$(dist/ormos_Linux_x86_64/ormos --version)"
+        fi
+        python3 -m unittest discover -s tests -p 'test_install.py' -v
+
     # Cheapest first, and the one most likely to be the only thing wrong.
     - name: Go formatting
       shell: bash

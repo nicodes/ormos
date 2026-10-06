@@ -66,7 +66,8 @@ runs:
         build darwin amd64 Darwin x86_64
         build darwin arm64 Darwin arm64
 
-        (cd dist && sha256sum -- *.tar.gz > checksums.txt)
+        cp install.sh dist/install.sh
+        (cd dist && sha256sum -- *.tar.gz install.sh > checksums.txt)
 
     # The archive is what people download, so the check is run against what came
     # out of the archive rather than against the tree it was built from. Only

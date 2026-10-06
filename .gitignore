@@ -2,3 +2,6 @@
 # COMMITTED export (see internal/ui/embed.go), so these are anchored at /ui.
 /ui/node_modules/
 /ui/dist/
+
+# Installer regression fixtures are Python scripts.
+__pycache__/
