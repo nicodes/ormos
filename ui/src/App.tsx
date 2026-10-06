@@ -17,6 +17,9 @@ function savedTerminals(): TerminalTab[] {
 export default function App() {
   const [tabs, setTabs] = createSignal<TerminalTab[]>([]);
   const [active, setActive] = createSignal("");
+  const [editing, setEditing] = createSignal("");
+  const [draftName, setDraftName] = createSignal("");
+  let nameInput: HTMLInputElement | undefined;
   const [statuses, setStatuses] = createSignal<Record<string, string>>({});
   const [previewOrigin, setPreviewOrigin] = createSignal("");
   const [error, setError] = createSignal("");
@@ -24,6 +27,7 @@ export default function App() {
   const [view, setView] = createSignal<"terminal" | "preview">(localStorage.getItem("ormos.view") === "preview" ? "preview" : "terminal");
   const [headerMount, setHeaderMount] = createSignal<HTMLDivElement>();
   const switchView = () => {
+    saveName();
     setView(previous => previous === "terminal" ? "preview" : "terminal");
     localStorage.setItem("ormos.view", view());
   };
@@ -34,7 +38,17 @@ export default function App() {
     localStorage.setItem("ormos.terminalTabs", JSON.stringify(tabs()));
     localStorage.setItem("ormos.activeTerminal", active());
   };
-  const select = (id: string) => { setActive(id); persist(); };
+  const rename = (tab: TerminalTab) => {
+    setDraftName(tab.label); setEditing(tab.id);
+    nameInput?.focus(); nameInput?.select();
+  };
+  const saveName = () => {
+    const id = editing(); if (!id) return;
+    const label = draftName().trim(); setEditing("");
+    if (label) setTabs(rows => rows.map(tab => tab.id === id ? { ...tab, label } : tab));
+    persist();
+  };
+  const select = (id: string) => { saveName(); setActive(id); persist(); };
   const addTerminal = async () => {
     if (busy()) return;
     setBusy(true); setError("");
@@ -47,6 +61,7 @@ export default function App() {
     finally { if (!disposed) setBusy(false); }
   };
   const closeTerminal = async (id: string) => {
+    saveName();
     try {
       await request("/api/action", { action: "kill", id });
     } catch (e) {
@@ -100,10 +115,17 @@ export default function App() {
           <Show when={view() === "terminal"}>
           <div class="tabbar" role="tablist" aria-label="Terminal tabs">
             <For each={tabs()}>{tab => <div class="tab" classList={{ selected: active() === tab.id }}>
-              <button role="tab" aria-selected={active() === tab.id} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
+              <Show when={editing() === tab.id} fallback={<button role="tab" aria-selected={active() === tab.id} title={statuses()[tab.id] ?? "Connecting"} onClick={() => select(tab.id)}>
                 <i class="status-dot" classList={{ online: statuses()[tab.id] === "Connected", exited: statuses()[tab.id] === "Exited" }} />{tab.label}
-              </button>
+              </button>}>
+                <input class="tab-name" aria-label="Terminal tab name" maxlength={80} value={draftName()} ref={element => { nameInput = element; }} onInput={event => setDraftName(event.currentTarget.value)} onBlur={saveName} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); saveName(); } else if (event.key === "Escape") { event.preventDefault(); setEditing(""); } }} />
+              </Show>
+              <Show when={active() === tab.id}>
+                <Show when={editing() !== tab.id}><button class="header-icon" aria-label={`Rename ${tab.label}`} title="Rename terminal" onClick={() => rename(tab)}>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m16 3 5 5-12 12-6 1 1-6L16 3Zm-2 2 5 5" /></svg>
+                </button></Show>
               <button class="header-icon tab-close" aria-label={`Close ${tab.label}`} onClick={() => void closeTerminal(tab.id)}>×</button>
+              </Show>
             </div>}</For>
             <button class="header-icon tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
           </div>
@@ -120,8 +142,8 @@ export default function App() {
           <section class="pane terminal-pane" aria-label="Terminal" hidden={view() !== "terminal"}>
           <div id="terminal-content" class="pane-content">
           <div class="terminal-stack">
-            <For each={tabs()}>{tab => <div class="terminal-session" hidden={active() !== tab.id}>
-              <TerminalPane id={tab.id} onStatus={status => setStatus(tab.id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
+            <For each={tabs().map(tab => tab.id)}>{id => <div class="terminal-session" hidden={active() !== id}>
+              <TerminalPane id={id} onStatus={status => setStatus(id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
             </div>}</For>
           </div>
           </div>
