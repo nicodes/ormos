@@ -3,40 +3,22 @@ import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Sh
 import { Portal } from "solid-js/web";
 import BrowserMenu from "./BrowserMenu";
 import { request } from "./api";
+import { parsePreviewAddress, previewURL, type PreviewTarget } from "./preview";
 
-export type PreviewTarget = { port: number; path: string };
 type PreviewHistory = { history: PreviewTarget[]; index: number };
 const addressFor = (target?: PreviewTarget) => target ? `${target.port}${target.path}` : "";
 
-export function parsePreviewAddress(raw: string, currentPort?: number): PreviewTarget {
-  const value = raw.trim();
-  let port: number;
-  let path: string;
-  const short = /^:?(\d{1,5})([/?#].*)?$/.exec(value);
-  if (short) { port = Number(short[1]); path = short[2] ?? "/"; }
-  else if (/^https?:\/\//i.test(value)) {
-    const url = new URL(value);
-    const allowed = new Set(["localhost", "127.0.0.1", "[::1]", location.hostname]);
-    if (!allowed.has(url.hostname) || url.username || url.password) throw new Error("Use a local app port or localhost URL.");
-    port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
-    if (url.protocol !== "http:") throw new Error("Local app previews currently use HTTP.");
-    path = url.pathname + url.search + url.hash;
-  } else if (currentPort) { port = currentPort; path = value.startsWith("/") ? value : `/${value}`; }
-  else throw new Error("Enter a local port, for example 39123, or a localhost URL.");
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Enter a port between 1 and 65535.");
-  if (!path.startsWith("/")) path = `/${path}`;
-  const normalized = new URL(path, "http://localhost");
-  if (normalized.origin !== "http://localhost") throw new Error("Use a local path.");
-  return { port, path: normalized.pathname + normalized.search + normalized.hash };
-}
-
-export default function PreviewPane(props: { origin: string; onError: (error: string) => void; header: HTMLDivElement; visible: boolean }) {
+export default function PreviewPane(props: { onError: (error: string) => void; header: HTMLDivElement; visible: boolean }) {
+  const workspace = new URL(location.href);
+  const parseAddress = (raw: string, currentPort?: number) => parsePreviewAddress(raw, workspace, currentPort);
   const validHistory = (value: unknown): value is PreviewHistory => {
     if (!value || typeof value !== "object") return false;
     const row = value as PreviewHistory;
     return Array.isArray(row.history) && Number.isInteger(row.index) && row.index >= -1 && row.index < row.history.length &&
-      row.history.every(item => item && Number.isInteger(item.port) && item.port > 0 && item.port <= 65535 &&
-        typeof item.path === "string" && item.path.startsWith("/") && !item.path.startsWith("//"));
+      row.history.every(item => {
+        try { return !!item && typeof item.path === "string" && !!previewURL(item, workspace); }
+        catch { return false; }
+      });
   };
   const loadHistory = (): PreviewHistory => {
     try {
@@ -51,7 +33,7 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
     } catch { /* invalid saved state starts with an empty preview */ }
     const legacy = localStorage.getItem("ormos.previewPort");
     if (legacy) {
-      try { return { history: [parsePreviewAddress(legacy)], index: 0 }; } catch { /* ignore invalid legacy port */ }
+      try { return { history: [parseAddress(legacy)], index: 0 }; } catch { /* ignore invalid legacy port */ }
     }
     return { history: [], index: -1 };
   };
@@ -76,7 +58,6 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
   const target = () => current().history[current().index];
   const [address, setAddress] = createSignal(addressFor(target()));
   const [navigation, setNavigation] = createSignal(0);
-  let frame: HTMLIFrameElement | undefined;
   let addressInput!: HTMLInputElement;
   let historyPanel: HTMLDivElement | undefined;
   const [addressFocused, setAddressFocused] = createSignal(false);
@@ -113,21 +94,19 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
     localStorage.removeItem("ormos.activePreview");
     localStorage.removeItem("ormos.previewPort");
   };
-  const record = (next: PreviewTarget, replace = false) => {
+  const record = (next: PreviewTarget) => {
     remember(next);
     const previous = target();
     if (previous?.port === next.port && previous.path === next.path) { setAddress(addressFor(next)); return; }
     setCurrent(row => {
-      const history = row.history.slice(0, row.index + 1);
-      if (replace && history.length) history[history.length - 1] = next;
-      else history.push(next);
-      return { ...row, history, index: history.length - 1 };
+      const history = [...row.history.slice(0, row.index + 1), next].slice(-200);
+      return { history, index: history.length - 1 };
     });
     persist(); setAddress(addressFor(next));
   };
   const navigate = () => {
     try {
-      const next = parsePreviewAddress(address(), target()?.port);
+      const next = parseAddress(address(), target()?.port);
       props.onError(""); record(next); setNavigation(n => n + 1); setHistoryDismissed(true);
     } catch (e) { props.onError(String(e)); }
   };
@@ -146,31 +125,37 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
       historyPanel?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: "nearest" });
     } else if (event.key === "Enter" && historyIndex() >= 0) { event.preventDefault(); visitRecent(filteredRecent()[historyIndex()]); }
   };
-  const [source, setSource] = createSignal("");
-  createEffect(on(() => [navigation(), props.origin], () => {
+  const [frameTarget, setFrameTarget] = createSignal<{ url: string }>();
+  const [availability, setAvailability] = createSignal<"empty" | "checking" | "ready" | "unavailable">("empty");
+  createEffect(on(navigation, () => {
     const item = target();
-    setSource(item && props.origin
-      ? `${props.origin.replace(/\/$/, "")}/__ormos_preview/${item.port}/?path=${encodeURIComponent(item.path)}&visit=${navigation()}`
-      : "");
+    setFrameTarget(undefined);
+    if (!item) { setAvailability("empty"); return; }
+    const url = previewURL(item, workspace);
+    setAvailability("checking");
+    const controller = new AbortController();
+    let live = true;
+    const timeout = window.setTimeout(() => controller.abort(), 5000);
+    // An opaque response confirms reachability without requiring app CORS.
+    // HEAD does not download the app or send its browser credentials.
+    void fetch(url, { method: "HEAD", mode: "no-cors", credentials: "omit", cache: "no-store", signal: controller.signal })
+      .then(() => { if (live) { setFrameTarget({ url }); setAvailability("ready"); } })
+      .catch(() => { if (live) setAvailability("unavailable"); })
+      .finally(() => window.clearTimeout(timeout));
+    onCleanup(() => { live = false; window.clearTimeout(timeout); controller.abort(); });
   }));
-  const connectBridge = () => frame?.contentWindow?.postMessage({ type: "ormos:preview-connect" }, new URL(props.origin).origin);
   onMount(() => {
     persist();
-    const receive = (event: MessageEvent) => {
-      if (!props.origin || event.source !== frame?.contentWindow || event.origin !== new URL(props.origin).origin || event.data?.type !== "ormos:preview-location" || typeof event.data.path !== "string") return;
-      const item = target(); if (!item) return;
-      try { record(parsePreviewAddress(event.data.path, item.port), event.data.replace === true); } catch { /* never accept a foreign target */ }
-    };
     const resize = () => { if (historyShown()) placeHistory(); };
-    window.addEventListener("message", receive); window.addEventListener("resize", resize); window.visualViewport?.addEventListener("resize", resize);
-    onCleanup(() => { window.removeEventListener("message", receive); window.removeEventListener("resize", resize); window.visualViewport?.removeEventListener("resize", resize); });
+    window.addEventListener("resize", resize); window.visualViewport?.addEventListener("resize", resize);
+    onCleanup(() => { window.removeEventListener("resize", resize); window.visualViewport?.removeEventListener("resize", resize); });
   });
   return (
     <>
       <Portal mount={props.header} ref={element => { element.className = "preview-toolbar"; }}>
       <form class="browserbar" hidden={!props.visible} onSubmit={e => { e.preventDefault(); navigate(); }}>
         <input ref={addressInput} role="combobox" aria-expanded={historyShown()} aria-controls="preview-history-list" aria-activedescendant={historyShown() && historyIndex() >= 0 ? `preview-history-${historyIndex()}` : undefined} aria-autocomplete="none" aria-label="Preview address" placeholder="Port or localhost URL" enterkeyhint="go" autocomplete="off" autocapitalize="none" spellcheck={false} value={address()} onFocus={() => { setHistoryDismissed(false); setHistoryIndex(-1); setAddressFocused(true); }} onBlur={() => setAddressFocused(false)} onKeyDown={historyKey} onInput={e => { setAddress(e.currentTarget.value); setHistoryDismissed(false); setHistoryIndex(-1); }} />
-        <BrowserMenu visible={props.visible} canGoBack={current().index > 0} canGoForward={current().index < current().history.length - 1} canRefresh={!!target()} back={() => move(-1)} forward={() => move(1)} refresh={() => { remember(target()); setNavigation(n => n + 1); }} openURL={target() && props.origin ? `${props.origin.replace(/\/$/, "")}/__ormos_preview/${target()!.port}/?path=${encodeURIComponent(target()!.path)}` : ""} />
+        <BrowserMenu visible={props.visible} canGoBack={current().index > 0} canGoForward={current().index < current().history.length - 1} canRefresh={!!target()} back={() => move(-1)} forward={() => move(1)} refresh={() => { remember(target()); setNavigation(n => n + 1); }} openURL={target() ? previewURL(target()!, workspace) : ""} />
       </form>
       </Portal>
       <Show when={historyShown()}><Portal>
@@ -184,13 +169,11 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
         </div>
       </Portal></Show>
       <div id="preview-content" class="pane-content">
-      <Show when={source()} fallback={<div class="empty"><div class="preview-empty-content" role="status">
-        <h1>{address().trim() ? "Ready to preview" : "Enter a port"}</h1>
-        <p>{address().trim() ? "Press Enter to open your address." : "Open a local app, right here."}</p>
+      <Show keyed when={frameTarget()} fallback={<div class="empty"><div class="preview-empty-content" role="status">
+        <h1>{availability() === "unavailable" ? "App unavailable" : availability() === "checking" ? "Opening app" : address().trim() ? "Ready to preview" : "Enter a port"}</h1>
+        <p>{availability() === "unavailable" ? "Make this port reachable over Tailscale, then refresh." : availability() === "checking" ? "Connecting to this port." : address().trim() ? "Press Enter to open your address." : "Open a local app, right here."}</p>
       </div></div>}>
-        <Show keyed when={source()}>
-          {url => <iframe title="Local app preview" ref={element => { frame = element; }} src={url} onLoad={connectBridge} sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups" referrerpolicy="no-referrer" allow="" />}
-        </Show>
+        {item => <iframe title="Local app preview" src={item.url} sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups" referrerpolicy="no-referrer" allow="" />}
       </Show>
       </div>
     </>

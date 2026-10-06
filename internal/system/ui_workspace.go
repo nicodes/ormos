@@ -5,13 +5,10 @@ package system
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -53,24 +50,14 @@ func (s *uiServer) guard(next http.Handler) http.Handler {
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src "+s.previewFrameOrigin()+"; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil {
+			host = r.Host
+		}
+		apps := "http://" + net.JoinHostPort(host, "*") + " https://" + net.JoinHostPort(host, "*")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' "+apps+"; frame-src "+apps+"; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 		next.ServeHTTP(w, r)
 	})
-}
-
-func validatePreviewOrigin(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("--preview-url must be an http(s) origin without a path or credentials")
-	}
-	return nil
-}
-
-func (s *uiServer) previewFrameOrigin() string {
-	if s.previewURL == "" {
-		return "'none'"
-	}
-	return strings.TrimSuffix(s.previewURL, "/")
 }
 
 func (s *uiServer) closeTerminals() {
@@ -190,95 +177,4 @@ func writeTerminalChunk(ctx context.Context, conn *websocket.Conn, chunk []byte)
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	return conn.Write(ctx, websocket.MessageBinary, chunk)
-}
-
-// App previews have a separate origin from the terminal controls. A root-path
-// proxy preserves absolute asset URLs, redirects and development WebSockets.
-func (s *uiServer) previewRoutes() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.hostAllowed(r.Host) {
-			http.Error(w, "host not allowed", http.StatusMisdirectedRequest)
-			return
-		}
-		if r.URL.Path == "/__ormos_bridge.js" {
-			if r.Method != http.MethodGet {
-				http.Error(w, "GET only", http.StatusMethodNotAllowed)
-				return
-			}
-			w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-			w.Header().Set("X-Content-Type-Options", "nosniff")
-			w.Header().Set("Cache-Control", "no-store")
-			w.Write(s.previewBridge())
-			return
-		}
-		port := 0
-		selecting := strings.HasPrefix(r.URL.Path, "/__ormos_preview/")
-		if selecting {
-			value := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/__ormos_preview/"), "/")
-			port, _ = strconv.Atoi(value)
-		} else if cookie, err := r.Cookie("ormos_preview_port"); err == nil {
-			port, _ = strconv.Atoi(cookie.Value)
-		}
-		for _, blocked := range s.blockedPorts {
-			if port == blocked {
-				http.Error(w, "cannot preview Ormos itself", http.StatusForbidden)
-				return
-			}
-		}
-		pol, err := uiLoadPolicy()
-		if err != nil && !os.IsNotExist(err) {
-			http.Error(w, "local policy unreadable", http.StatusForbidden)
-			return
-		}
-		if allowed, reason := pol.proxyAllowed(port); !allowed {
-			http.Error(w, reason, http.StatusForbidden)
-			return
-		}
-		if selecting {
-			if r.Method != http.MethodGet {
-				http.Error(w, "GET only", http.StatusMethodNotAllowed)
-				return
-			}
-			w.Header().Set("Cache-Control", "no-store")
-			http.SetCookie(w, &http.Cookie{Name: "ormos_preview_port", Value: strconv.Itoa(port), Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
-			path, err := localPreviewPath(r.URL.Query().Get("path"))
-			if err != nil {
-				http.Error(w, "use a local preview path", http.StatusBadRequest)
-				return
-			}
-			http.Redirect(w, r, path, http.StatusFound)
-			return
-		}
-		target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
-		proxy := httputil.NewSingleHostReverseProxy(target)
-		director := proxy.Director
-		proxy.Director = func(req *http.Request) {
-			director(req)
-			req.Host = target.Host
-			req.Header.Set("Accept-Encoding", "identity")
-			// Ormos's selector belongs to the proxy, never to the app.
-			cookies := req.Cookies()
-			req.Header.Del("Cookie")
-			for _, cookie := range cookies {
-				if cookie.Name != "ormos_preview_port" {
-					req.AddCookie(cookie)
-				}
-			}
-		}
-		proxy.ModifyResponse = func(res *http.Response) error {
-			if location := res.Header.Get("Location"); location != "" {
-				u, parseErr := url.Parse(location)
-				if parseErr == nil && u.Host == target.Host {
-					u.Scheme = ""
-					u.Host = ""
-					res.Header.Set("Location", u.String())
-				}
-			}
-			return injectPreviewBridge(res)
-		}
-		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-			previewUnavailable(w)
-		}
-		proxy.ServeHTTP(w, r)
-	})
 }
