@@ -277,7 +277,7 @@ func (s *uiServer) previewRoutes() http.Handler {
 			return injectPreviewBridge(res)
 		}
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-			http.Error(w, "No app listening on this port. Start your app in the terminal, then reload the preview.", http.StatusBadGateway)
+			previewUnavailable(w, port)
 		}
 		proxy.ServeHTTP(w, r)
 	})
