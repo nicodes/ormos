@@ -185,10 +185,8 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
       </Portal></Show>
       <div id="preview-content" class="pane-content">
       <Show when={source()} fallback={<div class="empty"><div class="preview-empty-content" role="status">
-        <div class="preview-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18M6 6.5h.01M9 6.5h.01m-2 6 3 2-3 2m6 0h4" /></svg></div>
         <h1>{address().trim() ? "Ready to preview" : "Enter a port"}</h1>
         <p>{address().trim() ? "Press Enter to open your address." : "Open a local app, right here."}</p>
-        <Show when={!address().trim()}><span class="preview-empty-example">3000 or http://localhost:3000</span></Show>
       </div></div>}>
         <Show keyed when={source()}>
           {url => <iframe title="Local app preview" ref={element => { frame = element; }} src={url} onLoad={connectBridge} sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups" referrerpolicy="no-referrer" allow="" />}

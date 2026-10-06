@@ -245,7 +245,7 @@ func TestUIPreviewUnavailablePage(t *testing.T) {
 	if res.Header.Get("Cache-Control") != "no-store" {
 		t.Fatal("unavailable preview could be cached after the app starts")
 	}
-	for _, text := range []string{"<h1>No app listening</h1>", "Port " + strconv.Itoa(port), "refresh the preview."} {
+	for _, text := range []string{"<h1>No app listening</h1>", "refresh the preview."} {
 		if !strings.Contains(string(data), text) {
 			t.Fatalf("missing %q in unavailable page", text)
 		}

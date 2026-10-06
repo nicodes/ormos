@@ -277,7 +277,7 @@ func (s *uiServer) previewRoutes() http.Handler {
 			return injectPreviewBridge(res)
 		}
 		proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-			previewUnavailable(w, port)
+			previewUnavailable(w)
 		}
 		proxy.ServeHTTP(w, r)
 	})
