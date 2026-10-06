@@ -18,8 +18,8 @@ input:focus, button:focus-visible { outline: 2px solid #4ade80; outline-offset: 
 .terminal-pane { border-top: 1px solid #374151; }
 .pane.collapsed { flex: none; }
 .pane-content { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-.tabbar .pane-toggle { position: sticky; left: 0; z-index: 1; display: flex; align-items: center; justify-content: center; width: 38px; flex: none; border: 0; border-right: 1px solid #1f2937; border-radius: 0; padding: 8px; background: #111827; color: #9ca3af; }
-.tabbar .pane-toggle:hover { background: #374151; color: #fff; }
+.tabbar .pane-toggle, .browserbar .pane-toggle { position: sticky; left: 0; z-index: 1; display: flex; align-items: center; justify-content: center; width: 38px; flex: none; border: 0; border-right: 1px solid #1f2937; border-radius: 0; padding: 8px; background: #111827; color: #9ca3af; }
+.tabbar .pane-toggle:hover, .browserbar .pane-toggle:hover { background: #374151; color: #fff; }
 .pane-toggle svg { width: 20px; height: 20px; }
 .tabbar { display: flex; align-items: stretch; min-height: 38px; flex: none; overflow-x: auto; background: #111827; border-bottom: 1px solid #1f2937; scrollbar-width: thin; }
 .tab { display: flex; align-items: stretch; flex: none; border-right: 1px solid #1f2937; border-bottom: 2px solid transparent; }
