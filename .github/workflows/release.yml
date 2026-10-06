@@ -167,7 +167,7 @@ jobs:
           go install github.com/nicodes/ormos@$TAG
           \`\`\`
 
-          Run \`ormos ui\` and open \`http://127.0.0.1:8481\`.
+          Run \`ormos ui\` and open \`http://127.0.0.1:4242\`.
           The installer verifies the archive's SHA-256 checksum and binary
           version. Archives and the installer also carry build provenance:
 
