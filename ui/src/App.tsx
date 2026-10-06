@@ -136,7 +136,7 @@ export default function App() {
           </div>
         </header>
         <div class="workspace-body">
-          <section class="pane preview-pane" aria-label="App preview" hidden={view() !== "preview"}>
+          <section class="pane preview-pane" aria-label="App preview" aria-hidden={view() !== "preview"} inert={view() !== "preview"}>
             <Show when={headerMount()}>{mount => <PreviewPane origin={previewOrigin()} onError={setError} header={mount()} visible={view() === "preview"} />}</Show>
           </section>
           <section class="pane terminal-pane" aria-label="Terminal" hidden={view() !== "terminal"}>

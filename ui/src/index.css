@@ -13,10 +13,12 @@ input:focus, button:focus-visible { outline: 2px solid #4ade80; outline-offset: 
 .error { display: flex; align-items: center; justify-content: space-between; padding: 6px 12px; font-size: 13px; color: #fca5a5; background: #351c25; flex: none; }
 .error button { border: 0; background: transparent; padding: 2px 8px; }
 .workspace { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.workspace-body { display: flex; flex: 1; min-height: 0; }
+.workspace-body { position: relative; display: flex; flex: 1; min-height: 0; }
 .header-controls, .terminal-toolbar, .browserbar { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; }
 .preview-toolbar { display: contents; }
-.pane { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.pane { position: absolute; inset: 0; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
+.terminal-pane { z-index: 1; background: #0b0f19; }
+.preview-pane { background: #0b0f19; }
 .pane-content { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .pane-header { display: flex; align-items: center; gap: 4px; padding: 4px; height: 45px; min-width: 0; flex: none; background: #111827; border-bottom: 1px solid #1f2937; }
 .pane-header .header-icon { display: flex; align-items: center; justify-content: center; flex: none; width: 36px; height: 36px; min-width: 36px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: #9ca3af; font-size: 20px; line-height: 1; cursor: pointer; }
@@ -42,7 +44,7 @@ input:focus, button:focus-visible { outline: 2px solid #4ade80; outline-offset: 
 .terminal-menu > button { width: 100%; margin-bottom: 8px; }
 .terminal-menu-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .terminal-menu button { font-size: 13px; min-height: 36px; }
-iframe { flex: 1; width: 100%; min-height: 0; border: 0; background: white; }
+iframe { flex: 1; width: 100%; min-height: 0; border: 0; background: #0b0f19; }
 .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; text-align: center; }
 .preview-symbol { font-size: 30px; color: #4ade80; margin-bottom: 15px; }
 .empty h1 { font-size: 20px; font-weight: 500; margin: 0 0 10px; }
