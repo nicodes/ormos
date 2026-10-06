@@ -36,7 +36,7 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
     });
   });
   return <>
-    <button ref={trigger} class="terminal-menu-toggle" type="button" aria-label="Terminal controls" title="Terminal controls" aria-haspopup="dialog" aria-expanded={open()} aria-controls="terminal-controls" onClick={toggle}>
+    <button ref={trigger} class="header-icon terminal-menu-toggle" type="button" aria-label="Terminal controls" title="Terminal controls" aria-haspopup="dialog" aria-expanded={open()} aria-controls="terminal-controls" onClick={toggle}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
     </button>
     <Show when={open()}><Portal>
