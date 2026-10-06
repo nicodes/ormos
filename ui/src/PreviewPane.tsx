@@ -175,15 +175,21 @@ export default function PreviewPane(props: { origin: string; onError: (error: st
       </Portal>
       <Show when={historyShown()}><Portal>
         <div ref={historyPanel} class="preview-history" style={historyPosition()} onPointerDown={event => event.preventDefault()}>
-          <Show when={filteredRecent().length} fallback={<p>{address().trim() ? "No matching history" : "No browser history"}</p>}>
-            <div id="preview-history-list" role="listbox" aria-label="Recent previews"><For each={filteredRecent()}>{(item, index) => <button id={`preview-history-${index()}`} type="button" role="option" aria-selected={historyIndex() === index()} onClick={() => visitRecent(item)}>
+          <div id="preview-history-list" role="listbox" aria-label="Recent previews">
+          <Show when={filteredRecent().length} fallback={<div class="empty-message history-empty" role="status"><strong>{address().trim() ? "No matching history" : "Enter a port"}</strong><p>{address().trim() ? "Press Enter to open a new address." : "Your recent previews will appear here."}</p></div>}>
+            <For each={filteredRecent()}>{(item, index) => <button id={`preview-history-${index()}`} type="button" role="option" aria-selected={historyIndex() === index()} onClick={() => visitRecent(item)}>
               <span class="status-dot" classList={{ online: activePorts()?.has(item.port) === true }} role="img" aria-label={activePorts() === null ? "Port status unavailable" : activePorts()!.has(item.port) ? "Port active" : "Port inactive"} title={activePorts() === null ? "Port status unavailable" : activePorts()!.has(item.port) ? "Port active" : "Port inactive"} /><span>{addressFor(item)}</span>
-            </button>}</For></div>
-          </Show>
+            </button>}</For>
+          </Show></div>
         </div>
       </Portal></Show>
       <div id="preview-content" class="pane-content">
-      <Show when={source()} fallback={<div class="empty"><div class="preview-symbol">↗</div><h1>Your app, right here.</h1><p>Enter a local port or URL above.</p></div>}>
+      <Show when={source()} fallback={<div class="empty"><div class="preview-empty-content" role="status">
+        <div class="preview-empty-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18M6 6.5h.01M9 6.5h.01m-2 6 3 2-3 2m6 0h4" /></svg></div>
+        <h1>{address().trim() ? "Ready to preview" : "Enter a port"}</h1>
+        <p>{address().trim() ? "Press Enter to open your address." : "Open a local app, right here."}</p>
+        <Show when={!address().trim()}><span class="preview-empty-example">3000 or http://localhost:3000</span></Show>
+      </div></div>}>
         <Show keyed when={source()}>
           {url => <iframe title="Local app preview" ref={element => { frame = element; }} src={url} onLoad={connectBridge} sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-popups" referrerpolicy="no-referrer" allow="" />}
         </Show>
