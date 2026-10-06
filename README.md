@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 2dc6db738b74b24beb295992e8945fb101b8f4f6e0e42a6baa0cbfafde8f2d7f -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 1dc4cc5df5d5f53784ba5c4325c2bbbc29573506173a98ecd66ceade1f11458f -->
 
 # Ormos
 
@@ -15,7 +15,7 @@ ormos ui
 
 Bare `ormos` also starts the local UI. Open `http://127.0.0.1:8481`. A single shared header switches between a full-height terminal and local app preview. In terminal view, click the preview icon at the left to show your app; in preview view, click the terminal icon to return to your shells. Both keep running when hidden, and the selected view is remembered after a reload. A fresh workspace starts in terminal view.
 
-The terminal header has tabs and a **+** button. Each tab keeps an independent shell running; closing it ends that shell. The right-hand hamburger opens Keyboard, Esc, Tab, Ctrl C, Ctrl D and arrow-key controls for the active terminal. Escape or clicking outside dismisses the menu.
+The terminal header has tabs and a **+** button. Each tab keeps an independent shell running. Only the selected tab shows its edit and close buttons. The edit icon renames it inline: Enter or leaving the field saves, Escape cancels, and an empty name keeps the previous name. Names survive reloads without restarting shells. Closing a tab ends only that shell. The right-hand hamburger opens Keyboard, Esc, Tab, Ctrl C, Ctrl D and arrow-key controls for the active terminal. Escape or clicking outside dismisses the menu.
 
 The preview header has one URL bar with back, forward and refresh controls. Enter a local port (`3000`), a port with a path (`3000/about`), a localhost HTTP URL, or a path within the current app. Normal links and SPA history update the address bar. The icon to the right opens the current preview in a separate browser tab. Reloading restores the preview address/history and reconnects to live terminal tabs. There is no sidebar, account login or separate global header.
 
