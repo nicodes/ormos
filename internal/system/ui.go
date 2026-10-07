@@ -623,6 +623,10 @@ func serveUIFile(w http.ResponseWriter, static fs.FS, name string) {
 		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	case strings.HasSuffix(name, ".css"):
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	case strings.HasSuffix(name, ".webmanifest"):
+		w.Header().Set("Content-Type", "application/manifest+json; charset=utf-8")
+	case strings.HasSuffix(name, ".svg"):
+		w.Header().Set("Content-Type", "image/svg+xml")
 	}
 	_, _ = w.Write(data)
 }
