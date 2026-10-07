@@ -51,7 +51,7 @@ var (
 	uiListeningPorts  = listeningPorts
 	uiSpawnTerminal   = spawnUITerminal
 	uiMaxTerminals    = 8
-	uiTerminalBufMax  = 64 << 10
+	uiTerminalBufMax  = 4 << 20
 	uiTerminalKillGap = 2 * time.Second
 )
 
@@ -71,7 +71,8 @@ type uiTerminal struct {
 	started time.Time
 	alive   bool
 	mu      sync.Mutex
-	buf     []byte
+	history replayRing
+	end     uint64
 	kill    func()
 	input   func([]byte) error
 	resize  func(uint16, uint16) error
@@ -81,13 +82,17 @@ type uiTerminal struct {
 func (t *uiTerminal) output() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return string(t.buf)
+	return string(t.history.snapshot())
 }
 
 func (t *uiTerminal) append(p []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.buf = append(t.buf, p...)
+	if t.history.buf == nil {
+		t.history.buf = make([]byte, uiTerminalBufMax)
+	}
+	t.history.append(p)
+	t.end += uint64(len(p))
 	for reader := range t.readers {
 		select {
 		case reader <- append([]byte(nil), p...):
@@ -95,9 +100,6 @@ func (t *uiTerminal) append(p []byte) {
 			close(reader)
 			delete(t.readers, reader)
 		}
-	}
-	if len(t.buf) > uiTerminalBufMax {
-		t.buf = t.buf[len(t.buf)-uiTerminalBufMax:]
 	}
 }
 
