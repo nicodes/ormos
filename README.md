@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 7f87915710bc99a3f95167a871434094e481c59e0677724377d939040f35937a -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 8ccd2958363e8ee6602c75f1bc3aafb9194908bb98709c484d1af1b485f8a218 -->
 
 # Ormos
 
@@ -36,6 +36,15 @@ ormos ui
 ```
 
 Bare `ormos` also starts the local UI. Open the address printed at startup. The default is `http://127.0.0.1:4242` in v0.2.1 and later; v0.2.0 defaults to port 8481. Set a port explicitly with `ormos ui --port 4242` (or another port from 1 through 65535). A single shared header switches between a full-height terminal and local app preview. In terminal view, click the preview icon at the left to show your app; in preview view, click the terminal icon to return to your shells. Switching uses a short opacity fade in both directions, skipped when reduced motion is requested. Both keep running when hidden, and the selected view is remembered after a reload. A fresh workspace starts in terminal view.
+
+
+## Home-screen installation (next release)
+
+PWA installation support is prepared for the next release; v0.2.5 does not include it. Open your Ormos workspace over HTTPS on your phone. On iPhone, use Safari’s Share menu and choose **Add to Home Screen**; on Android, use your browser’s **Install app** or **Add to Home screen** option. Launching the icon opens Ormos in a standalone window on supporting browsers. Installation options vary by browser. Plain HTTP on a remote hostname does not meet PWA installation requirements; loopback HTTP is supported for local development.
+
+The installed app remains a client of the machine running Ormos. That machine must be reachable and running; private-network setups still need their network connection. No service worker or offline cache is registered. Existing terminal reconnect/history behavior applies, and operating-system suspension may disconnect the client. Keep using the same workspace URL: changing its hostname or port changes browser storage and app identity. Home-screen and browser storage sharing varies by platform, so saved commands or prompts may need recreating in the installed app.
+
+## Terminal and preview controls
 
 The terminal header has tabs and a **+** button. Each tab keeps an independent shell running. Only the selected tab shows its editable name and close button. Click its name to edit directly: Enter or leaving the field saves, Escape cancels, and an empty name keeps the previous name. Names are limited to 24 characters, display in full, and survive reloads without restarting shells. Selecting a tab does not change its width. Closing a tab ends only that shell. The right-hand hamburger has three icon tabs. The keyboard tab provides Keyboard, Esc, Tab, Enter, Ctrl C, Ctrl D and arrow-key controls. The bookmark tab lists saved commands with their titles and command text; Add command, edit and delete manage them. Click a saved command’s title or text to send it to the active terminal and execute it. The speech-bubble tab provides a separate saved-prompts list with the same create, edit and delete controls. Click a saved prompt’s title or text to paste it into the active terminal without pressing Enter. Both lists show only a borderless Edit icon beside the title, with a closely spaced single-line text preview and an ellipsis. Editing reveals the full text; Delete is at the bottom left and Save at the bottom right below the inputs. New items have only Save. Commands and prompts are saved in this browser, not shared between devices. Escape or clicking outside dismisses the popup.
 
