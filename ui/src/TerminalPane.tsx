@@ -4,7 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { request, type TerminalRow } from "./api";
 
-export type TerminalControls = { focus: () => void; type: (data: string) => void; paste: (data: string) => void };
+export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void };
 export default function TerminalPane(props: {
   id: string; onStatus: (status: string) => void;
   register: (id: string, controls?: TerminalControls) => void;
@@ -22,6 +22,25 @@ export default function TerminalPane(props: {
       theme: { background: "#0b0f19", foreground: "#d1d5db", cursor: "#d1d5db", selectionBackground: "#374151" },
     });
     const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
+    const textarea = terminal.textarea!;
+    const touchKeyboard = () => window.matchMedia("(pointer: coarse)").matches;
+    const dismissKeyboard = () => {
+      textarea.inputMode = "none";
+      textarea.readOnly = touchKeyboard();
+    };
+    dismissKeyboard();
+    const focus = () => { dismissKeyboard(); terminal.focus(); };
+    const keyboard = () => {
+      // A fresh focus inside the button's user gesture opens mobile keyboards.
+      textarea.blur(); textarea.readOnly = false; textarea.inputMode = "text";
+      terminal.focus();
+    };
+    const touchPointer = (event: PointerEvent) => {
+      if (event.pointerType !== "touch") return;
+      terminal.blur(); textarea.inputMode = "none"; textarea.readOnly = true;
+    };
+    textarea.addEventListener("blur", dismissKeyboard);
+    container.addEventListener("pointerdown", touchPointer, true);
     // xterm handles wheels, but its custom viewport does not handle touch swipes.
     // Reuse xterm's wheel handling for apps that own scrolling/mouse input.
     // Ordinary shell swipes only scroll the local buffer.
@@ -112,7 +131,7 @@ export default function TerminalPane(props: {
     };
     const input = terminal.onData(type);
     const observer = new ResizeObserver(resize); observer.observe(container);
-    props.register(props.id, { focus: () => terminal.focus(), type, paste: data => terminal.paste(data) });
+    props.register(props.id, { focus, keyboard, type, paste: data => terminal.paste(data) });
     connect();
     onCleanup(() => {
       disposed = true; generation++; clearTimeout(retry); observer.disconnect(); socket?.close();
@@ -120,6 +139,8 @@ export default function TerminalPane(props: {
       container.removeEventListener("touchmove", touchMove);
       container.removeEventListener("touchend", touchEnd);
       container.removeEventListener("touchcancel", touchEnd);
+      textarea.removeEventListener("blur", dismissKeyboard);
+      container.removeEventListener("pointerdown", touchPointer, true);
       input.dispose(); terminal.dispose(); props.register(props.id);
     });
   });

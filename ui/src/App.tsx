@@ -1,6 +1,7 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import TerminalPane, { type TerminalControls } from "./TerminalPane";
 import PreviewPane from "./PreviewPane";
+import TerminalQuickControls from "./TerminalQuickControls";
 import TerminalMenu from "./TerminalMenu";
 import { APIError, request, type TerminalRow } from "./api";
 
@@ -123,7 +124,7 @@ export default function App() {
             </div>}</For>
             <button class="header-icon tab-add" aria-label="New terminal tab" disabled={busy()} onClick={() => void addTerminal()}>+</button>
           </div>
-          <TerminalMenu enabled={!!active()} focus={() => controls.get(active())?.focus()} type={data => controls.get(active())?.type(data)} paste={data => controls.get(active())?.paste(data)} />
+          <TerminalMenu enabled={!!active()} keyboard={() => controls.get(active())?.keyboard()} focus={() => controls.get(active())?.focus()} type={data => controls.get(active())?.type(data)} paste={data => controls.get(active())?.paste(data)} />
           </Show>
           </div>
           <div class="preview-toolbar" ref={setHeaderMount} />
@@ -140,6 +141,7 @@ export default function App() {
               <TerminalPane id={id} onStatus={status => setStatus(id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
             </div>}</For>
           </div>
+          <TerminalQuickControls enabled={statuses()[active()] === "Connected"} keyboard={() => controls.get(active())?.keyboard()} type={data => controls.get(active())?.type(data)} />
           </div>
           </section>
         </div>

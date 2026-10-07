@@ -1,8 +1,10 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
+import TerminalKeyIcon from "./TerminalKeyIcon";
+import { terminalKeys } from "./terminalKeys";
 import SavedItems, { type SavedEditor } from "./SavedItems";
 
-export default function TerminalMenu(props: { enabled: boolean; focus: () => void; type: (data: string) => void; paste: (data: string) => void }) {
+export default function TerminalMenu(props: { enabled: boolean; focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void }) {
   const [open, setOpen] = createSignal(false);
   const [tab, setTab] = createSignal<"keyboard" | "saved" | "prompts">("keyboard");
   const [createCommand, setCreateCommand] = createSignal(0);
@@ -10,15 +12,10 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
   const [commandEditor, setCommandEditor] = createSignal<SavedEditor>();
   const [promptEditor, setPromptEditor] = createSignal<SavedEditor>();
   const editor = () => tab() === "saved" ? commandEditor() : promptEditor();
-  const editorAction = () => `${editor()?.editing ? "Save" : "Add"} ${tab() === "saved" ? "command" : "prompt"}`;
+  const editorAction = () => `Add ${tab() === "saved" ? "command" : "prompt"}`;
   const [position, setPosition] = createSignal({ top: "0px", right: "8px", "max-height": "280px" });
   let trigger!: HTMLButtonElement;
   let panel: HTMLDivElement | undefined;
-  const keys = [
-    { label: "Esc", data: "\x1b" }, { label: "Tab", data: "\t" }, { label: "Ctrl C", data: "\x03" },
-    { label: "Ctrl D", data: "\x04" }, { label: "↑", data: "\x1b[A", name: "Up arrow" }, { label: "↓", data: "\x1b[B", name: "Down arrow" },
-    { label: "←", data: "\x1b[D", name: "Left arrow" }, { label: "→", data: "\x1b[C", name: "Right arrow" },
-  ];
   const place = () => {
     const rect = trigger.getBoundingClientRect();
     const height = window.visualViewport?.height ?? window.innerHeight;
@@ -70,16 +67,15 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 11a8 8 0 0 1-8 8H7l-4 3V7a4 4 0 0 1 4-4h6a8 8 0 0 1 8 8ZM7 8h10M7 12h7" /></svg>
           </button>
         </div>
-        <Show when={tab() !== "keyboard"}><button class="saved-item-add" type="button" aria-label={editorAction()} title={editorAction()} disabled={editor()?.editing && !editor()?.canSave} onClick={() => {
-          if (editor()?.editing) editor()?.save();
-          else if (tab() === "saved") setCreateCommand(count => count + 1);
+        <Show when={tab() !== "keyboard" && !editor()?.editing}><button class="saved-item-add" type="button" aria-label={editorAction()} title={editorAction()} onClick={() => {
+          if (tab() === "saved") setCreateCommand(count => count + 1);
           else setCreatePrompt(count => count + 1);
         }}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><Show when={editor()?.editing} fallback={<path d="M12 5v14M5 12h14" />}><path d="m5 12 4 4L19 6" /></Show></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
         </button></Show></div>
         <div id="shortcut-panel" class="shortcut-controls" role="tabpanel" aria-labelledby="shortcut-tab" hidden={tab() !== "keyboard"}>
-          <button disabled={!props.enabled} onClick={() => { setOpen(false); props.focus(); }}>Keyboard</button>
-          <div class="terminal-menu-keys"><For each={keys}>{key => <button disabled={!props.enabled} aria-label={key.name ?? key.label} onPointerDown={e => e.preventDefault()} onClick={() => props.type(key.data)}>{key.label}</button>}</For></div>
+          <button disabled={!props.enabled} onClick={() => { setOpen(false); props.keyboard(); }}>Keyboard</button>
+          <div class="terminal-menu-keys"><For each={terminalKeys}>{key => <button disabled={!props.enabled} aria-label={key.name} onPointerDown={e => e.preventDefault()} onClick={() => props.type(key.data)}><TerminalKeyIcon label={key.label} icon={"icon" in key ? key.icon : undefined} /></button>}</For></div>
         </div>
         <div id="saved-command-panel" role="tabpanel" aria-labelledby="saved-command-tab" hidden={tab() !== "saved"}>
           <SavedItems visible={tab() === "saved"} registerEditor={setCommandEditor} createRequest={createCommand()} kind="command" enabled={props.enabled} use={command => { props.type(`${command}\r`); setOpen(false); }} />
