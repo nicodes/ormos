@@ -90,8 +90,11 @@ finally:
     try {
       await context.addInitScript(() => localStorage.setItem('ormos.view', 'preview'));
       const page = await context.newPage();
-      const assets = [], sockets = [], polls = [];
-      page.on('request', request => { if (request.url().includes('/assets/')) assets.push(request.url()); });
+      const assets = [], sockets = [], polls = [], openings = [];
+      page.on('request', request => {
+        if (request.url().includes('/assets/')) assets.push(request.url());
+        if (request.url().endsWith('/api/action') && request.postDataJSON()?.action === 'open') openings.push(request.url());
+      });
       page.on('websocket', socket => sockets.push(socket.url()));
       // Hold the first poll longer than the former three-second interval.
       await page.route('**/api/ports', route => { polls.push(route); });
@@ -100,6 +103,7 @@ finally:
       await address.waitFor();
       assert(!assets.some(url => /TerminalPane-/.test(url)), 'Preview must not fetch xterm JavaScript or CSS');
       assert.equal(sockets.length, 0, 'Preview must not replay terminal history');
+      assert.equal(openings.length, 0, 'A fresh preview must not create an unused shell');
       await address.click();
       await page.waitForFunction(() => document.querySelector('.preview-history'));
       for (let attempt = 0; polls.length === 0; attempt++) { assert(attempt < 100); await new Promise(resolve => setTimeout(resolve, 10)); }
@@ -110,6 +114,7 @@ finally:
       await cancelled;
       await page.waitForFunction(() => document.querySelector('.status-dot.online'));
       assert.equal(sockets.length, 1);
+      assert.equal(openings.length, 1, 'The first terminal view must open one shell');
       assert(assets.some(url => /TerminalPane-.*\.js$/.test(url)));
       await page.getByRole('button', { name: 'Show preview', exact: true }).click();
       await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
