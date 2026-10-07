@@ -92,10 +92,27 @@ finally:
         await context.addInitScript(() => {
           const Native = window.WebSocket;
           window.testTerminalSockets = [];
+          window.testTerminalMessages = [];
+          window.testResizeCallbacks = [];
           window.WebSocket = class extends Native {
             constructor(...args) {
               super(...args);
               if (String(args[0]).includes('/api/terminal/')) window.testTerminalSockets.push(this);
+            }
+            send(data) {
+              if (this.url.includes('/api/terminal/') && typeof data === 'string') window.testTerminalMessages.push(JSON.parse(data));
+              super.send(data);
+            }
+          };
+          const NativeObserver = window.ResizeObserver;
+          window.ResizeObserver = class extends NativeObserver {
+            constructor(callback) {
+              super(callback);
+              this.callback = callback;
+            }
+            observe(element, ...args) {
+              if (element.classList.contains('terminal-container')) window.testResizeCallbacks.push(this.callback);
+              super.observe(element, ...args);
             }
           };
         });
@@ -128,6 +145,17 @@ finally:
         assert.deepEqual(installability.installabilityErrors, []);
         await cdp.detach();
         await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+        await page.waitForFunction(() => window.testTerminalMessages.some(message => message.type === 'resize'));
+        const beforeResize = await page.evaluate(() => window.testTerminalMessages.filter(message => message.type === 'resize').length);
+        await page.evaluate(async () => {
+          for (let i = 0; i < 100; i++) for (const callback of window.testResizeCallbacks) callback([]);
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        });
+        assert.equal(await page.evaluate(() => window.testTerminalMessages.filter(message => message.type === 'resize').length), beforeResize,
+          'Layout notifications without a character-grid change must not redraw the PTY');
+        await page.setViewportSize({ width: touch ? 330 : 1280, height: touch ? 744 : 800 });
+        await page.waitForFunction(count => window.testTerminalMessages.filter(message => message.type === 'resize').length > count, beforeResize);
+        await page.setViewportSize({ width: touch ? 390 : 1440, height: touch ? 844 : 900 });
         if (touch) {
           await page.locator('.xterm-screen').tap();
           assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'none');
