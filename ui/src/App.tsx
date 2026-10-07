@@ -7,6 +7,7 @@ import TerminalMenu from "./TerminalMenu";
 import { APIError, request, type TerminalRow } from "./api";
 
 const TerminalPane = lazy(() => import("./TerminalPane"));
+const preloadTerminal = () => void TerminalPane.preload().catch(() => { /* handled by the pane boundary */ });
 
 type TerminalTab = { id: string; label: string };
 function savedTerminals(): TerminalTab[] {
@@ -34,7 +35,11 @@ export default function App() {
     saveName();
     setShifted(false);
     setView(previous => previous === "terminal" ? "preview" : "terminal");
-    if (view() === "terminal" && active()) setVisited(previous => new Set([...previous, active()]));
+    if (view() === "terminal") {
+      preloadTerminal();
+      if (active()) setVisited(previous => new Set([...previous, active()]));
+      else void addTerminal();
+    }
     writeStorage("ormos.view", view());
   };
   const controls = new Map<string, TerminalControls>();
@@ -88,7 +93,7 @@ export default function App() {
   onMount(() => {
     // Start terminal code and session discovery together; preview-only loads
     // defer both rendering and this download until the view is requested.
-    if (view() === "terminal") void TerminalPane.preload().catch(() => { /* handled by the pane boundary */ });
+    if (view() === "terminal") preloadTerminal();
     const viewport = window.visualViewport;
     const updateHeight = () => document.documentElement.style.setProperty("--viewport-height", `${viewport?.height ?? window.innerHeight}px`);
     viewport?.addEventListener("resize", updateHeight); updateHeight();
@@ -104,7 +109,7 @@ export default function App() {
         setActive(retained.find(tab => tab.id === previous)?.id ?? retained[0]?.id ?? "");
         setVisited(new Set(view() === "terminal" && active() ? [active()] : []));
         setBusy(false);
-        if (!retained.length) await addTerminal(); else persist();
+        if (!retained.length && view() === "terminal") await addTerminal(); else persist();
       } catch (e) { if (!disposed) { setError(String(e)); setBusy(false); } }
     })();
     onCleanup(() => { disposed = true; viewport?.removeEventListener("resize", updateHeight); });
