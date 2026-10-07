@@ -114,6 +114,7 @@ button, .header-icon { -webkit-tap-highlight-color: transparent; }
 .quick-key-group { display: flex; align-items: center; gap: 4px; }
 .terminal-quick-controls .quick-key { display: flex; align-items: center; justify-content: center; flex: none; min-width: 44px; height: 44px; padding: 0 8px; border: 0; border-radius: 6px; background: transparent; color: #9ca3af; font-size: 14px; line-height: 1; touch-action: manipulation; }
 .terminal-quick-controls .quick-key svg { width: 20px; height: 20px; }
+.terminal-quick-controls .interrupt-key { padding: 0; }
 @media (max-width: 340px) { .terminal-quick-controls, .quick-key-group { gap: 0; } }
 
 .saved-editor-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
