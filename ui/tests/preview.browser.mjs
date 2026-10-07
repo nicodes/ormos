@@ -210,6 +210,72 @@ finally:
       });
     } finally { await context.close(); }
   });
+  for (const reduced of [false, true]) {
+    await t.test(`hidden terminal pauses paint and retains output${reduced ? ' with reduced motion' : ''}`, async () => {
+      await writeFile(path.join(home, 'paint-app.py'), `import time
+print('PAINT_STARTED', flush=True)
+for i in range(200):
+    print('PAINT_ROW_%04d' % i, flush=True)
+    time.sleep(0.02)
+print('PAINT_FINISHED', flush=True)
+`);
+      const context = await browser.newContext({ reducedMotion: reduced ? 'reduce' : 'no-preference' });
+      try {
+        await context.addInitScript(() => {
+          const Native = window.WebSocket; window.testPaintSockets = []; window.testPaintBytes = 0; window.testPaintAcks = 0;
+          const Observer = window.IntersectionObserver; window.testPaintIntersections = [];
+          window.IntersectionObserver = class extends Observer {
+            constructor(callback, options) { super((entries, observer) => { for (const entry of entries) if (entry.target.classList.contains('xterm-screen')) window.testPaintIntersections.push(entry.isIntersecting); callback(entries, observer); }, options); }
+          };
+          window.WebSocket = class extends Native {
+            constructor(...args) {
+              super(...args); if (!String(args[0]).includes('/api/terminal/')) return;
+              window.testPaintSockets.push(this);
+              this.addEventListener('message', event => { if (typeof event.data !== 'string') window.testPaintBytes += event.data.byteLength; });
+            }
+            send(data) { const message = JSON.parse(data); if (message.type === 'ack') window.testPaintAcks += message.bytes; super.send(data); }
+          };
+        });
+        const page = await context.newPage();
+        await page.goto(origin);
+        await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+        await page.locator('.terminal-container').click();
+        // Recreate the former opacity-only behavior for a measured comparison.
+        const baselineStyle = reduced ? undefined : await page.addStyleTag({ content: '.terminal-pane{transition:opacity 160ms ease!important}.terminal-pane[aria-hidden=true]{display:flex!important}' });
+        await page.keyboard.type('python3 -u paint-app.py'); await page.keyboard.press('Enter');
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('PAINT_STARTED'));
+        await page.getByRole('button', { name: 'Show preview', exact: true }).click();
+        if (baselineStyle) {
+          await page.evaluate(() => {
+            window.testBaselineMutations = 0;
+            window.testBaselineObserver = new MutationObserver(records => { window.testBaselineMutations += records.length; });
+            window.testBaselineObserver.observe(document.querySelector('.xterm-rows'), { childList: true, characterData: true, subtree: true });
+          });
+          await page.waitForFunction(() => window.testBaselineMutations > 0);
+          await page.evaluate(() => window.testBaselineObserver.disconnect());
+          await baselineStyle.evaluate(element => element.remove());
+        }
+        await page.waitForFunction(() => getComputedStyle(document.querySelector('.terminal-pane')).display === 'none');
+        await page.waitForFunction(() => window.testPaintIntersections.at(-1) === false); // synchronize on xterm's actual visibility notification
+        const before = await page.evaluate(() => {
+          window.testPaintMutations = 0;
+          window.testPaintObserver = new MutationObserver(records => { window.testPaintMutations += records.length; });
+          window.testPaintObserver.observe(document.querySelector('.xterm-rows'), { childList: true, characterData: true, subtree: true });
+          return { bytes: window.testPaintBytes, acks: window.testPaintAcks };
+        });
+        await page.waitForFunction(before => window.testPaintBytes > before.bytes + 100 && window.testPaintAcks > before.acks + 100, before);
+        assert.equal(await page.evaluate(() => window.testPaintMutations), 0, 'Hidden terminal must receive history without repainting its rows');
+        await page.evaluate(() => window.testPaintObserver.disconnect());
+        await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('PAINT_FINISHED'));
+        assert.equal(await page.evaluate(() => window.testPaintSockets.length), 1, 'Showing the terminal must preserve its renderer and connection');
+        assert.equal(await page.locator('.terminal-pane').evaluate(element => getComputedStyle(element).transitionDuration), reduced ? '0s' : '0.16s, 0.16s');
+        await page.evaluate(async () => {
+          for (const row of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill', id: row.id }) });
+        });
+      } finally { await context.close(); }
+    });
+  }
   await t.test('terminal code loads in parallel with session discovery', async () => {
     const context = await browser.newContext();
     try {

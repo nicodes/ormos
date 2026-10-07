@@ -21,6 +21,15 @@ input:focus, button:focus-visible { outline: 2px solid #9ca3af; outline-offset: 
 .pane[aria-hidden="true"] { opacity: 0; pointer-events: none; }
 @media (prefers-reduced-motion: reduce) { .pane { transition: none; } }
 .terminal-pane { z-index: 1; background: #0b0f19; }
+/* Preserve the fade, then let xterm's visibility observer pause hidden paint.
+   Browsers without discrete transitions retain the existing opacity behavior. */
+@supports (transition-behavior: allow-discrete) {
+  .terminal-pane { transition: opacity 160ms ease, display 160ms allow-discrete; }
+  .terminal-pane[aria-hidden="true"] { display: none; }
+  @starting-style { .terminal-pane[aria-hidden="false"] { opacity: 0; } }
+  @media (prefers-reduced-motion: reduce) { .terminal-pane { transition: none; } }
+}
+
 .preview-pane { background: #0b0f19; }
 .pane-content { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
 .pane-header { display: flex; align-items: center; gap: 4px; padding: 4px; height: 45px; min-width: 0; flex: none; background: #111827; border-bottom: 1px solid #1f2937; }
