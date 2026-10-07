@@ -26,6 +26,8 @@ const close = server => new Promise((resolve, reject) => server.close(error => e
 test('isolated localhost previews retain navigation, terminal state and scrolling', { timeout: 90000 }, async t => {
   assert(process.env.ORMOS_TEST_BINARY, 'Set ORMOS_TEST_BINARY to a built Ormos executable.');
   const home = await mkdtemp(path.join(tmpdir(), 'ormos-direct-'));
+  const artifacts = process.env.ORMOS_TEST_ARTIFACTS || home;
+  await mkdir(artifacts, { recursive: true });
   t.after(() => rm(home, { recursive: true, force: true }));
   // A local fullscreen app exercises the same alternate-screen/mouse protocol
   // as interactive coding tools, without credentials or API calls.
@@ -104,7 +106,12 @@ finally:
         page.on('pageerror', error => errors.push(error));
         await page.goto(origin);
         await page.waitForFunction(() => document.querySelector('.status-dot.online'));
-        await page.locator('.xterm-helper-textarea').focus();
+        if (touch) {
+          await page.locator('.xterm-screen').tap();
+          assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'none');
+          assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), true, 'Terminal taps must not request the software keyboard');
+        }
+        await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).click();
         await page.keyboard.type("DIRECT_STATE=kept; printf 'DIRECT_%s\\n' OK");
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('DIRECT_OK'));
@@ -133,7 +140,7 @@ finally:
         assert.equal(await page.evaluate(() => window.scrollY), 0, 'Scrolling must stay inside the terminal');
         await scroll(-240);
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
-        await page.locator('.xterm-helper-textarea').focus();
+        await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).click();
         await page.keyboard.type('python3 "$HOME/scroll-app.py"');
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('APP_SCROLL_0100'));
@@ -143,11 +150,33 @@ finally:
         const previous = await appPosition();
         await scroll(-240);
         await page.waitForFunction(previous => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]) > previous, previous, { timeout: 3000 });
+        const quick = page.getByRole('toolbar', { name: 'Quick terminal controls' });
+        assert.equal(await quick.getByRole('button').count(), 6);
+        // Inspect actual WebSocket input while the fixture has a raw PTY,
+        // so Ctrl+C and Esc test their bytes without terminating a shell.
+        await page.evaluate(() => {
+          window.testKeyInput = [];
+          const socket = window.testTerminalSockets.at(-1);
+          const send = socket.send.bind(socket);
+          socket.send = data => { const message = JSON.parse(data); if (message.type === 'input') window.testKeyInput.push(message.data); send(data); };
+        });
+        for (const name of ['Tab', 'Escape', 'Up arrow', 'Down arrow', 'Ctrl C']) {
+          await quick.getByRole('button', { name, exact: true }).click();
+        }
+        assert.deepEqual(await page.evaluate(() => window.testKeyInput), ['\t', '\x1b', '\x1b[A', '\x1b[B', '\x03']);
+        if (touch) {
+          assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'none');
+          assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), true);
+        }
+        await quick.getByRole('button', { name: 'Keyboard', exact: true }).click();
+        assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'text');
+        assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), false);
+        assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);
         await page.keyboard.type('q');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
         // More than 64 KiB but fewer than 5,000 display lines: refresh must
         // retain the earliest marker, not only the old tiny server replay.
-        await page.locator('.xterm-helper-textarea').focus();
+        await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).click();
         await page.keyboard.type("printf '\\033c'; i=1; while [ \"$i\" -le 3000 ]; do printf 'HISTORY_%04d_abcdefghijklmnop\\n' \"$i\"; i=$((i+1)); done");
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
@@ -177,6 +206,34 @@ finally:
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_0001'));
         await moveScrollbar(true);
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
+        await page.screenshot({ path: path.join(artifacts, `terminal-${touch ? 'phone' : 'desktop'}.png`) });
+        // Saved commands and prompts share the compact row and editor actions.
+        for (const kind of ['command', 'prompt']) {
+          await page.getByRole('button', { name: 'Terminal controls', exact: true }).click();
+          const dialog = page.getByRole('dialog', { name: 'Terminal tools' });
+          await dialog.getByRole('tab', { name: kind === 'command' ? 'Saved commands' : 'Saved prompts' }).click();
+          await dialog.getByRole('button', { name: `Add ${kind}`, exact: true }).click();
+          await dialog.getByRole('textbox', { name: kind === 'command' ? 'Command title' : 'Prompt title' }).fill(`Test ${kind}`);
+          await dialog.getByRole('textbox', { name: `Saved ${kind}` }).fill('A longer saved item for the compact title and subtitle layout');
+          const form = dialog.locator('.saved-command-form:visible');
+          assert.equal(await form.getByRole('button', { name: `Delete ${kind}` }).count(), 0, 'New entries have nothing to delete');
+          await form.getByRole('button', { name: `Save ${kind}`, exact: true }).click();
+          const row = dialog.locator('.saved-command-list:visible li');
+          assert.equal(await row.locator('.saved-command-actions button').count(), 1, 'Only Edit belongs beside the title');
+          const titleBox = await row.locator('.saved-item-title').boundingBox();
+          const textBox = await row.locator('.saved-item-text').boundingBox();
+          assert(textBox.y - titleBox.y - titleBox.height <= 3, 'Subtitle stays close to its title');
+          await page.screenshot({ path: path.join(artifacts, `list-${kind}-${touch ? 'phone' : 'desktop'}.png`) });
+          await row.getByRole('button', { name: `Edit Test ${kind}`, exact: true }).click();
+          const deleteBox = await form.getByRole('button', { name: `Delete ${kind}`, exact: true }).boundingBox();
+          const saveBox = await form.getByRole('button', { name: `Save ${kind}`, exact: true }).boundingBox();
+          const inputBox = await form.locator('textarea').boundingBox();
+          assert(deleteBox.x < saveBox.x && deleteBox.y >= inputBox.y + inputBox.height, 'Delete left, Save right, both below inputs');
+          await page.screenshot({ path: path.join(artifacts, `editor-${kind}-${touch ? 'phone' : 'desktop'}.png`) });
+          await form.getByRole('button', { name: `Delete ${kind}`, exact: true }).click();
+          await dialog.getByRole('status').getByText(`No saved ${kind}s`, { exact: true }).waitFor();
+          await page.getByRole('button', { name: 'Terminal controls', exact: true }).click();
+        }
         await page.getByRole('button', { name: 'Show preview', exact: true }).click();
         const address = page.getByRole('combobox', { name: 'Preview address' });
         const navigate = async value => { await address.fill(value); await address.press('Enter'); };
@@ -196,7 +253,7 @@ finally:
         assert((await context.cookies()).every(cookie => cookie.name !== 'ormos_preview_port'));
         await frame().getByRole('button', { name: 'Change state' }).click();
         await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
-        await page.locator('.xterm-helper-textarea').focus();
+        await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).click();
         await page.keyboard.type("printf 'STATE_%s\\n' \"$DIRECT_STATE\"");
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('STATE_kept'));
