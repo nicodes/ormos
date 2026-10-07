@@ -616,6 +616,13 @@ func serveUIFile(w http.ResponseWriter, static fs.FS, name string) {
 		}
 		name = "index.html"
 	}
+	// Vite fingerprints these assets; refreshing the HTML discovers new names
+	// after an upgrade without downloading an unchanged UI bundle on every load.
+	if strings.HasPrefix(name, "assets/") {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	} else {
+		w.Header().Set("Cache-Control", "no-cache")
+	}
 	switch {
 	case strings.HasSuffix(name, ".html"):
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

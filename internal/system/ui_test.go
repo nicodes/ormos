@@ -322,6 +322,9 @@ func TestUIPWAAssets(t *testing.T) {
 	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/manifest+json; charset=utf-8" {
 		t.Fatalf("manifest: status=%d type=%q", res.StatusCode, res.Header.Get("Content-Type"))
 	}
+	if res.Header.Get("Cache-Control") != "no-cache" {
+		t.Fatal("manifest must revalidate after upgrades")
+	}
 	var manifest struct {
 		ID, Name, Scope, Display string
 		StartURL                 string `json:"start_url"`
@@ -371,6 +374,9 @@ func TestUIServeOverLoopback(t *testing.T) {
 	if res.StatusCode != http.StatusOK || !strings.Contains(string(body[:n]), "ormos") {
 		t.Fatalf("index: status=%d", res.StatusCode)
 	}
+	if res.Header.Get("Cache-Control") != "no-cache" {
+		t.Fatal("HTML must revalidate to discover upgraded asset names")
+	}
 
 	var asset string
 	entries, err := fs.ReadDir(fix.srv.static, "assets")
@@ -392,6 +398,9 @@ func TestUIServeOverLoopback(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusOK || !strings.Contains(res.Header.Get("Content-Type"), "javascript") {
 		t.Fatalf("asset %s: status=%d type=%q", asset, res.StatusCode, res.Header.Get("Content-Type"))
+	}
+	if res.Header.Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Fatalf("fingerprinted asset is not cached: %q", res.Header.Get("Cache-Control"))
 	}
 
 	code, _ := getJSON(t, ts.URL+"/api/definitely-not-a-route")
