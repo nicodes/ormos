@@ -4,15 +4,16 @@ package system
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -23,7 +24,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/creack/pty"
 	"github.com/nicodes/ormos/internal/ui"
 )
 
@@ -74,6 +74,7 @@ type uiTerminal struct {
 	history     replayRing
 	end         uint64
 	kill        func()
+	done        chan struct{}
 	input       func([]byte) error
 	resize      func(uint16, uint16) error
 	readers     map[chan []byte]bool
@@ -90,11 +91,12 @@ func (t *uiTerminal) output() string {
 }
 
 func (t *uiTerminal) append(p []byte) {
+	if len(p) == 0 {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.history.buf == nil {
-		t.history.buf = make([]byte, uiTerminalBufMax)
-	}
+	t.growHistory(min(uiTerminalBufMax, t.history.size+len(p)))
 	t.history.append(p)
 	t.end += uint64(len(p))
 	// PTY reads reuse their buffer. Own one immutable chunk and share it across
@@ -119,13 +121,38 @@ func (t *uiTerminal) append(p []byte) {
 	}
 }
 
+// Grow under t.mu before appending so a small terminal retains every byte
+// without reserving its eventual full history bound. Copy existing wrapped
+// bytes directly once per geometric growth, preserving absolute stream offsets.
+func (t *uiTerminal) growHistory(needed int) {
+	if len(t.history.buf) >= needed {
+		return
+	}
+	capacity := min(uiTerminalBufMax, max(8192, len(t.history.buf)*2))
+	for capacity < needed {
+		capacity = min(uiTerminalBufMax, capacity*2)
+	}
+	buf := make([]byte, capacity)
+	if t.history.size > 0 {
+		n := copy(buf, t.history.buf[t.history.start:min(t.history.start+t.history.size, len(t.history.buf))])
+		copy(buf[n:], t.history.buf[:t.history.size-n])
+	}
+	t.history.buf, t.history.start = buf, 0
+}
+
 type uiServer struct {
 	version      string
 	static       fs.FS
+	staticOnce   sync.Once
+	staticAssets map[string]uiAsset
+	staticErr    error
 	hostname     string
 	mu           sync.Mutex
 	terms        map[string]*uiTerminal
 	starting     int
+	closing      bool
+	starts       sync.WaitGroup
+	connections  int
 	hosts        []string
 	defaultCwd   string
 	controlPort  int
@@ -175,13 +202,20 @@ func RunUI(args []string, version string) error {
 	local := &uiServer{version: version, static: static, hostname: host,
 		terms: map[string]*uiTerminal{}, hosts: strings.Split(*hosts, ","),
 		defaultCwd: *cwd, controlPort: *port}
-	defer local.closeTerminals()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	local.previewServe = newPreviewServe(ctx)
-	defer local.previewServe.close()
-	srv := &http.Server{Handler: local.routes(), ReadHeaderTimeout: 10 * time.Second}
-	defer srv.Close()
+	srv := &http.Server{
+		Handler: local.routes(), ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout: 15 * time.Second, IdleTimeout: time.Minute,
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
+	defer func() {
+		cancel()
+		_ = srv.Close()
+		local.closeTerminals()
+		local.previewServe.close()
+	}()
 	failed := make(chan error, 1)
 	go func() { failed <- srv.Serve(ln) }()
 	fmt.Printf("ormos ui on http://%s\n", ln.Addr())
@@ -384,7 +418,13 @@ type uiActionBody struct {
 func (s *uiServer) apiAction(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var body uiActionBody
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil {
+		uiError(w, http.StatusBadRequest, "body must be one JSON object")
+		return
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
 		uiError(w, http.StatusBadRequest, "body must be one JSON object")
 		return
 	}
@@ -435,11 +475,24 @@ func (s *uiServer) apiActionOpen(w http.ResponseWriter, body uiActionBody) {
 		return
 	}
 	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		uiError(w, http.StatusServiceUnavailable, "workspace is stopping")
+		return
+	}
 	for id, term := range s.terms {
 		term.mu.Lock()
 		alive := term.alive
 		term.mu.Unlock()
-		if !alive {
+		finished := !alive
+		if finished && term.done != nil {
+			select {
+			case <-term.done:
+			default:
+				finished = false
+			}
+		}
+		if finished {
 			delete(s.terms, id)
 		}
 	}
@@ -449,16 +502,28 @@ func (s *uiServer) apiActionOpen(w http.ResponseWriter, body uiActionBody) {
 		return
 	}
 	s.starting++
+	s.starts.Add(1)
 	s.mu.Unlock()
-	defer func() { s.mu.Lock(); s.starting--; s.mu.Unlock() }()
+	defer func() { s.mu.Lock(); s.starting--; s.mu.Unlock(); s.starts.Done() }()
 	term, err := uiSpawnTerminal(shell, resolved)
 	if err != nil {
 		uiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	s.mu.Lock()
-	s.terms[term.id] = term
+	closing := s.closing
+	if !closing {
+		s.terms[term.id] = term
+	}
 	s.mu.Unlock()
+	if closing {
+		term.kill()
+		if term.done != nil {
+			<-term.done
+		}
+		uiError(w, http.StatusServiceUnavailable, "workspace is stopping")
+		return
+	}
 	uiJSON(w, map[string]any{"v": 1, "id": term.id})
 }
 
@@ -538,122 +603,36 @@ func expandUIRoot(root string) (string, error) {
 	return filepath.EvalSymlinks(filepath.Clean(root))
 }
 
-// spawnUITerminal opens one PTY on this machine. There is no relay in this
-// path: no admission, no fence, no handshake -- the local UI is the only
-// client. The PTY belongs to this server and survives browser disconnects.
-func spawnUITerminal(shell, cwd string) (*uiTerminal, error) {
-	id := newUIID()
-	cmd := exec.Command(shell)
-	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 80})
-	if err != nil {
-		return nil, err
-	}
-	t := &uiTerminal{
-		id:      id,
-		shell:   shell,
-		cwd:     cwd,
-		started: time.Now(),
-		alive:   true,
-		readers: map[chan []byte]bool{},
-		input:   func(data []byte) error { _, err := ptmx.Write(data); return err },
-		resize:  func(cols, rows uint16) error { return pty.Setsize(ptmx, &pty.Winsize{Rows: rows, Cols: cols}) },
-	}
-	t.kill = func() {
-		t.mu.Lock()
-		t.alive = false
-		t.mu.Unlock()
-		_ = cmd.Process.Signal(syscall.SIGHUP)
-		time.AfterFunc(uiTerminalKillGap, func() {
-			_ = cmd.Process.Kill()
-			_ = ptmx.Close()
-		})
-	}
-	go func() {
-		chunk := make([]byte, 8192)
-		for {
-			n, err := ptmx.Read(chunk)
-			if n > 0 {
-				t.append(chunk[:n])
-			}
-			if err != nil {
-				break
-			}
-		}
-	}()
-	go func() {
-		_ = cmd.Wait()
-		t.mu.Lock()
-		t.alive = false
-		for reader := range t.readers {
-			close(reader)
-			delete(t.readers, reader)
-		}
-		for update := range t.updates {
-			close(update)
-			delete(t.updates, update)
-		}
-		t.mu.Unlock()
-		_ = ptmx.Close()
-	}()
-	return t, nil
-}
-
 func newUIID() string {
-	b := make([]byte, 8)
-	f, err := os.Open("/dev/urandom")
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-	if _, err := f.Read(b); err != nil {
-		panic(err)
-	}
+	var b [8]byte
+	_, _ = rand.Read(b[:]) // crypto/rand.Read fills the buffer or terminates safely.
 	return fmt.Sprintf("t_%x", b)
 }
 
 func (s *uiServer) spa(w http.ResponseWriter, r *http.Request) {
-	name := filepath.ToSlash(filepath.Clean("/" + r.URL.Path))
-	if name == "/" {
-		name = "/index.html"
-	}
-	serveUIFile(w, s.static, strings.TrimPrefix(name, "/"))
-}
-
-func serveUIFile(w http.ResponseWriter, static fs.FS, name string) {
-	if strings.Contains(name, "..") {
-		http.NotFound(w, nil)
+	s.staticOnce.Do(func() { s.staticAssets, s.staticErr = loadUIAssets(s.static) })
+	if s.staticErr != nil {
+		http.Error(w, "UI assets unavailable", http.StatusInternalServerError)
 		return
 	}
-	data, err := fs.ReadFile(static, name)
-	if err != nil {
-		// SPA fallback: client-side routes resolve to index.html.
-		data, err = fs.ReadFile(static, "index.html")
-		if err != nil {
-			http.NotFound(w, nil)
+	name := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+r.URL.Path)), "/")
+	if name == "" {
+		name = "index.html"
+	}
+	asset, found := s.staticAssets[name]
+	if !found {
+		// Missing chunks must not become immutable cached HTML. Client-side routes
+		// still use the SPA entry, but a missing file is a real 404.
+		if strings.HasPrefix(name, "assets/") || filepath.Ext(name) != "" {
+			http.NotFound(w, r)
 			return
 		}
 		name = "index.html"
+		asset, found = s.staticAssets[name]
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
 	}
-	// Vite fingerprints these assets; refreshing the HTML discovers new names
-	// after an upgrade without downloading an unchanged UI bundle on every load.
-	if strings.HasPrefix(name, "assets/") {
-		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	} else {
-		w.Header().Set("Cache-Control", "no-cache")
-	}
-	switch {
-	case strings.HasSuffix(name, ".html"):
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	case strings.HasSuffix(name, ".js"):
-		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	case strings.HasSuffix(name, ".css"):
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	case strings.HasSuffix(name, ".webmanifest"):
-		w.Header().Set("Content-Type", "application/manifest+json; charset=utf-8")
-	case strings.HasSuffix(name, ".svg"):
-		w.Header().Set("Content-Type", "image/svg+xml")
-	}
-	_, _ = w.Write(data)
+	serveUIAsset(w, r, name, asset)
 }

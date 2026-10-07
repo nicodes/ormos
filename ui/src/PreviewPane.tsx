@@ -1,6 +1,7 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
 
 import { Portal } from "solid-js/web";
+import { readStorage, writeStorage, removeStorage } from "./storage";
 import BrowserMenu from "./BrowserMenu";
 import { APIError, request } from "./api";
 import { parsePreviewAddress, previewURL, type PreviewTarget } from "./preview";
@@ -22,16 +23,16 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
   };
   const loadHistory = (): PreviewHistory => {
     try {
-      const saved = JSON.parse(localStorage.getItem("ormos.previewHistory") ?? "null");
+      const saved = JSON.parse(readStorage("ormos.previewHistory") ?? "null");
       if (validHistory(saved)) return saved;
       // Keep the previously selected preview when migrating away from tabs.
-      const tabs = JSON.parse(localStorage.getItem("ormos.previewTabs") ?? "null");
+      const tabs = JSON.parse(readStorage("ormos.previewTabs") ?? "null");
       if (Array.isArray(tabs)) {
-        const selected = tabs.find(tab => tab?.id === localStorage.getItem("ormos.activePreview")) ?? tabs[0];
+        const selected = tabs.find(tab => tab?.id === readStorage("ormos.activePreview")) ?? tabs[0];
         if (validHistory(selected)) return { history: selected.history, index: selected.index };
       }
     } catch { /* invalid saved state starts with an empty preview */ }
-    const legacy = localStorage.getItem("ormos.previewPort");
+    const legacy = readStorage("ormos.previewPort");
     if (legacy) {
       try { return { history: [parseAddress(legacy)], index: 0 }; } catch { /* ignore invalid legacy port */ }
     }
@@ -44,7 +45,7 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
   };
   const loadRecent = () => {
     try {
-      const saved = JSON.parse(localStorage.getItem("ormos.previewRecent") ?? "null");
+      const saved = JSON.parse(readStorage("ormos.previewRecent") ?? "null");
       if (Array.isArray(saved) && validHistory({ history: saved, index: -1 })) return uniqueRecent(saved);
     } catch { /* seed recent visits from existing navigation history */ }
     return uniqueRecent([...current().history].reverse());
@@ -53,7 +54,7 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
   const remember = (item?: PreviewTarget) => {
     if (!item) return;
     setRecent(rows => uniqueRecent([item, ...rows]));
-    localStorage.setItem("ormos.previewRecent", JSON.stringify(recent()));
+    writeStorage("ormos.previewRecent", JSON.stringify(recent()));
   };
   const target = () => current().history[current().index];
   const [address, setAddress] = createSignal(addressFor(target()));
@@ -79,20 +80,23 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
     if (!shown) return;
     placeHistory(); setActivePorts(null);
     let live = true;
+    let timer: number | undefined;
+    const controller = new AbortController();
     const refreshPorts = async () => {
       try {
-        const data = await request<{ ports: { port: number }[] }>("/api/ports");
+        const data = await request<{ ports: { port: number }[] }>("/api/ports", undefined, controller.signal);
         if (live) setActivePorts(new Set(data.ports.map(row => row.port)));
       } catch { if (live) setActivePorts(null); }
+      finally { if (live) timer = window.setTimeout(() => void refreshPorts(), 3000); }
     };
-    void refreshPorts(); const timer = window.setInterval(() => void refreshPorts(), 3000);
-    onCleanup(() => { live = false; window.clearInterval(timer); });
+    void refreshPorts();
+    onCleanup(() => { live = false; window.clearTimeout(timer); controller.abort(); });
   }));
   const persist = () => {
-    localStorage.setItem("ormos.previewHistory", JSON.stringify(current()));
-    localStorage.removeItem("ormos.previewTabs");
-    localStorage.removeItem("ormos.activePreview");
-    localStorage.removeItem("ormos.previewPort");
+    if (!writeStorage("ormos.previewHistory", JSON.stringify(current()))) return;
+    removeStorage("ormos.previewTabs");
+    removeStorage("ormos.activePreview");
+    removeStorage("ormos.previewPort");
   };
   const record = (next: PreviewTarget) => {
     remember(next);

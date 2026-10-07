@@ -16,7 +16,10 @@ import (
 	"github.com/coder/websocket"
 )
 
-const uiMaxTerminalReaders = 8
+const (
+	uiMaxTerminalReaders  = 8
+	uiMaxWorkspaceReaders = 64
+)
 
 // No account system: the private listener is the access boundary. Host and
 // Origin checks prevent other browser pages from controlling local terminals.
@@ -66,10 +69,23 @@ func (s *uiServer) guard(next http.Handler) http.Handler {
 
 func (s *uiServer) closeTerminals() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.closing = true
+	terms := make([]*uiTerminal, 0, len(s.terms))
 	for _, term := range s.terms {
+		terms = append(terms, term)
+	}
+	s.mu.Unlock()
+	// Signal every terminal first so shutdown takes one grace period, not one
+	// per tab. Never wait under the server lock or race a still-opening PTY.
+	for _, term := range terms {
 		term.kill()
 	}
+	for _, term := range terms {
+		if term.done != nil {
+			<-term.done
+		}
+	}
+	s.starts.Wait()
 }
 
 func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
@@ -110,6 +126,23 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 		}
 		since = &offset
 	}
+	// A retired terminal can still have a slow socket draining its tail. Count
+	// those sockets globally until their handlers finish, even after the PTY
+	// leaves the terminal table, so repeated open/kill cycles stay bounded.
+	s.mu.Lock()
+	if s.closing || s.connections >= uiMaxWorkspaceReaders {
+		closing := s.closing
+		s.mu.Unlock()
+		if closing {
+			uiError(w, http.StatusServiceUnavailable, "workspace is stopping")
+		} else {
+			uiError(w, http.StatusTooManyRequests, "workspace connection limit reached")
+		}
+		return
+	}
+	s.connections++
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.connections--; s.mu.Unlock() }()
 	// Reserve before upgrading, including connections whose slow output queue
 	// was evicted but whose socket is still closing. Failed upgrades release it.
 	term.mu.Lock()

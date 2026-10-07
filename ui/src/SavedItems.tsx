@@ -1,10 +1,12 @@
 import { createEffect, createSignal, For, on, onCleanup, Show } from "solid-js";
 
+import { readStorage, writeStorage } from "./storage";
+
 export type SavedEditor = { editing: boolean };
 type SavedItem = { id: string; title: string; text: string };
 const load = (storageKey: string, kind: "command" | "prompt"): SavedItem[] => {
   try {
-    const rows = JSON.parse(localStorage.getItem(storageKey) ?? "[]");
+    const rows = JSON.parse(readStorage(storageKey) ?? "[]");
     if (Array.isArray(rows)) return rows.filter(row => row && typeof row.id === "string" && typeof row.title === "string" && row.title.trim() && typeof row[kind] === "string" && row[kind].trim()).map(row => ({ id: row.id, title: row.title, text: row[kind] }));
   } catch { /* start with an empty list if saved data is invalid */ }
   return [];
@@ -28,8 +30,10 @@ export default function SavedItems(props: { kind: "command" | "prompt"; createRe
   createEffect(on(() => props.visible, visible => { if (!visible) { setEditing(null); setError(""); } }));
   onCleanup(() => props.registerEditor());
   const persist = (rows: SavedItem[]) => {
-    try { localStorage.setItem(storageKey, JSON.stringify(rows.map(row => ({ id: row.id, title: row.title, [kind]: row.text })))); setCommands(rows); setError(""); return true; }
-    catch { setError(`Could not save ${kind}s in this browser.`); return false; }
+    if (!writeStorage(storageKey, JSON.stringify(rows.map(row => ({ id: row.id, title: row.title, [kind]: row.text }))))) {
+      setError(`Could not save ${kind}s in this browser.`); return false;
+    }
+    setCommands(rows); setError(""); return true;
   };
   const save = () => {
     const id = editing(); if (id === null || !title().trim() || !command().trim()) return;
