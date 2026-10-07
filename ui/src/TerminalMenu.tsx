@@ -1,5 +1,6 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { Portal } from "solid-js/web";
+import TerminalKeyIcon from "./TerminalKeyIcon";
 import { terminalKeys } from "./terminalKeys";
 import SavedItems, { type SavedEditor } from "./SavedItems";
 
@@ -74,7 +75,7 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
         </button></Show></div>
         <div id="shortcut-panel" class="shortcut-controls" role="tabpanel" aria-labelledby="shortcut-tab" hidden={tab() !== "keyboard"}>
           <button disabled={!props.enabled} onClick={() => { setOpen(false); props.keyboard(); }}>Keyboard</button>
-          <div class="terminal-menu-keys"><For each={terminalKeys}>{key => <button disabled={!props.enabled} aria-label={key.name} onPointerDown={e => e.preventDefault()} onClick={() => props.type(key.data)}>{key.label}</button>}</For></div>
+          <div class="terminal-menu-keys"><For each={terminalKeys}>{key => <button disabled={!props.enabled} aria-label={key.name} onPointerDown={e => e.preventDefault()} onClick={() => props.type(key.data)}><TerminalKeyIcon label={key.label} icon={"icon" in key ? key.icon : undefined} /></button>}</For></div>
         </div>
         <div id="saved-command-panel" role="tabpanel" aria-labelledby="saved-command-tab" hidden={tab() !== "saved"}>
           <SavedItems visible={tab() === "saved"} registerEditor={setCommandEditor} createRequest={createCommand()} kind="command" enabled={props.enabled} use={command => { props.type(`${command}\r`); setOpen(false); }} />

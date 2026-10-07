@@ -52,6 +52,7 @@ input:focus, button:focus-visible { outline: 2px solid #9ca3af; outline-offset: 
 .terminal-menu { position: fixed; z-index: 10; width: 320px; max-width: calc(100vw - 16px); max-height: calc(var(--viewport-height, 100dvh) - 16px); overflow-y: auto; padding: 10px; border: 1px solid #374151; border-radius: 8px; background: #111827; box-shadow: 0 8px 24px #0008; }
 .shortcut-controls > button { width: 100%; margin-bottom: 8px; }
 .terminal-menu-keys { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.terminal-menu-keys button { display: flex; align-items: center; justify-content: center; }
 .terminal-menu button { font-size: 13px; min-height: 36px; }
 iframe { flex: 1; width: 100%; min-height: 0; border: 0; background: #0b0f19; }
 .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; text-align: center; }
@@ -113,7 +114,6 @@ button, .header-icon { -webkit-tap-highlight-color: transparent; }
 .quick-key-group { display: flex; align-items: center; gap: 4px; }
 .terminal-quick-controls .quick-key { display: flex; align-items: center; justify-content: center; flex: none; min-width: 44px; height: 44px; padding: 0 8px; border: 0; border-radius: 6px; background: transparent; color: #9ca3af; font-size: 14px; line-height: 1; touch-action: manipulation; }
 .terminal-quick-controls .quick-key svg { width: 20px; height: 20px; }
-.terminal-quick-controls .interrupt-key { min-width: 60px; }
 @media (max-width: 340px) { .terminal-quick-controls, .quick-key-group { gap: 0; } }
 
 .saved-editor-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

@@ -153,7 +153,7 @@ finally:
         await scroll(-240);
         await page.waitForFunction(previous => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]) > previous, previous, { timeout: 3000 });
         const quick = page.getByRole('toolbar', { name: 'Quick terminal controls' });
-        assert.equal(await quick.getByRole('button').count(), 6);
+        assert.equal(await quick.getByRole('button').count(), 7);
         // Inspect actual WebSocket input while the fixture has a raw PTY,
         // so Ctrl+C and Esc test their bytes without terminating a shell.
         await page.evaluate(() => {
@@ -162,10 +162,10 @@ finally:
           const send = socket.send.bind(socket);
           socket.send = data => { const message = JSON.parse(data); if (message.type === 'input') window.testKeyInput.push(message.data); send(data); };
         });
-        for (const name of ['Tab', 'Escape', 'Up arrow', 'Down arrow', 'Ctrl C']) {
+        for (const name of ['Tab', 'Escape', 'Up arrow', 'Down arrow', 'Enter', 'Ctrl C']) {
           await pressControl(quick.getByRole('button', { name, exact: true }));
         }
-        assert.deepEqual(await page.evaluate(() => window.testKeyInput), ['\t', '\x1b', '\x1b[A', '\x1b[B', '\x03']);
+        assert.deepEqual(await page.evaluate(() => window.testKeyInput), ['\t', '\x1b', '\x1b[A', '\x1b[B', '\r', '\x03']);
         if (touch) {
           assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'none');
           assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), true);
