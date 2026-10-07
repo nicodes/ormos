@@ -66,3 +66,57 @@ func BenchmarkUITerminalFanout(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkUITerminalFirstOutput(b *testing.B) {
+	data := []byte("shell prompt\r\n")
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		term := &uiTerminal{}
+		term.append(data)
+	}
+}
+
+func TestUIHistoryGrowsWithoutChangingReplay(t *testing.T) {
+	term := &uiTerminal{}
+	term.append(nil)
+	if term.history.buf != nil {
+		t.Fatal("empty output allocated history")
+	}
+	term.append([]byte("prompt"))
+	if len(term.history.buf) > 8192 {
+		t.Fatal("small terminal reserved its full history bound")
+	}
+	expected, end := []byte("prompt"), uint64(6)
+	for _, length := range []int{8191, 1, 8192, 110003, 1 << 20, uiTerminalBufMax - 17, 257, uiTerminalBufMax + 13} {
+		data := make([]byte, length)
+		for i := range data {
+			data[i] = byte(i*31 + length)
+		}
+		term.append(data)
+		expected = append(expected, data...)
+		if len(expected) > uiTerminalBufMax {
+			expected = expected[len(expected)-uiTerminalBufMax:]
+		}
+		end += uint64(len(data))
+		got, start, reset := term.replay(nil)
+		if !bytes.Equal(got, expected) || !reset || start != end-uint64(len(expected)) || term.end != end {
+			t.Fatalf("growth at %d changed byte order or offsets", length)
+		}
+		if len(term.history.buf) < len(expected) || len(term.history.buf) > uiTerminalBufMax {
+			t.Fatal("history allocation escaped its bounds")
+		}
+	}
+}
+
+func TestUIHistoryGrowthPreservesWrappedBuffer(t *testing.T) {
+	term := &uiTerminal{history: replayRing{buf: make([]byte, 8)}, end: 10}
+	term.history.append([]byte("abcdefghij"))
+	term.append([]byte("klmnop"))
+	if got := term.output(); got != "cdefghijklmnop" {
+		t.Fatalf("wrapped growth = %q", got)
+	}
+	_, start, _ := term.replay(nil)
+	if start != 2 {
+		t.Fatalf("growth invented earlier history: start=%d", start)
+	}
+}

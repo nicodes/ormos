@@ -10,11 +10,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -252,5 +255,33 @@ func TestPreviewRefusesAnotherWorkspace(t *testing.T) {
 	port, _ := strconv.Atoi(target.Port())
 	if err := loopbackAppListening(context.Background(), port); err == nil {
 		t.Fatal("accepted a workspace as a preview destination")
+	}
+}
+
+func TestServeStatusDoesNotWaitForInheritedOutputPipe(t *testing.T) {
+	dir := t.TempDir()
+	pidfile := filepath.Join(dir, "child-pid")
+	t.Setenv("ORMOS_TEST_CHILD_PID", pidfile)
+	t.Setenv("PATH", dir)
+	script := "#!/bin/sh\n/bin/sleep 30 &\nprintf '%s' $! > \"$ORMOS_TEST_CHILD_PID\"\nprintf '{}'\n"
+	if err := os.WriteFile(filepath.Join(dir, "tailscale"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		data, _ := os.ReadFile(pidfile)
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(data)))
+		if pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	})
+	result := make(chan error, 1)
+	go func() { _, err := readServeStatus(context.Background()); result <- err }()
+	select {
+	case err := <-result:
+		if !errors.Is(err, exec.ErrWaitDelay) {
+			t.Fatalf("inherited pipe error = %v, want ErrWaitDelay", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("exited CLI left status waiting on a descendant's pipe")
 	}
 }

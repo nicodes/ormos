@@ -19,7 +19,10 @@ import (
 	"time"
 )
 
-const maxPreviewRoutes = 32
+const (
+	maxPreviewRoutes = 32
+	serveWaitDelay   = 2 * time.Second
+)
 
 // Foreground Serve sessions are owned by their CLI watcher. Stopping that
 // watcher removes only its session; no reset, off or background edits are used.
@@ -271,6 +274,9 @@ func (s *previewServe) close() {
 // account/setup details and is never returned to the browser.
 func readServeStatus(ctx context.Context) (*serveConfig, error) {
 	cmd := exec.CommandContext(ctx, "tailscale", "serve", "status", "--json")
+	// Bound pipe draining even if an exited CLI leaves a descendant holding
+	// stdout open; cancellation alone only stops the direct process.
+	cmd.WaitDelay = serveWaitDelay
 	output := &boundedServeOutput{}
 	cmd.Stdout = output
 	cmd.Stderr = io.Discard
@@ -318,7 +324,7 @@ func startServeSession(parent context.Context, scheme string, port, localPort in
 	cmd.Stdout = &serveReadyOutput{ready: session.ready}
 	cmd.Stderr = io.Discard
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
-	cmd.WaitDelay = 2 * time.Second
+	cmd.WaitDelay = serveWaitDelay
 	if err := cmd.Start(); err != nil {
 		cancel()
 		return nil, err
