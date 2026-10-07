@@ -22,6 +22,29 @@ type previewRoute struct {
 	session               *serveSession
 }
 
+// Reuse copy buffers across app assets and routes. Idle retention is capped at
+// 512 KiB; concurrent responses beyond that still get their own working buffer.
+type previewBufferPool chan []byte
+
+func (pool previewBufferPool) Get() []byte {
+	select {
+	case buffer := <-pool:
+		return buffer
+	default:
+		return make([]byte, 32<<10)
+	}
+}
+
+func (pool previewBufferPool) Put(buffer []byte) {
+	if len(buffer) != 32<<10 || cap(buffer) != 32<<10 {
+		return
+	}
+	select {
+	case pool <- buffer:
+	default:
+	}
+}
+
 func (r *previewRoute) close() {
 	if r.cancel != nil {
 		r.cancel()
@@ -48,7 +71,8 @@ func (s *previewServe) proxyHandler(ctx context.Context, port int, scheme, autho
 	context.AfterFunc(ctx, transport.CloseIdleConnections)
 	origin := scheme + "://" + authority
 	proxy := &httputil.ReverseProxy{
-		Transport: transport,
+		Transport:  transport,
+		BufferPool: s.buffers,
 		Rewrite: func(p *httputil.ProxyRequest) {
 			p.SetURL(upstream)
 			// Rewrite only a legitimate same-preview origin. Never bless a foreign

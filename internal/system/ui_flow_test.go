@@ -93,7 +93,7 @@ func TestUIFlowReplayAndInput(t *testing.T) {
 func testUIFlowReplayAndInput(t *testing.T, mode websocket.CompressionMode) {
 	fix := newUIFixture(t, nil)
 	input := make(chan string, 1)
-	term := &uiTerminal{id: "t_flow", alive: true, input: func(p []byte) error { input <- string(p); return nil }}
+	term := &uiTerminal{id: "t_flow", alive: true, input: func(_ context.Context, p []byte) error { input <- string(p); return nil }}
 	history := bytes.Repeat([]byte("history\r\n"), (3<<20)/9)
 	term.append(history)
 	fix.srv.terms[term.id] = term

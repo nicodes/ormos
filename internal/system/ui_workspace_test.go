@@ -99,7 +99,7 @@ func TestUITerminalCompressedReplay(t *testing.T) {
 func TestUITerminalInputWhileHistoryBlocked(t *testing.T) {
 	fix := newUIFixture(t, nil)
 	input := make(chan string, 1)
-	term := &uiTerminal{id: "t_slow", alive: true, input: func(p []byte) error { input <- string(p); return nil }}
+	term := &uiTerminal{id: "t_slow", alive: true, input: func(_ context.Context, p []byte) error { input <- string(p); return nil }}
 	term.append(bytes.Repeat([]byte("x"), 128<<10))
 	fix.srv.terms[term.id] = term
 	ts := httptest.NewUnstartedServer(fix.srv.routes())
@@ -239,7 +239,16 @@ func TestUITerminalAttachmentLimitAndCleanup(t *testing.T) {
 		}
 	}
 	dial := func() (*websocket.Conn, *http.Response, error) {
-		return websocket.Dial(ctx, "ws"+strings.TrimPrefix(endpoint, "http"), &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{ts.URL}}})
+		conn, res, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(endpoint, "http"), &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{ts.URL}}})
+		if err == nil {
+			// A successful upgrade precedes subscription. Wait for replay
+			// metadata before asserting the handler's reader registration.
+			if _, _, err = conn.Read(ctx); err != nil {
+				conn.CloseNow()
+				return nil, res, err
+			}
+		}
+		return conn, res, err
 	}
 	var connections []*websocket.Conn
 	defer func() {

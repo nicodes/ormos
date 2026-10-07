@@ -4,6 +4,7 @@ package system
 
 import (
 	"bytes"
+	"context"
 	"golang.org/x/sys/unix"
 	"os"
 	"path/filepath"
@@ -96,7 +97,7 @@ func TestUITerminalCloseWakesBlockedInput(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	wrote := make(chan error, 1)
-	go func() { wrote <- term.input(bytes.Repeat([]byte("x"), 1<<20)) }()
+	go func() { wrote <- term.input(context.Background(), bytes.Repeat([]byte("x"), 1<<20)) }()
 	select {
 	case <-wrote:
 		t.Fatal("fixture input did not block")
@@ -172,12 +173,13 @@ func TestUIShutdownRacesPendingOpen(t *testing.T) {
 
 func TestUITerminalKillStopsForegroundJob(t *testing.T) {
 	dir := t.TempDir()
+	t.Setenv("HOME", dir)
 	term, err := spawnUITerminal("/bin/bash", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { term.kill(); <-term.done })
-	if err := term.input([]byte("sh -c 'trap \"\" HUP; echo $$ > foreground; exec sleep 30'\r")); err != nil {
+	if err := term.input(context.Background(), []byte("sh -c 'trap \"\" HUP; echo $$ > foreground; exec sleep 30'\r")); err != nil {
 		t.Fatal(err)
 	}
 	var pid int

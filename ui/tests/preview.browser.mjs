@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, rm, mkdir, writeFile, readFile } from 'node:fs/promises';
@@ -128,6 +129,87 @@ finally:
       });
     } finally { await context.close(); }
   });
+  await t.test('saved lists mount only when selected and large prompts obey input credits', async () => {
+    const text = '😀終'.repeat(15000), bytes = Buffer.byteLength(text);
+    await writeFile(path.join(home, 'paste-app.py'), `import os,tty,termios,hashlib
+original = termios.tcgetattr(0)
+tty.setraw(0)
+print('PASTE_READY', flush=True)
+data = bytearray()
+try:
+    while len(data) < ${bytes}:
+        data.extend(os.read(0, min(4096, ${bytes} - len(data))))
+    print('PASTE_RESULT_' + str(len(data)) + '_' + hashlib.sha256(data).hexdigest(), flush=True)
+finally:
+    termios.tcsetattr(0, termios.TCSADRAIN, original)
+`);
+    const context = await browser.newContext();
+    try {
+      await context.addInitScript(text => {
+        localStorage.setItem('ormos.savedCommands', JSON.stringify([{ id: 'command', title: 'Only commands', command: 'true' }]));
+        localStorage.setItem('ormos.savedPrompts', JSON.stringify([{ id: 'prompt', title: 'Large prompt', prompt: text }]));
+        window.testSavedReads = [];
+        const get = Storage.prototype.getItem;
+        Storage.prototype.getItem = function(key) { if (key.startsWith('ormos.saved')) window.testSavedReads.push(key); return get.call(this, key); };
+        window.testInputSockets = []; window.testHeldInputAcks = []; window.testHoldInputAcks = false;
+        const Native = window.WebSocket;
+        window.WebSocket = class extends Native {
+          constructor(...args) {
+            super(...args);
+            if (!String(args[0]).includes('/api/terminal/')) return;
+            window.testInputSockets.push(this);
+            this.testInputPending = 0; this.testInputMaximum = 0;
+            this.addEventListener('message', event => {
+              if (typeof event.data !== 'string') return;
+              const message = JSON.parse(event.data);
+              if (message.type === 'replay') this.testInputWindow = message.inputWindow;
+              if (message.type === 'input-ack') {
+                if (window.testHoldInputAcks) { window.testHeldInputAcks.push([this, event.data]); event.stopImmediatePropagation(); return; }
+                this.testInputPending -= message.bytes;
+              }
+            });
+          }
+          send(data) {
+            const message = JSON.parse(data);
+            if (message.type === 'input') { this.testInputPending += new TextEncoder().encode(message.data).byteLength; this.testInputMaximum = Math.max(this.testInputMaximum, this.testInputPending); }
+            super.send(data);
+          }
+        };
+      }, text);
+      const page = await context.newPage();
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      const terminal = page.locator('.terminal-container');
+      await terminal.click();
+      await page.keyboard.type('python3 -u paste-app.py'); await page.keyboard.press('Enter');
+      await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('PASTE_READY'));
+      await page.getByRole('button', { name: 'Terminal controls', exact: true }).click();
+      const dialog = page.getByRole('dialog', { name: 'Terminal tools' });
+      assert.deepEqual(await page.evaluate(() => window.testSavedReads), [], 'Keyboard menu must not read or render saved lists');
+      await dialog.getByRole('tab', { name: 'Saved commands', exact: true }).click();
+      await dialog.getByRole('button', { name: 'Run Only commands', exact: true }).waitFor();
+      assert.deepEqual(await page.evaluate(() => window.testSavedReads), ['ormos.savedCommands']);
+      await dialog.getByRole('tab', { name: 'Saved prompts', exact: true }).click();
+      await dialog.getByRole('button', { name: 'Paste Large prompt', exact: true }).waitFor();
+      assert.equal(await page.locator('.saved-item-title').count(), 1, 'Inactive saved list must not retain DOM');
+      await page.evaluate(() => { window.testHoldInputAcks = true; });
+      await dialog.getByRole('button', { name: 'Paste Large prompt', exact: true }).click();
+      await page.waitForFunction(() => window.testInputSockets.at(-1).testInputPending > 25000);
+      await page.waitForTimeout(100);
+      assert(await page.evaluate(() => window.testInputSockets.at(-1).testInputMaximum <= 32768));
+      assert(!await terminal.textContent().then(value => value.includes('PASTE_RESULT_')), 'Prompt must pause until PTY byte credits return');
+      await page.evaluate(() => {
+        window.testHoldInputAcks = false;
+        for (const [socket, data] of window.testHeldInputAcks.splice(0)) socket.dispatchEvent(new MessageEvent('message', { data }));
+      });
+      const marker = `PASTE_RESULT_${bytes}_${createHash('sha256').update(text).digest('hex')}`;
+      await page.waitForFunction(marker => document.querySelector('.xterm-screen').textContent.replace(/\s/g, '').includes(marker), marker);
+      assert(await page.evaluate(() => window.testInputSockets.at(-1).testInputMaximum <= 32768));
+      await page.evaluate(async () => {
+        for (const row of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill', id: row.id }) });
+      });
+    } finally { await context.close(); }
+  });
   await t.test('terminal code loads in parallel with session discovery', async () => {
     const context = await browser.newContext();
     try {
@@ -211,7 +293,7 @@ finally:
                 window.testTerminalSockets.push(this);
                 this.testPending = 0; this.testMaximum = 0; this.testWindow = 0;
                 this.addEventListener('message', event => {
-                  if (typeof event.data === 'string') this.testWindow = JSON.parse(event.data).window || 0;
+                  if (typeof event.data === 'string') { const message = JSON.parse(event.data); if (message.type === 'replay') this.testWindow = message.window || 0; }
                   else {
                     this.testPending += event.data.byteLength;
                     this.testMaximum = Math.max(this.testMaximum, this.testPending);

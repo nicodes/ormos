@@ -3,6 +3,7 @@
 package system
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -17,6 +18,127 @@ import (
 
 	"github.com/coder/websocket"
 )
+
+func BenchmarkPreviewProxyAsset(b *testing.B) {
+	payload := bytes.Repeat([]byte("x"), 1<<20)
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(payload) }))
+	defer app.Close()
+	target, _ := url.Parse(app.URL)
+	port, _ := strconv.Atoi(target.Port())
+	oldPolicy := uiLoadPolicy
+	uiLoadPolicy = func() (policy, error) { return policy{AllowedPorts: []int{port}}, nil }
+	defer func() { uiLoadPolicy = oldPolicy }()
+	for _, pooled := range []bool{false, true} {
+		b.Run(strconv.FormatBool(pooled), func(b *testing.B) {
+			s := newPreviewServe(context.Background())
+			defer s.cancel()
+			if !pooled {
+				s.buffers = nil
+			}
+			proxy := s.proxyHandler(s.ctx, port, "http", "localhost:3000")
+			r := httptest.NewRequest("GET", "http://localhost:3000/asset.wasm", nil)
+			w := &uiDiscardResponse{header: make(http.Header)}
+			proxy.ServeHTTP(w, r) // warm transport and buffer pool
+			b.SetBytes(int64(len(payload)))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				w.size = 0
+				clear(w.header)
+				proxy.ServeHTTP(w, r)
+				if w.size != len(payload) {
+					b.Fatal("proxy changed body length")
+				}
+			}
+		})
+	}
+}
+
+func TestPreviewBufferPoolRetentionBound(t *testing.T) {
+	pool := make(previewBufferPool, 16)
+	for range 32 {
+		pool.Put(make([]byte, 32<<10))
+	}
+	if len(pool) != 16 {
+		t.Fatal("idle buffer retention exceeded its bound")
+	}
+	pool.Put(make([]byte, 1))
+	buffer := pool.Get()
+	if len(buffer) != 32<<10 || len(pool) != 15 {
+		t.Fatal("pooled transfer buffer not reused")
+	}
+}
+
+func TestPreviewRouteCloseCancelsStreamingHTTPAndWebSocket(t *testing.T) {
+	for _, upgrade := range []bool{false, true} {
+		t.Run(strconv.FormatBool(upgrade), func(t *testing.T) {
+			newUIFixture(t, nil)
+			started, ended := make(chan struct{}), make(chan struct{})
+			app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer close(ended)
+				if upgrade {
+					conn, err := websocket.Accept(w, r, nil)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					defer conn.CloseNow()
+					close(started)
+					_, _, _ = conn.Read(r.Context())
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = fmt.Fprint(w, "data: ready\n\n")
+				w.(http.Flusher).Flush()
+				close(started)
+				<-r.Context().Done()
+			}))
+			defer app.Close()
+			target, _ := url.Parse(app.URL)
+			port, _ := strconv.Atoi(target.Port())
+			uiLoadPolicy = func() (policy, error) { return policy{AllowedPorts: []int{port}}, nil }
+			s := testPreviewServe(t)
+			exposed, err := s.open(context.Background(), port, "http", "127.0.0.1", 4242)
+			if err != nil {
+				t.Fatal(err)
+			}
+			address := "127.0.0.1:" + strconv.Itoa(exposed)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			var socket *websocket.Conn
+			if upgrade {
+				socket, _, err = websocket.Dial(ctx, "ws://"+address+"/hmr", &websocket.DialOptions{HTTPHeader: http.Header{"Origin": {"http://" + address}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer socket.CloseNow()
+			} else {
+				r, _ := http.NewRequestWithContext(ctx, "GET", "http://"+address+"/events", nil)
+				res, err := http.DefaultClient.Do(r)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer res.Body.Close()
+				prefix := make([]byte, len("data: ready\n\n"))
+				if _, err := io.ReadFull(res.Body, prefix); err != nil || string(prefix) != "data: ready\n\n" {
+					t.Fatalf("SSE buffered or changed: %q %v", prefix, err)
+				}
+			}
+			<-started
+			s.close()
+			select {
+			case <-ended:
+			case <-ctx.Done():
+				t.Fatal("route shutdown left the app connection running")
+			}
+			if socket != nil {
+				if _, _, err := socket.Read(ctx); err == nil {
+					t.Fatal("hijacked preview survived shutdown")
+				}
+			}
+		})
+	}
+}
 
 func TestPreviewProxyHostOriginPathsRedirectsAndPolicy(t *testing.T) {
 	newUIFixture(t, nil)
