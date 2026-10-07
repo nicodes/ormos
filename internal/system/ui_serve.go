@@ -30,6 +30,7 @@ type previewServe struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	gate      chan struct{}
+	buffers   previewBufferPool
 	sessions  map[string]*previewRoute
 	status    func(context.Context) (*serveConfig, error)
 	start     func(context.Context, string, int, int) (*serveSession, error)
@@ -61,7 +62,7 @@ func (e *previewSetupError) Error() string { return e.message }
 
 func newPreviewServe(parent context.Context) *previewServe {
 	ctx, cancel := context.WithCancel(parent)
-	return &previewServe{ctx: ctx, cancel: cancel, gate: make(chan struct{}, 1), sessions: map[string]*previewRoute{}, status: readServeStatus, start: startServeSession, listening: loopbackAppListening}
+	return &previewServe{ctx: ctx, cancel: cancel, gate: make(chan struct{}, 1), buffers: make(previewBufferPool, 16), sessions: map[string]*previewRoute{}, status: readServeStatus, start: startServeSession, listening: loopbackAppListening}
 }
 
 func loopbackAppListening(ctx context.Context, port int) error {
