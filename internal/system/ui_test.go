@@ -5,6 +5,8 @@ package system
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"image/png"
 	"io/fs"
 	"net"
 	"net/http"
@@ -306,6 +308,52 @@ func TestUIInjectionNeverReachesSpawn(t *testing.T) {
 	}
 	if !strings.Contains(fix.spawnLog.String(), "\x00"+resolvedSub) {
 		t.Fatalf("spawn got an unresolved cwd: %q", fix.spawnLog.String())
+	}
+}
+
+func TestUIPWAAssets(t *testing.T) {
+	fix := newUIFixture(t, nil)
+	ts := fix.start(t)
+	res, err := http.Get(ts.URL + "/manifest.webmanifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "application/manifest+json; charset=utf-8" {
+		t.Fatalf("manifest: status=%d type=%q", res.StatusCode, res.Header.Get("Content-Type"))
+	}
+	var manifest struct {
+		ID, Name, Scope, Display string
+		StartURL                 string `json:"start_url"`
+		Icons                    []struct{ Src, Sizes, Type, Purpose string }
+	}
+	if err := json.NewDecoder(res.Body).Decode(&manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.ID != "/" || manifest.Name != "Ormos" || manifest.StartURL != "/" || manifest.Scope != "/" || manifest.Display != "standalone" {
+		t.Fatalf("unexpected installation manifest: %+v", manifest)
+	}
+	if len(manifest.Icons) != 2 {
+		t.Fatalf("expected two installation icons: %+v", manifest.Icons)
+	}
+	for i, size := range []int{192, 512, 180} {
+		name := "/icons/apple-touch-icon.png"
+		if i < len(manifest.Icons) {
+			icon := manifest.Icons[i]
+			name = icon.Src
+			if icon.Type != "image/png" || icon.Purpose != "any maskable" || icon.Sizes != fmt.Sprintf("%dx%d", size, size) {
+				t.Fatalf("unexpected icon: %+v", icon)
+			}
+		}
+		res, err := http.Get(ts.URL + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		config, decodeErr := png.DecodeConfig(res.Body)
+		res.Body.Close()
+		if res.StatusCode != http.StatusOK || res.Header.Get("Content-Type") != "image/png" || decodeErr != nil || config.Width != size || config.Height != size {
+			t.Fatalf("icon %s: status=%d type=%q config=%+v err=%v", name, res.StatusCode, res.Header.Get("Content-Type"), config, decodeErr)
+		}
 	}
 }
 
