@@ -111,10 +111,12 @@ button, .header-icon { -webkit-tap-highlight-color: transparent; }
 .empty-message p { margin: 0; color: #9ca3af; font-size: 12px; line-height: 1.5; }
 
 .terminal-quick-controls { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex: none; min-height: 49px; padding: 2px 4px; background: #111827; border-top: 1px solid #1f2937; }
-.quick-key-group { display: flex; align-items: center; gap: 4px; }
+.quick-key-group { display: flex; align-items: center; gap: 2px; }
 .terminal-quick-controls .quick-key { display: flex; align-items: center; justify-content: center; flex: none; min-width: 44px; height: 44px; padding: 0 8px; border: 0; border-radius: 6px; background: transparent; color: #9ca3af; font-size: 14px; line-height: 1; touch-action: manipulation; }
 .terminal-quick-controls .quick-key svg { width: 20px; height: 20px; }
 .terminal-quick-controls .interrupt-key { padding: 0; }
+.terminal-quick-controls { overflow-x: auto; }
+.terminal-quick-controls .shift-key[aria-pressed="true"] { color: #e5e7eb; background: #374151; }
 @media (max-width: 340px) { .terminal-quick-controls, .quick-key-group { gap: 0; } }
 
 .saved-editor-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

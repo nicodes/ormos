@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 8ccd2958363e8ee6602c75f1bc3aafb9194908bb98709c484d1af1b485f8a218 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: b58d63c12daf52ee222f4247a616d242367cb2aa00a543d7899d05c1b36056fe -->
 
 # Ormos
 
@@ -74,6 +74,11 @@ Ormos forwards app requests only to a fixed localhost destination per preview. I
 In the terminal popup, the plus icon at the right of the tabs adds a command or prompt to the selected list. It is hidden while editing and on the keyboard tab. Save uses a checkmark below the inputs; switching tabs or closing the popup discards unsaved changes.
 
 Saved command and prompt lists use plain rows without card outlines or a storage-caption row. Empty lists show a centered “No saved commands” or “No saved prompts” title and a short subtitle.
+
+
+The next release adds a one-shot **Shift** control beside Keyboard. Tap Shift, then open the keyboard and type `s` to send `S`; the modifier turns off after one key. Tap Shift again to cancel. Shift also works with Tab (back-tab), arrows and standard US punctuation. Pasted prompts and multi-character commands are unchanged. Changing tabs, switching views or disconnecting clears Shift. Narrow screens can scroll the quick-control row horizontally while keeping normal touch targets.
+
+The next release also restores only the selected terminal tab on a fresh page load. Other shells keep running on the host and load their retained history when first selected; visited tabs stay mounted afterward. Refresh still replays the full retained history of the selected tab, up to 4 MiB, rather than loading older lines when scrolling. Replay is streamed in 64 KiB pieces and compressed when the browser supports it; small interactive output stays uncompressed. Input and resize messages can be processed while replay transfers. Reconnects continue requesting only missed bytes. Content-hashed UI assets are cached between refreshes; HTML and the manifest revalidate so upgrades discover the latest files. A long first replay can still take time to parse on slower phones.
 
 Terminal content fills the pane between the shared header and a bottom quick-control row, with a small 6-pixel inset and no frame border. The bottom row has Keyboard on the left, Esc, Tab, Up, Down and Enter in the middle, and Interrupt (Ctrl+C) on the right. Keyboard, Tab, Enter and arrows use icons with accessible labels and tooltips; Esc and Ctrl+C have text labels. Tap Keyboard to open the software keyboard; tapping or swiping terminal output does not open it. Shortcut buttons send keys without opening the keyboard. These quick controls and the updated saved-item editor layout require v0.2.4 or later. v0.2.5 replaces the square interrupt icon with Ctrl+C text and puts Esc before Tab.
 
