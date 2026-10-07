@@ -100,6 +100,8 @@ finally:
           };
         });
         const page = await context.newPage();
+        const pressControl = async button => { if (touch) await button.tap(); else await button.click(); };
+        const openKeyboard = () => pressControl(page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }));
         const requests = [];
         const errors = [];
         page.on('request', request => requests.push(request.url()));
@@ -111,7 +113,7 @@ finally:
           assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'none');
           assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), true, 'Terminal taps must not request the software keyboard');
         }
-        await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).click();
+        await openKeyboard();
         await page.keyboard.type("DIRECT_STATE=kept; printf 'DIRECT_%s\\n' OK");
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('DIRECT_OK'));
@@ -140,7 +142,7 @@ finally:
         assert.equal(await page.evaluate(() => window.scrollY), 0, 'Scrolling must stay inside the terminal');
         await scroll(-240);
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
-        await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).click();
+        await openKeyboard();
         await page.keyboard.type('python3 "$HOME/scroll-app.py"');
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('APP_SCROLL_0100'));
@@ -161,14 +163,14 @@ finally:
           socket.send = data => { const message = JSON.parse(data); if (message.type === 'input') window.testKeyInput.push(message.data); send(data); };
         });
         for (const name of ['Tab', 'Escape', 'Up arrow', 'Down arrow', 'Ctrl C']) {
-          await quick.getByRole('button', { name, exact: true }).click();
+          await pressControl(quick.getByRole('button', { name, exact: true }));
         }
         assert.deepEqual(await page.evaluate(() => window.testKeyInput), ['\t', '\x1b', '\x1b[A', '\x1b[B', '\x03']);
         if (touch) {
           assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'none');
           assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), true);
         }
-        await quick.getByRole('button', { name: 'Keyboard', exact: true }).click();
+        await openKeyboard();
         assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'text');
         assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), false);
         assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);
@@ -176,7 +178,7 @@ finally:
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
         // More than 64 KiB but fewer than 5,000 display lines: refresh must
         // retain the earliest marker, not only the old tiny server replay.
-        await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).click();
+        await openKeyboard();
         await page.keyboard.type("printf '\\033c'; i=1; while [ \"$i\" -le 3000 ]; do printf 'HISTORY_%04d_abcdefghijklmnop\\n' \"$i\"; i=$((i+1)); done");
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
@@ -253,7 +255,7 @@ finally:
         assert((await context.cookies()).every(cookie => cookie.name !== 'ormos_preview_port'));
         await frame().getByRole('button', { name: 'Change state' }).click();
         await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
-        await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).click();
+        await openKeyboard();
         await page.keyboard.type("printf 'STATE_%s\\n' \"$DIRECT_STATE\"");
         await page.keyboard.press('Enter');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('STATE_kept'));
