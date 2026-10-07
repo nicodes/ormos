@@ -173,7 +173,9 @@ finally:
         await scroll(-240);
         await page.waitForFunction(previous => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]) > previous, previous, { timeout: 3000 });
         const quick = page.getByRole('toolbar', { name: 'Quick terminal controls' });
-        assert.equal(await quick.getByRole('button').count(), 7);
+        assert.equal(await quick.getByRole('button').count(), 8);
+        const lastControl = await quick.getByRole('button', { name: 'Ctrl C', exact: true }).boundingBox();
+        assert(lastControl.x + lastControl.width <= (touch ? 390 : 1440), 'Toolbar must fit the viewport');
         // Inspect actual WebSocket input while the fixture has a raw PTY,
         // so Ctrl+C and Esc test their bytes without terminating a shell.
         await page.evaluate(() => {
@@ -191,6 +193,21 @@ finally:
           assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), true);
         }
         await openKeyboard();
+        const shift = quick.getByRole('button', { name: 'Shift', exact: true });
+        await page.evaluate(() => { window.testKeyInput = []; });
+        await pressControl(shift);
+        await openKeyboard();
+        assert.equal(await shift.getAttribute('aria-pressed'), 'true', 'Opening the keyboard preserves Shift');
+        await page.keyboard.type('s');
+        assert.equal(await shift.getAttribute('aria-pressed'), 'false');
+        await page.keyboard.type('s');
+        await pressControl(shift);
+        await pressControl(quick.getByRole('button', { name: 'Tab', exact: true }));
+        assert.equal(await shift.getAttribute('aria-pressed'), 'false');
+        await pressControl(shift);
+        await pressControl(shift);
+        await page.keyboard.type('s');
+        assert.deepEqual(await page.evaluate(() => window.testKeyInput), ['S', 's', '\x1b[Z', 's']);
         assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'text');
         assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), false);
         assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);
@@ -327,6 +344,28 @@ finally:
         await page.reload();
         await frame().getByRole('heading', { name: 'First app' }).waitFor();
         assert.equal(errors.length, 0, errors.map(String).join('\n'));
+        // Hidden PTYs keep running, but after reload only the selected tab
+        // mounts a renderer and transfers its history. Visiting another tab
+        // loads it once; later switching preserves that renderer.
+        await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
+        await page.getByRole('button', { name: 'New terminal tab', exact: true }).click();
+        await page.waitForFunction(() => document.querySelectorAll('.xterm').length === 2);
+        await page.getByRole('tab', { name: 'Terminal 1', exact: true }).click();
+        await page.reload();
+        await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+        assert.equal(await page.locator('.xterm').count(), 1);
+        assert.equal(await page.evaluate(() => window.testTerminalSockets.length), 1);
+        await page.getByRole('tab', { name: 'Terminal 2', exact: true }).click();
+        await page.waitForFunction(() => window.testTerminalSockets.length === 2);
+        assert.equal(await page.locator('.xterm').count(), 2);
+        await page.getByRole('tab', { name: 'Terminal 1', exact: true }).click();
+        assert.equal(await page.evaluate(() => window.testTerminalSockets.length), 2);
+        await page.reload();
+        await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+        await page.getByRole('button', { name: 'Close Terminal 1', exact: true }).click();
+        await page.waitForFunction(() => document.querySelector('input[aria-label="Terminal tab name"]')?.value === 'Terminal 2' && document.querySelector('.tab.selected .status-dot.online'));
+        assert.equal(await page.getByRole('textbox', { name: 'Terminal tab name' }).inputValue(), 'Terminal 2');
+        assert.equal(await page.locator('.xterm').count(), 1);
         // These IDs come only from this browser context's newly created tabs.
         await page.evaluate(async () => {
           for (const terminal of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) {
