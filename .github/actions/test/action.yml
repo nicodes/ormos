@@ -18,47 +18,6 @@ description: >
 runs:
   using: composite
   steps:
-    - name: Installer regression
-      shell: bash
-      run: |
-        set -euo pipefail
-        shellcheck install.sh
-        if [ -f dist/ormos_Linux_x86_64.tar.gz ]; then
-          export ORMOS_INSTALL_TEST_ARCHIVE="$PWD/dist/ormos_Linux_x86_64.tar.gz"
-          export ORMOS_INSTALL_TEST_VERSION="$(dist/ormos_Linux_x86_64/ormos --version)"
-        fi
-        python3 -m unittest discover -s tests -p 'test_install.py' -v
-
-    # Cheapest first, and the one most likely to be the only thing wrong.
-    - name: Go formatting
-      shell: bash
-      run: |
-        unformatted="$(gofmt -l .)"
-        if [ -n "$unformatted" ]; then
-          echo "::error::gofmt would change these files:"
-          echo "$unformatted"
-          exit 1
-        fi
-
-    - name: Go vet
-      shell: bash
-      run: go vet ./...
-
-    # -race because this binary runs a relay and the work it coordinates is
-    # concurrent, which is exactly the shape that fails only under load.
-    #
-    # -count=1 because a cached PASS from an earlier run is not evidence about
-    # this one.
-    - name: Go tests
-      shell: bash
-      run: go test -race -count=1 ./...
-
-    # Known vulnerabilities in the module graph the binary actually reaches.
-    # govulncheck reports only vulns on a path the code calls and exits non-zero
-    # when it finds one, so this fails the build on a reachable CVE rather than
-    # leaving it to a report nobody reads. Installed from the govulncheck pin in
-    # .mise.toml. Last, because it does its own analysis over the build the
-    # steps above already warmed.
-    - name: govulncheck
-      shell: bash
-      run: govulncheck ./...
+  - name: Verify CLI profile
+    shell: bash
+    run: make lint test vuln
