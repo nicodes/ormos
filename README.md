@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: a67a2bd0efc442b8e9704ae1d3ccf6d72aa03539916421ad5c6219999e87577f -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 7f87915710bc99a3f95167a871434094e481c59e0677724377d939040f35937a -->
 
 # Ormos
 
@@ -66,7 +66,7 @@ In the terminal popup, the plus icon at the right of the tabs adds a command or 
 
 Saved command and prompt lists use plain rows without card outlines or a storage-caption row. Empty lists show a centered “No saved commands” or “No saved prompts” title and a short subtitle.
 
-Terminal content fills the pane between the shared header and a bottom quick-control row, with a small 6-pixel inset and no frame border. The bottom row has Keyboard on the left, Tab, Esc, Up, Down and Enter in the middle, and Interrupt (Ctrl+C) on the right. Keyboard, Tab, Enter, arrows and Interrupt use icons with accessible labels and tooltips; Esc retains its familiar short label. Tap Keyboard to open the software keyboard; tapping or swiping terminal output does not open it. Shortcut buttons send keys without opening the keyboard. These quick controls and the updated saved-item editor layout require v0.2.4 or later.
+Terminal content fills the pane between the shared header and a bottom quick-control row, with a small 6-pixel inset and no frame border. The bottom row has Keyboard on the left, Esc, Tab, Up, Down and Enter in the middle, and Interrupt (Ctrl+C) on the right. Keyboard, Tab, Enter and arrows use icons with accessible labels and tooltips; Esc and Ctrl+C have text labels. Tap Keyboard to open the software keyboard; tapping or swiping terminal output does not open it. Shortcut buttons send keys without opening the keyboard. These quick controls and the updated saved-item editor layout require v0.2.4 or later. v0.2.5 replaces the square interrupt icon with Ctrl+C text and puts Esc before Tab.
 
 Before loading an app, Ormos prepares its forwarding route and the browser makes a credential-free HEAD reachability check, bounded by a 20-second overall timeout. Failure shows a centered “App unavailable” title and a short subtitle identifying the next step. This check does not certify that embedding is permitted; use Open in new tab if the app blocks iframes. Refresh checks the address again and reloads it. Navigation history retains up to 200 entered addresses; recent history retains 50 unique entries.
 
