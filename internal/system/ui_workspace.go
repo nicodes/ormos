@@ -108,7 +108,10 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 		since = &offset
 	}
 	// The exact same-origin check above is stricter than Accept's host check.
-	conn, err := websocket.Accept(w, r, nil)
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		CompressionMode:      websocket.CompressionNoContextTakeover,
+		CompressionThreshold: 1024,
+	})
 	if err != nil {
 		return
 	}
@@ -145,13 +148,17 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	if len(history) > 0 {
-		if err := writeTerminalChunk(ctx, conn, history); err != nil {
-			return
-		}
-	}
 	go func() {
 		defer cancel()
+		// Start reading input/resizes immediately while history is streamed.
+		// Bounded messages let the browser parse/paint before the whole tail arrives.
+		for len(history) > 0 {
+			n := min(len(history), 64<<10)
+			if err := writeTerminalChunk(ctx, conn, history[:n]); err != nil {
+				return
+			}
+			history = history[n:]
+		}
 		for {
 			select {
 			case <-ctx.Done():

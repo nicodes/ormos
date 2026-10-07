@@ -3,18 +3,133 @@
 package system
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
 )
+
+type replayCountingListener struct {
+	net.Listener
+	written atomic.Int64
+	hold    <-chan struct{}
+}
+
+func (l *replayCountingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &replayCountingConn{Conn: conn, owner: l}, nil
+}
+
+type replayCountingConn struct {
+	net.Conn
+	owner *replayCountingListener
+}
+
+func (c *replayCountingConn) Write(data []byte) (int, error) {
+	if len(data) > 1024 && c.owner.hold != nil {
+		<-c.owner.hold
+	}
+	n, err := c.Conn.Write(data)
+	c.owner.written.Add(int64(n))
+	return n, err
+}
+
+func TestUITerminalCompressedReplay(t *testing.T) {
+	for _, mode := range []websocket.CompressionMode{websocket.CompressionDisabled, websocket.CompressionNoContextTakeover} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			fix := newUIFixture(t, nil)
+			term := &uiTerminal{id: "t_bulk", alive: true}
+			redraw := []byte("\x1b[H\x1b[2Krendered terminal status and unchanged application content\r\n")
+			history := bytes.Repeat(redraw, uiTerminalBufMax/len(redraw))
+			term.append(history)
+			fix.srv.terms[term.id] = term
+			ts := httptest.NewUnstartedServer(fix.srv.routes())
+			counter := &replayCountingListener{Listener: ts.Listener}
+			ts.Listener = counter
+			ts.Start()
+			defer ts.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			started := time.Now()
+			conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/api/terminal/"+term.id+"/ws", &websocket.DialOptions{CompressionMode: mode, HTTPHeader: http.Header{"Origin": []string{ts.URL}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.CloseNow()
+			conn.SetReadLimit(64 << 10)
+			if _, _, err := conn.Read(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var replay []byte
+			for len(replay) < len(history) {
+				kind, chunk, err := conn.Read(ctx)
+				if err != nil || kind != websocket.MessageBinary || len(chunk) > 64<<10 {
+					t.Fatalf("replay chunk: %d %v", len(chunk), err)
+				}
+				replay = append(replay, chunk...)
+			}
+			if !bytes.Equal(replay, history) {
+				t.Fatal("terminal output changed during replay")
+			}
+			wire := counter.written.Load()
+			if mode != websocket.CompressionDisabled {
+				if !strings.Contains(response.Header.Get("Sec-WebSocket-Extensions"), "permessage-deflate") || wire >= int64(len(history))/10 {
+					t.Fatalf("compression not effective: %d bytes for %d raw", wire, len(history))
+				}
+			}
+			t.Logf("raw=%d wire=%d elapsed=%s", len(history), wire, time.Since(started))
+		})
+	}
+}
+
+func TestUITerminalInputWhileHistoryBlocked(t *testing.T) {
+	fix := newUIFixture(t, nil)
+	input := make(chan string, 1)
+	term := &uiTerminal{id: "t_slow", alive: true, input: func(p []byte) error { input <- string(p); return nil }}
+	term.append(bytes.Repeat([]byte("x"), 128<<10))
+	fix.srv.terms[term.id] = term
+	ts := httptest.NewUnstartedServer(fix.srv.routes())
+	release := make(chan struct{})
+	ts.Listener = &replayCountingListener{Listener: ts.Listener, hold: release}
+	ts.Start()
+	defer ts.Close()
+	defer close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/api/terminal/"+term.id+"/ws", &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{ts.URL}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	if _, _, err := conn.Read(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, []byte(`{"type":"input","data":"s"}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-input:
+		if got != "s" {
+			t.Fatal(got)
+		}
+	case <-ctx.Done():
+		t.Fatal("input waited for blocked history transfer")
+	}
+}
 
 func TestUIRejectsForeignBrowserRequests(t *testing.T) {
 	fix := newUIFixture(t, nil)
