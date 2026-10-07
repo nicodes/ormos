@@ -1,10 +1,10 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: e9a86ca9f04c7ff2a5d1d645914590808aedf3fc34d2a9d21d1980a7a2431044 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: ad9364235173bcd80f5307d8ac8f300214766719200aa7e5496cd358a7e553a5 -->
 
 # Ormos
 
 A terminal and local app preview in your browser. One executable serves the SolidJS UI and interactive terminals on your machine. Local use needs no account, hosted backend, or Clerk.
 
-Automatic preview forwarding is currently a development feature. Published v0.2.2 uses direct app previews; the forwarding behavior below is available in the preview branch until its next release.
+Automatic localhost preview forwarding requires v0.2.3 or later. Older releases use direct app previews.
 
 ## Install and run
 
@@ -23,7 +23,7 @@ curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --ver
 curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --install-dir "$HOME/bin"
 ```
 
-The short form is `-v 0.2.1`. Omitting a version uses `latest`; `--version latest` and `-v latest` also work. A leading `v` on a version is optional. Custom install directories must be on your PATH. The installer is also included in release assets starting with v0.2.0. The local UI described below requires v0.2.0 or later. You can also manually extract a platform archive from [Releases](https://github.com/nicodes/ormos/releases), or use Go matching `go.mod` and `.mise.toml`:
+The short form is `-v 0.2.1`. Omitting a version uses `latest`; `--version latest` and `-v latest` also work. A leading `v` on a version is optional. Custom install directories must be on your PATH. The installer is also included in release assets starting with v0.2.0. The terminal UI requires v0.2.0 or later; automatic preview forwarding requires v0.2.3 or later. You can also manually extract a platform archive from [Releases](https://github.com/nicodes/ormos/releases), or use Go matching `go.mod` and `.mise.toml`:
 
 ```sh
 go install github.com/nicodes/ormos@latest
