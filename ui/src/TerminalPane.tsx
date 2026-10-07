@@ -3,11 +3,13 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { request, type TerminalRow } from "./api";
+import { shiftTerminalKey } from "./shiftKey";
 
 export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void };
 export default function TerminalPane(props: {
   id: string; onStatus: (status: string) => void;
   register: (id: string, controls?: TerminalControls) => void;
+  shifted: () => boolean; clearShift: () => void;
 }) {
   let container!: HTMLDivElement;
   onMount(() => {
@@ -87,7 +89,12 @@ export default function TerminalPane(props: {
     const send = (message: object) => {
       if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
     };
+    let pasting = false;
     const type = (data: string) => {
+      if (!pasting && props.shifted()) {
+        const shifted = shiftTerminalKey(data);
+        if (shifted !== undefined) { data = shifted; props.clearShift(); }
+      }
       for (let i = 0; i < data.length; i += 2048) send({ type: "input", data: data.slice(i, i + 2048) });
     };
     const resize = () => {
@@ -131,7 +138,10 @@ export default function TerminalPane(props: {
     };
     const input = terminal.onData(type);
     const observer = new ResizeObserver(resize); observer.observe(container);
-    props.register(props.id, { focus, keyboard, type, paste: data => terminal.paste(data) });
+    props.register(props.id, { focus, keyboard, type, paste: data => {
+      pasting = true;
+      try { terminal.paste(data); } finally { pasting = false; }
+    } });
     connect();
     onCleanup(() => {
       disposed = true; generation++; clearTimeout(retry); observer.disconnect(); socket?.close();
