@@ -15,6 +15,7 @@ export default function TerminalPane(props: {
     let generation = 0;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let socket: WebSocket | undefined;
+    let offset: number | undefined;
     const terminal = new Terminal({
       cursorBlink: true, cursorStyle: "bar", fontSize: 14, scrollback: 5000,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
@@ -77,13 +78,24 @@ export default function TerminalPane(props: {
     const connect = () => {
       clearTimeout(retry);
       const current = ++generation;
-      socket?.close(); terminal.reset(); props.onStatus("Connecting");
+      socket?.close(); props.onStatus("Connecting");
       const url = new URL(`/api/terminal/${props.id}/ws`, location.href);
+      if (offset !== undefined) url.searchParams.set("since", String(offset));
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(url); socket = ws; ws.binaryType = "arraybuffer";
       ws.onopen = () => { if (current === generation) { props.onStatus("Connected"); resize(); } };
       ws.onmessage = event => {
-        if (current === generation && event.data instanceof ArrayBuffer) terminal.write(new Uint8Array(event.data));
+        if (current !== generation) return;
+        if (typeof event.data === "string") {
+          const message = JSON.parse(event.data);
+          if (message.type === "replay") {
+            if (message.reset) terminal.reset();
+            offset = message.offset;
+          }
+        } else if (event.data instanceof ArrayBuffer) {
+          terminal.write(new Uint8Array(event.data));
+          if (offset !== undefined) offset += event.data.byteLength;
+        }
       };
       ws.onclose = () => {
         if (disposed || current !== generation) return;

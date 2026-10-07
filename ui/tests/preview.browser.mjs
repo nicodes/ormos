@@ -87,6 +87,16 @@ finally:
     await t.test(touch ? 'phone layout' : 'desktop layout', async () => {
       const context = await browser.newContext({ viewport: touch ? { width: 390, height: 844 } : { width: 1440, height: 900 }, hasTouch: touch, isMobile: touch });
       try {
+        await context.addInitScript(() => {
+          const Native = window.WebSocket;
+          window.testTerminalSockets = [];
+          window.WebSocket = class extends Native {
+            constructor(...args) {
+              super(...args);
+              if (String(args[0]).includes('/api/terminal/')) window.testTerminalSockets.push(this);
+            }
+          };
+        });
         const page = await context.newPage();
         const requests = [];
         const errors = [];
@@ -135,6 +145,38 @@ finally:
         await page.waitForFunction(previous => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]) > previous, previous, { timeout: 3000 });
         await page.keyboard.type('q');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
+        // More than 64 KiB but fewer than 5,000 display lines: refresh must
+        // retain the earliest marker, not only the old tiny server replay.
+        await page.locator('.xterm-helper-textarea').focus();
+        await page.keyboard.type("printf '\\033c'; i=1; while [ \"$i\" -le 3000 ]; do printf 'HISTORY_%04d_abcdefghijklmnop\\n' \"$i\"; i=$((i+1)); done");
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
+        await page.reload();
+        await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
+        const moveScrollbar = async bottom => {
+          const track = await page.locator('.xterm .scrollbar.vertical').boundingBox();
+          const slider = await page.locator('.xterm .scrollbar.vertical .slider').boundingBox();
+          await page.mouse.move(slider.x + slider.width / 2, slider.y + slider.height / 2);
+          await page.mouse.down();
+          await page.mouse.move(track.x + track.width / 2, bottom ? track.y + track.height : track.y, { steps: 10 });
+          await page.mouse.up();
+        };
+        const showEarliestHistory = async () => {
+          await moveScrollbar(false);
+          await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_0001'), null, { timeout: 3000 });
+        };
+        await showEarliestHistory();
+        const reconnects = [];
+        page.on('websocket', ws => reconnects.push(ws.url()));
+        await page.evaluate(() => window.testTerminalSockets.at(-1).close());
+        await page.waitForFunction(() => !document.querySelector('.status-dot.online'));
+        await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+        assert(reconnects.some(url => url.includes('since=')), 'Reconnect must request only missed bytes');
+        // Reconnect must also preserve the current scroll position.
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_0001'));
+        await moveScrollbar(true);
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
         await page.getByRole('button', { name: 'Show preview', exact: true }).click();
         const address = page.getByRole('combobox', { name: 'Preview address' });
         const navigate = async value => { await address.fill(value); await address.press('Enter'); };
