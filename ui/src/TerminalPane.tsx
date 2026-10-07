@@ -6,6 +6,7 @@ import { request, type TerminalRow } from "./api";
 import { shiftTerminalKey } from "./shiftKey";
 import { createTerminalResize } from "./terminalResize";
 import { terminalInputChunks } from "./terminalInput";
+import { createTerminalOutput } from "./terminalOutput";
 
 export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void };
 export default function TerminalPane(props: {
@@ -19,13 +20,13 @@ export default function TerminalPane(props: {
     let generation = 0;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let socket: WebSocket | undefined;
-    let offset: number | undefined;
     const terminal = new Terminal({
       cursorBlink: true, cursorStyle: "bar", fontSize: 14, scrollback: 5000,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
       theme: { background: "#0b0f19", foreground: "#d1d5db", cursor: "#d1d5db", selectionBackground: "#374151" },
     });
     const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
+    const output = createTerminalOutput((data, parsed) => terminal.write(data, parsed), () => terminal.reset());
     const textarea = terminal.textarea!;
     const touchKeyboard = () => window.matchMedia("(pointer: coarse)").matches;
     const dismissKeyboard = () => {
@@ -112,21 +113,27 @@ export default function TerminalPane(props: {
       const current = ++generation;
       socket?.close(); props.onStatus("Connecting");
       const url = new URL(`/api/terminal/${props.id}/ws`, location.href);
+      url.searchParams.set("flow", "1");
+      const offset = output.offset();
       if (offset !== undefined) url.searchParams.set("since", String(offset));
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(url); socket = ws; ws.binaryType = "arraybuffer";
       ws.onopen = () => { if (!disposed && current === generation) { props.onStatus("Connected"); resize.reconnect(); } };
       ws.onmessage = event => {
         if (disposed || current !== generation) return;
-        if (typeof event.data === "string") {
-          const message = JSON.parse(event.data);
-          if (message.type === "replay") {
-            if (message.reset) terminal.reset();
-            offset = message.offset;
+        try {
+          if (typeof event.data === "string") {
+            const message = JSON.parse(event.data);
+            if (message.type === "replay") {
+              output.begin(message, bytes => {
+                if (!disposed && current === generation && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ack", bytes }));
+              });
+            }
+          } else if (event.data instanceof ArrayBuffer) {
+            output.receive(new Uint8Array(event.data));
           }
-        } else if (event.data instanceof ArrayBuffer) {
-          terminal.write(new Uint8Array(event.data));
-          if (offset !== undefined) offset += event.data.byteLength;
+        } catch {
+          ws.close(1002, "Invalid terminal stream");
         }
       };
       ws.onclose = () => {
@@ -150,7 +157,7 @@ export default function TerminalPane(props: {
     } });
     connect();
     onCleanup(() => {
-      disposed = true; generation++; clearTimeout(retry); observer.disconnect(); resize.dispose(); socket?.close();
+      disposed = true; generation++; clearTimeout(retry); observer.disconnect(); resize.dispose(); output.dispose(); socket?.close();
       container.removeEventListener("touchstart", touchStart);
       container.removeEventListener("touchmove", touchMove);
       container.removeEventListener("touchend", touchEnd);
