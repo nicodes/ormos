@@ -40,6 +40,7 @@ func sameUIOrigin(r *http.Request) bool {
 
 func (s *uiServer) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Ormos-Workspace", "1")
 		if !s.hostAllowed(r.Host) {
 			uiError(w, http.StatusMisdirectedRequest, "host not allowed")
 			return

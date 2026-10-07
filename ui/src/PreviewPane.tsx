@@ -132,28 +132,14 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
     const item = target();
     setFrameTarget(undefined);
     if (!item) { setAvailability("empty"); return; }
-    const url = previewURL(item, workspace);
     setAvailability("checking");
     const controller = new AbortController();
     let live = true;
     const timeout = window.setTimeout(() => controller.abort(), 20000);
-    const probe = async () => {
-      const attempt = new AbortController();
-      const abort = () => attempt.abort();
-      controller.signal.addEventListener("abort", abort, { once: true });
-      if (controller.signal.aborted) attempt.abort();
-      const timer = window.setTimeout(abort, 3000);
-      try { await fetch(url, { method: "HEAD", mode: "no-cors", credentials: "omit", cache: "no-store", signal: attempt.signal }); }
-      finally { window.clearTimeout(timer); controller.signal.removeEventListener("abort", abort); }
-    };
     void (async () => {
-      try { await probe(); }
-      catch {
-        if (!live) return;
-        if (controller.signal.aborted) throw new Error("Preview timed out");
-        await request("/api/preview", { port: item.port, scheme: workspace.protocol.slice(0, -1) }, controller.signal);
-        await probe();
-      }
+      const exposed = await request<{ port: number }>("/api/preview", { port: item.port, scheme: workspace.protocol.slice(0, -1) }, controller.signal);
+      const url = previewURL({ ...item, port: exposed.port }, workspace);
+      await fetch(url, { method: "HEAD", mode: "no-cors", credentials: "omit", cache: "no-store", signal: controller.signal });
       if (live) { setFrameTarget({ url }); setAvailability("ready"); }
     })()
       .catch(error => { if (live) { setUnavailableMessage(error instanceof APIError ? error.message : "This app is not reachable yet. Check Tailscale access, then refresh."); setAvailability("unavailable"); } })
@@ -171,7 +157,7 @@ export default function PreviewPane(props: { onError: (error: string) => void; h
       <Portal mount={props.header} ref={element => { element.className = "preview-toolbar"; }}>
       <form class="browserbar" hidden={!props.visible} onSubmit={e => { e.preventDefault(); navigate(); }}>
         <input ref={addressInput} role="combobox" aria-expanded={historyShown()} aria-controls="preview-history-list" aria-activedescendant={historyShown() && historyIndex() >= 0 ? `preview-history-${historyIndex()}` : undefined} aria-autocomplete="none" aria-label="Preview address" placeholder="Port or localhost URL" enterkeyhint="go" autocomplete="off" autocapitalize="none" spellcheck={false} value={address()} onFocus={() => { setHistoryDismissed(false); setHistoryIndex(-1); setAddressFocused(true); }} onBlur={() => setAddressFocused(false)} onKeyDown={historyKey} onInput={e => { setAddress(e.currentTarget.value); setHistoryDismissed(false); setHistoryIndex(-1); }} />
-        <BrowserMenu visible={props.visible} canGoBack={current().index > 0} canGoForward={current().index < current().history.length - 1} canRefresh={!!target()} back={() => move(-1)} forward={() => move(1)} refresh={() => { remember(target()); setNavigation(n => n + 1); }} openURL={target() ? previewURL(target()!, workspace) : ""} />
+        <BrowserMenu visible={props.visible} canGoBack={current().index > 0} canGoForward={current().index < current().history.length - 1} canRefresh={!!target()} back={() => move(-1)} forward={() => move(1)} refresh={() => { remember(target()); setNavigation(n => n + 1); }} openURL={frameTarget()?.url ?? ""} />
       </form>
       </Portal>
       <Show when={historyShown()}><Portal>

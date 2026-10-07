@@ -23,7 +23,7 @@ export function parsePreviewAddress(raw: string, workspace: URL, currentPort?: n
     if (value.includes("\\")) throw new Error("Use a local app address.");
     const url = new URL(value);
     if ((!localAliases.has(url.hostname) && url.hostname !== workspace.hostname) || url.username || url.password) throw new Error("Use this machine's app port or a localhost URL.");
-    if (url.protocol !== workspace.protocol) throw new Error(`Use ${workspace.protocol.slice(0, -1).toUpperCase()} URLs for this workspace.`);
+    if (url.protocol !== "http:" && url.protocol !== workspace.protocol) throw new Error("Use a local HTTP app URL.");
     port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
     path = url.pathname + url.search + url.hash;
   } else if (currentPort && value) { port = currentPort; path = value.startsWith("/") ? value : `/${value}`; }

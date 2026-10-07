@@ -118,8 +118,8 @@ UI options:
   --bind IP                UI bind address (default 127.0.0.1)
 
 Serve the loopback UI privately through Tailscale Serve for phone access.
-App previews load directly from this machine's hostname and the chosen port.
-Expose each app through Tailscale Serve or bind it to the Tailscale IP.
+Enter a local HTTP app port; Ormos forwards and exposes previews automatically.
+Use an HTTPS workspace for Godot and other apps requiring a secure context.
 There is no application account or login. Trusted network access is required.
 Terminals end when Ormos stops; browser disconnects leave them running.
 

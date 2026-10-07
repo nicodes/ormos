@@ -28,7 +28,7 @@ test("foreign origins, credentials, origin escapes, empty input and the control 
 test("HTTPS and IPv6 workspaces preserve the actual host and protocol", () => {
   const https = new URL("https://box.example.ts.net:8481");
   assert.equal(previewURL(parsePreviewAddress("https://localhost:3000/", https), https), "https://box.example.ts.net:3000/");
-  assert.throws(() => parsePreviewAddress("http://localhost:3000", https));
+  assert.deepEqual(parsePreviewAddress("http://localhost:3000", https), { port: 3000, path: "/" });
   const ipv6 = new URL("http://[::1]:8481");
   assert.equal(previewURL(parsePreviewAddress("3000", ipv6), ipv6), "http://[::1]:3000/");
 });

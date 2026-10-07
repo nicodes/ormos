@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -26,9 +27,9 @@ type previewServe struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 	gate      chan struct{}
-	sessions  map[int]*serveSession
+	sessions  map[string]*previewRoute
 	status    func(context.Context) (*serveConfig, error)
-	start     func(context.Context, string, int) (*serveSession, error)
+	start     func(context.Context, string, int, int) (*serveSession, error)
 	listening func(context.Context, int) error
 }
 
@@ -57,65 +58,63 @@ func (e *previewSetupError) Error() string { return e.message }
 
 func newPreviewServe(parent context.Context) *previewServe {
 	ctx, cancel := context.WithCancel(parent)
-	return &previewServe{ctx: ctx, cancel: cancel, gate: make(chan struct{}, 1), sessions: map[int]*serveSession{}, status: readServeStatus, start: startServeSession, listening: loopbackAppListening}
+	return &previewServe{ctx: ctx, cancel: cancel, gate: make(chan struct{}, 1), sessions: map[string]*previewRoute{}, status: readServeStatus, start: startServeSession, listening: loopbackAppListening}
 }
 
 func loopbackAppListening(ctx context.Context, port int) error {
-	dialer := net.Dialer{Timeout: 500 * time.Millisecond}
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	conn, err := dialLoopback(ctx, port)
+	if err != nil {
+		return err
+	}
+	address := conn.RemoteAddr().String()
+	conn.Close()
+	// Updated Ormos instances identify their control listener. Never translate
+	// a preview's Origin into another workspace's trusted localhost origin.
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://"+address+"/", nil)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	defer client.CloseIdleConnections()
+	res, err := client.Do(req)
 	if err == nil {
-		conn.Close()
+		res.Body.Close()
+		if res.Header.Get("X-Ormos-Workspace") == "1" {
+			return &previewSetupError{http.StatusForbidden, "Choose an app port, not an Ormos workspace port."}
+		}
 	}
-	return err
+	return nil
 }
 
-// Inspect all host-level sessions; service VIPs have their own port namespace.
-func (c *serveConfig) route(port int, scheme string) (exists, compatible bool) {
+// Host-level listeners share a port namespace; service VIPs do not.
+func (c *serveConfig) usesPort(port int) bool {
 	if c == nil {
-		return false, false
+		return false
 	}
-	number := strconv.Itoa(port)
-	raw, hasTCP := c.TCP[number]
-	exists = hasTCP
-	var listener struct {
-		HTTP, HTTPS              bool
-		TCPForward, TerminateTLS string
+	if _, exists := c.TCP[strconv.Itoa(port)]; exists {
+		return true
 	}
-	matching := hasTCP && json.Unmarshal(raw, &listener) == nil && listener.TCPForward == "" && listener.TerminateTLS == "" &&
-		((scheme == "http" && listener.HTTP && !listener.HTTPS) || (scheme == "https" && listener.HTTPS && !listener.HTTP))
-	roots := 0
-	for authority, web := range c.Web {
-		_, p, err := net.SplitHostPort(authority)
-		if err != nil || p != number {
-			continue
+	for authority := range c.Web {
+		if _, p, err := net.SplitHostPort(authority); err == nil && p == strconv.Itoa(port) {
+			return true
 		}
-		exists = true
-		handler, ok := web.Handlers["/"]
-		if !ok || len(web.Handlers) != 1 || handler.Proxy != "http://127.0.0.1:"+number || handler.Path != "" || handler.Text != "" {
-			matching = false
-		}
-		roots++
 	}
-	matching = matching && roots == 1
 	for authority, public := range c.AllowFunnel {
-		_, p, err := net.SplitHostPort(authority)
-		if err == nil && p == number && public {
-			exists = true
-			matching = false
+		if _, p, err := net.SplitHostPort(authority); public && err == nil && p == strconv.Itoa(port) {
+			return true
 		}
 	}
-	compatible = matching
 	for _, foreground := range c.Foreground {
-		used, match := foreground.route(port, scheme)
-		if used {
-			compatible = match && !exists
-			exists = true
+		if foreground.usesPort(port) {
+			return true
 		}
 	}
-	return
+	return false
 }
 
-func (s *previewServe) ensure(ctx context.Context, port int, scheme string) error {
+// open serializes route creation and returns the browser-facing port. Every
+// preview has its own listener/origin; no terminal routes live on that listener.
+func (s *previewServe) open(ctx context.Context, port int, scheme, host string, controlPort int) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	stop := context.AfterFunc(s.ctx, cancel)
@@ -124,61 +123,127 @@ func (s *previewServe) ensure(ctx context.Context, port int, scheme string) erro
 	case s.gate <- struct{}{}:
 		defer func() { <-s.gate }()
 	case <-ctx.Done():
-		return ctx.Err()
+		return 0, ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return 0, err
+	}
+	// Prevent routing back into Ormos or one of its forwarding listeners.
+	for key, route := range s.sessions {
+		if route.session != nil {
+			select {
+			case <-route.session.done:
+				route.close()
+				delete(s.sessions, key)
+			default:
+			}
+		}
+	}
+	for _, route := range s.sessions {
+		if port == route.localPort {
+			return 0, &previewSetupError{http.StatusForbidden, "Choose an app port, not an Ormos preview port."}
+		}
 	}
 	if err := s.listening(ctx, port); err != nil {
-		return &previewSetupError{http.StatusConflict, "Start your app in the terminal, then refresh."}
-	}
-	for p, session := range s.sessions {
-		select {
-		case <-session.done:
-			delete(s.sessions, p)
-		default:
+		var setup *previewSetupError
+		if errors.As(err, &setup) {
+			return 0, setup
 		}
+		return 0, &previewSetupError{http.StatusConflict, "Start your app in the terminal, then refresh."}
 	}
-	if session := s.sessions[port]; session != nil && session.scheme == scheme {
-		return nil
-	}
-	cfg, err := s.status(ctx)
-	if err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return &previewSetupError{http.StatusServiceUnavailable, "Install and connect Tailscale on this machine, then refresh."}
-		}
-		return &previewSetupError{http.StatusServiceUnavailable, "Allow Ormos's user to manage Tailscale Serve, then refresh."}
-	}
-	if exists, compatible := cfg.route(port, scheme); exists {
-		if compatible {
-			return nil
-		}
-		return &previewSetupError{http.StatusConflict, "This port is used by another Tailscale service. Choose another port."}
+	key := scheme + ":" + net.JoinHostPort(host, strconv.Itoa(port))
+	if route := s.sessions[key]; route != nil {
+		return route.publicPort, nil
 	}
 	if len(s.sessions) >= maxPreviewRoutes {
-		return &previewSetupError{http.StatusTooManyRequests, "Preview port limit reached. Restart Ormos to release its preview ports."}
+		return 0, &previewSetupError{http.StatusTooManyRequests, "Preview port limit reached. Restart Ormos to release its preview ports."}
 	}
-	session, err := s.start(s.ctx, scheme, port)
-	if err != nil {
-		return &previewSetupError{http.StatusServiceUnavailable, "Tailscale could not open this port. Check its setup, then refresh."}
-	}
-	select {
-	case <-session.ready:
-		select {
-		case <-session.done:
-			session.stop()
-			return &previewSetupError{http.StatusServiceUnavailable, "Tailscale could not open this port. Check its setup, then refresh."}
-		default:
+	local := host == "localhost" || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())
+	var cfg *serveConfig
+	if !local {
+		var err error
+		cfg, err = s.status(ctx)
+		if err != nil {
+			if errors.Is(err, exec.ErrNotFound) {
+				return 0, &previewSetupError{http.StatusServiceUnavailable, "Install and connect Tailscale on this machine, then refresh."}
+			}
+			return 0, &previewSetupError{http.StatusServiceUnavailable, "Allow Ormos's user to manage Tailscale Serve, then refresh."}
 		}
-		s.sessions[port] = session
-		return nil
-	case <-session.done:
-		session.stop()
-		return &previewSetupError{http.StatusServiceUnavailable, "Tailscale could not open this port. Check its setup, then refresh."}
-	case <-ctx.Done():
-		session.stop()
-		return &previewSetupError{http.StatusServiceUnavailable, "Tailscale setup did not finish. Check its connection and permissions, then refresh."}
 	}
+	bind := "127.0.0.1:0"
+	if ip := net.ParseIP(host); local && ip != nil && ip.To4() == nil {
+		bind = "[::1]:0"
+	}
+	ln, err := net.Listen("tcp", bind)
+	if err != nil {
+		return 0, &previewSetupError{http.StatusServiceUnavailable, "Could not open a preview listener. Refresh to try again."}
+	}
+	route := &previewRoute{localPort: ln.Addr().(*net.TCPAddr).Port}
+	route.publicPort = route.localPort
+	if !local {
+		// Never reuse or replace existing routes: even an existing direct route
+		// would bypass the localhost Host rewrite required by development servers.
+		available := func(candidate int) bool {
+			if candidate == controlPort {
+				return false
+			}
+			if cfg.usesPort(candidate) {
+				return false
+			}
+			for _, other := range s.sessions {
+				if candidate == other.publicPort || candidate == other.localPort {
+					return false
+				}
+			}
+			return true
+		}
+		// Keep the app port free of tailnet listeners. Some dev servers probe
+		// wildcard addresses when restarting, even when bound to localhost.
+		route.publicPort = route.localPort
+		if !available(route.publicPort) {
+			route.publicPort = 0
+			for candidate := 20000; candidate <= 65535; candidate++ {
+				if available(candidate) {
+					route.publicPort = candidate
+					break
+				}
+			}
+			if route.publicPort == 0 {
+				ln.Close()
+				return 0, &previewSetupError{http.StatusServiceUnavailable, "No preview port is available."}
+			}
+		}
+	}
+	routeCtx, routeCancel := context.WithCancel(s.ctx)
+	route.cancel = routeCancel
+	authority := net.JoinHostPort(host, strconv.Itoa(route.publicPort))
+	route.server = &http.Server{Handler: s.proxyHandler(routeCtx, port, scheme, authority), ReadHeaderTimeout: 10 * time.Second, BaseContext: func(net.Listener) context.Context { return routeCtx }}
+	go func() { _ = route.server.Serve(ln) }()
+	if !local {
+		session, err := s.start(s.ctx, scheme, route.publicPort, route.localPort)
+		if err != nil {
+			route.close()
+			return 0, &previewSetupError{http.StatusServiceUnavailable, "Tailscale could not open this preview. Check its setup, then refresh."}
+		}
+		route.session = session
+		select {
+		case <-session.ready:
+			select {
+			case <-session.done:
+				route.close()
+				return 0, &previewSetupError{http.StatusServiceUnavailable, "Tailscale could not open this preview. Refresh to try again."}
+			default:
+			}
+		case <-session.done:
+			route.close()
+			return 0, &previewSetupError{http.StatusServiceUnavailable, "Tailscale could not open this preview. Refresh to try again."}
+		case <-ctx.Done():
+			route.close()
+			return 0, &previewSetupError{http.StatusServiceUnavailable, "Tailscale setup did not finish. Check its connection and permissions, then refresh."}
+		}
+	}
+	s.sessions[key] = route
+	return route.publicPort, nil
 }
 
 func (s *previewServe) close() {
@@ -187,9 +252,15 @@ func (s *previewServe) close() {
 	defer func() { <-s.gate }()
 	timeout := time.NewTimer(3 * time.Second)
 	defer timeout.Stop()
-	for _, session := range s.sessions {
+	for _, route := range s.sessions {
+		route.close()
+	}
+	for _, route := range s.sessions {
+		if route.session == nil {
+			continue
+		}
 		select {
-		case <-session.done:
+		case <-route.session.done:
 		case <-timeout.C:
 			return
 		}
@@ -239,11 +310,11 @@ func (b *serveReadyOutput) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func startServeSession(parent context.Context, scheme string, port int) (*serveSession, error) {
+func startServeSession(parent context.Context, scheme string, port, localPort int) (*serveSession, error) {
 	ctx, cancel := context.WithCancel(parent)
 	session := &serveSession{scheme: scheme, ready: make(chan struct{}), done: make(chan struct{}), stop: cancel}
 	// No shell, background mode, --yes, Funnel or destructive config commands.
-	cmd := exec.CommandContext(ctx, "tailscale", "serve", "--"+scheme+"="+strconv.Itoa(port), "http://127.0.0.1:"+strconv.Itoa(port))
+	cmd := exec.CommandContext(ctx, "tailscale", "serve", "--"+scheme+"="+strconv.Itoa(port), "http://127.0.0.1:"+strconv.Itoa(localPort))
 	cmd.Stdout = &serveReadyOutput{ready: session.ready}
 	cmd.Stderr = io.Discard
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
@@ -274,6 +345,11 @@ func (s *uiServer) apiPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, control, _ := net.SplitHostPort(r.Host)
+	origin, _ := url.Parse(r.Header.Get("Origin"))
+	if origin == nil || origin.Scheme != body.Scheme {
+		uiError(w, http.StatusBadRequest, "Use the workspace connection scheme.")
+		return
+	}
 	if body.Port == s.controlPort || strconv.Itoa(body.Port) == control {
 		uiError(w, http.StatusForbidden, "Choose an app port, not the Ormos port.")
 		return
@@ -291,7 +367,12 @@ func (s *uiServer) apiPreview(w http.ResponseWriter, r *http.Request) {
 		uiError(w, http.StatusServiceUnavailable, "Tailscale setup is unavailable.")
 		return
 	}
-	if err := s.previewServe.ensure(r.Context(), body.Port, body.Scheme); err != nil {
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	exposed, err := s.previewServe.open(r.Context(), body.Port, body.Scheme, host, s.controlPort)
+	if err != nil {
 		var setup *previewSetupError
 		if errors.As(err, &setup) {
 			uiError(w, setup.status, setup.message)
@@ -300,5 +381,5 @@ func (s *uiServer) apiPreview(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	uiJSON(w, map[string]any{"port": body.Port})
+	uiJSON(w, map[string]any{"port": exposed})
 }

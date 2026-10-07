@@ -23,7 +23,7 @@ const app = title => listen((req, res) => {
 const close = server => new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
 
 // Uses the already-built release binary. Tests own ephemeral app ports and PTYs.
-test('direct previews work without app CORS, proxy cookies or rewritten HTML', { timeout: 90000 }, async t => {
+test('isolated localhost previews retain navigation, terminal state and scrolling', { timeout: 90000 }, async t => {
   assert(process.env.ORMOS_TEST_BINARY, 'Set ORMOS_TEST_BINARY to a built Ormos executable.');
   const home = await mkdtemp(path.join(tmpdir(), 'ormos-direct-'));
   t.after(() => rm(home, { recursive: true, force: true }));
@@ -145,9 +145,12 @@ finally:
         const frame = () => page.frameLocator('iframe');
         await navigate(`http://localhost:${firstPort}/?entered=1#part`);
         await frame().getByRole('heading', { name: 'First app' }).waitFor();
-        assert.equal(await page.locator('iframe').getAttribute('src'), `http://127.0.0.1:${firstPort}/?entered=1#part`);
+        const firstURL = await page.locator('iframe').getAttribute('src');
+        assert.notEqual(new URL(firstURL).port, String(firstPort));
+        assert.notEqual(new URL(firstURL).origin, origin);
+        assert.equal(new URL(firstURL).pathname + new URL(firstURL).search + new URL(firstURL).hash, '/?entered=1#part');
         assert(!requests.some(url => url.includes('__ormos')));
-        assert(!requests.some(url => url.endsWith('/api/preview')), 'Already reachable apps must not configure Serve');
+        assert(requests.some(url => url.endsWith('/api/preview')), 'Every app must go through an isolated preview');
         assert((await context.cookies()).every(cookie => cookie.name !== 'ormos_preview_port'));
         await frame().getByRole('button', { name: 'Change state' }).click();
         await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
@@ -178,7 +181,8 @@ finally:
         await page.getByRole('button', { name: 'Open preview in new tab', exact: true }).click();
         const opened = await popup;
         await opened.waitForLoadState('domcontentloaded');
-        assert.equal(opened.url(), `http://127.0.0.1:${secondPort}/`);
+        assert.equal(opened.url(), await page.locator('iframe').getAttribute('src'));
+        assert.notEqual(new URL(opened.url()).port, String(secondPort));
         assert.equal(await opened.evaluate(() => !!window.opener), false);
         await opened.close();
         const stopped = await listen((_req, res) => res.end());
@@ -216,7 +220,7 @@ finally:
 
 // A foreground CLI double exercises process lifetime without mutating the test
 // machine's Tailscale configuration. Real Serve behavior is checked on devbox.
-test('unreachable preview provisions one temporary route and preserves existing routes on shutdown', { timeout: 30000 }, async t => {
+test('remote preview provisions one temporary route and preserves existing routes on shutdown', { timeout: 30000 }, async t => {
   const home = await mkdtemp(path.join(tmpdir(), 'ormos-auto-'));
   t.after(() => rm(home, { recursive: true, force: true }));
   const bin = path.join(home, 'bin');
@@ -234,7 +238,7 @@ if (args.join(' ') === 'serve status --json') {
 } else {
  if (args.length !== 3 || !/^--http=\\d+$/.test(args[1])) process.exit(2);
  const port = args[1].slice(7);
- if (args[2] !== 'http://127.0.0.1:'+port) process.exit(3);
+ if (!args[2].startsWith('http://127.0.0.1:') || !Number(args[2].split(':').at(-1))) process.exit(3);
  const cfg = JSON.parse(fs.readFileSync(process.env.TEST_SERVE_STATE));
  cfg.Foreground = { [process.pid]: { TCP: { [port]: { HTTP: true } }, Web: { ['box.test:'+port]: { Handlers: { '/': { Proxy: args[2] } } } } } };
  fs.writeFileSync(process.env.TEST_SERVE_STATE, JSON.stringify(cfg));
@@ -255,7 +259,7 @@ if (args.join(' ') === 'serve status --json') {
   const placeholder = await listen((_req, res) => res.end());
   const port = placeholder.address().port;
   await close(placeholder);
-  const child = spawn(process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port)], {
+  const child = spawn(process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port), '--hosts', 'box.test:'+port], {
     env: { ...process.env, HOME: home, XDG_CONFIG_HOME: home, SHELL: '/bin/sh', PATH: bin+path.delimiter+process.env.PATH, TEST_SERVE_STATE: state, TEST_SERVE_CALLS: calls },
     stdio: 'ignore',
   });
@@ -270,37 +274,82 @@ if (args.join(' ') === 'serve status --json') {
     try { await fetch(origin); break; }
     catch { assert(n < 100 && child.exitCode === null); await new Promise(resolve => setTimeout(resolve, 50)); }
   }
-  const browser = await chromium.launch();
-  t.after(() => browser.close());
-  const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
-  const page = await context.newPage();
-  await page.goto(origin);
-  await page.getByRole('button', { name: 'Show preview', exact: true }).click();
-  // Simulate a phone that cannot reach a localhost-only app yet. The first
-  // probe fails; the second succeeds only after the setup endpoint returns.
-  const setups = [];
-  page.on('request', req => { if (req.url().endsWith('/api/preview')) setups.push(req.postDataJSON()); });
-  let failNextProbe = true;
-  await page.route(`http://127.0.0.1:${targetPort}/`, route => {
-    if (route.request().method() === 'HEAD' && failNextProbe) { failNextProbe = false; return route.abort('connectionrefused'); }
-    return route.continue();
+  // Exercise a remote hostname against the real CLI watcher without changing
+  // this machine's Tailscale state. Local previews need no CLI at all.
+  const open = () => new Promise((resolve, reject) => {
+    const request = http.request(origin+'/api/preview', {
+      method: 'POST', headers: { Host: 'box.test:'+port, Origin: 'http://box.test:'+port, 'Content-Type': 'application/json' },
+    }, response => {
+      let body = ''; response.on('data', data => { body += data; });
+      response.on('end', () => { try { assert.equal(response.statusCode, 200, body); resolve(JSON.parse(body)); } catch (error) { reject(error); } });
+    });
+    request.on('error', reject);
+    request.end(JSON.stringify({ port: targetPort, scheme: 'http' }));
   });
-  const address = page.getByRole('combobox', { name: 'Preview address' });
-  await address.fill(String(targetPort)); await address.press('Enter');
-  await page.frameLocator('iframe').getByRole('heading', { name: 'Automatic app' }).waitFor({ timeout: 15000 });
-  assert.deepEqual(setups, [{ port: targetPort, scheme: 'http' }]);
+  const exposed = await open();
+  assert.notEqual(exposed.port, targetPort);
   const active = JSON.parse(await readFile(state, 'utf8'));
   assert.deepEqual(active.TCP, existing.TCP);
   assert.deepEqual(active.Web, existing.Web);
   assert.equal(Object.keys(active.Foreground).length, 1);
-  failNextProbe = true;
-  await address.fill(String(targetPort)); await address.press('Enter');
-  await page.frameLocator('iframe').getByRole('heading', { name: 'Automatic app' }).waitFor({ timeout: 15000 });
-  assert.equal(setups.length, 2);
+  const backend = Object.values(active.Foreground)[0].Web['box.test:'+exposed.port].Handlers['/'].Proxy;
+  const body = await new Promise((resolve, reject) => { http.get(backend, { headers: { Host: 'box.test:'+exposed.port } }, response => { let body=''; response.on('data', data => { body += data; }); response.on('end', () => resolve(body)); }).on('error', reject); });
+  assert.match(body, /Automatic app/);
+  assert.deepEqual(await open(), exposed);
   const commands = (await readFile(calls, 'utf8')).trim().split('\n').map(JSON.parse);
-  assert.deepEqual(commands, [['serve', 'status', '--json'], ['serve', '--http='+targetPort, 'http://127.0.0.1:'+targetPort]]);
-  // Graceful server shutdown also closes its own idle test PTY.
-  await context.close();
+  assert.deepEqual(commands, [['serve', 'status', '--json'], ['serve', '--http='+exposed.port, backend]]);
   await stop();
   assert.deepEqual(JSON.parse(await readFile(state, 'utf8')), existing);
+});
+
+test('Vite accepts localhost forwarding and hot reloads through the preview WebSocket', { timeout: 45000 }, async t => {
+  const { createServer } = await import('vite');
+  const home = await mkdtemp(path.join(tmpdir(), 'ormos-vite-preview-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const root = path.join(home, 'app'); await mkdir(root);
+  await writeFile(path.join(root, 'index.html'), `<html><body><h1 id="message"></h1><script type="module">
+import { message } from '/message.js';
+document.querySelector('h1').textContent = message;
+if (import.meta.hot) import.meta.hot.accept('/message.js', module => { document.querySelector('h1').textContent = module.message; });
+</script></body></html>`);
+  await writeFile(path.join(root, 'message.js'), `export const message = 'Before live reload';\n`);
+  let vite = await createServer({ root, configFile: false, server: { host: '127.0.0.1', port: 0 } });
+  await vite.listen(); t.after(() => vite.close());
+  const appPort = vite.httpServer.address().port;
+  const placeholder = await listen((_req, res) => res.end());
+  const port = placeholder.address().port; await close(placeholder);
+  const child = spawn(process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port)], {
+    env: { ...process.env, HOME: home, XDG_CONFIG_HOME: home, SHELL: '/bin/sh' }, stdio: 'ignore',
+  });
+  t.after(async () => { if (child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill('SIGTERM'); await exited; } });
+  const origin = `http://127.0.0.1:${port}`;
+  for (let attempt=0; ; attempt++) {
+    try { await fetch(origin); break; }
+    catch { assert(attempt < 100 && child.exitCode === null); await new Promise(resolve => setTimeout(resolve, 50)); }
+  }
+  const browser = await chromium.launch(); t.after(() => browser.close());
+  const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+  const errors = []; const sockets = [];
+  page.on('pageerror', error => errors.push(String(error)));
+  page.on('websocket', socket => sockets.push(socket.url()));
+  await page.goto(origin);
+  await page.getByRole('button', { name: 'Show preview', exact: true }).click();
+  const address = page.getByRole('combobox', { name: 'Preview address' });
+  await address.fill(String(appPort)); await address.press('Enter');
+  const frame = page.frameLocator('iframe');
+  await frame.getByRole('heading', { name: 'Before live reload', exact: true }).waitFor();
+  const preview = new URL(await page.locator('iframe').getAttribute('src'));
+  assert.notEqual(preview.origin, origin);
+  assert.notEqual(preview.port, String(appPort));
+  await writeFile(path.join(root, 'message.js'), `export const message = 'After live reload';\n`);
+  await frame.getByRole('heading', { name: 'After live reload', exact: true }).waitFor();
+  assert(sockets.some(socket => new URL(socket).port === preview.port), 'HMR must use the preview proxy, not the app port');
+  await vite.close();
+  vite = await createServer({ root, configFile: false, server: { host: '127.0.0.1', port: appPort, strictPort: true } });
+  await vite.listen();
+  await page.getByRole('button', { name: 'Browser controls', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Browser tools' }).getByRole('button', { name: 'Refresh preview', exact: true }).click();
+  await frame.getByRole('heading', { name: 'After live reload', exact: true }).waitFor();
+  assert.equal(new URL(await page.locator('iframe').getAttribute('src')).port, preview.port, 'Restarting the app must retain its preview route');
+  assert.equal(errors.length, 0, errors.join('\n'));
 });

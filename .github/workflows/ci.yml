@@ -77,7 +77,7 @@ jobs:
       - name: Build
         uses: ./.github/actions/build
 
-      - name: Direct preview browser regression
+      - name: Preview browser regression
         shell: bash
         run: |
           set -euo pipefail
