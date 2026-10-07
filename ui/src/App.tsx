@@ -21,12 +21,15 @@ export default function App() {
   const [editing, setEditing] = createSignal("");
   const [draftName, setDraftName] = createSignal("");
   const [statuses, setStatuses] = createSignal<Record<string, string>>({});
+  const [shifted, setShifted] = createSignal(false);
+  const [visited, setVisited] = createSignal<Set<string>>(new Set());
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(true);
   const [view, setView] = createSignal<"terminal" | "preview">(localStorage.getItem("ormos.view") === "preview" ? "preview" : "terminal");
   const [headerMount, setHeaderMount] = createSignal<HTMLDivElement>();
   const switchView = () => {
     saveName();
+    setShifted(false);
     setView(previous => previous === "terminal" ? "preview" : "terminal");
     localStorage.setItem("ormos.view", view());
   };
@@ -46,7 +49,7 @@ export default function App() {
     if (label) setTabs(rows => rows.map(tab => tab.id === id ? { ...tab, label } : tab));
     persist();
   };
-  const select = (id: string) => { saveName(); setActive(id); persist(); };
+  const select = (id: string) => { saveName(); setShifted(false); setVisited(previous => new Set([...previous, id])); setActive(id); persist(); };
   const addTerminal = async () => {
     if (busy()) return;
     setBusy(true); setError("");
@@ -68,12 +71,16 @@ export default function App() {
     if (disposed) return;
     const rows = tabs(); const index = rows.findIndex(tab => tab.id === id);
     setTabs(rows.filter(tab => tab.id !== id));
-    if (active() === id) setActive(tabs()[Math.max(0, index - 1)]?.id ?? "");
+    setVisited(previous => new Set([...previous].filter(value => value !== id)));
+    if (active() === id) select(tabs()[Math.max(0, index - 1)]?.id ?? "");
     setStatuses(previous => { const next = { ...previous }; delete next[id]; return next; });
     persist();
     if (!tabs().length) await addTerminal();
   };
-  const setStatus = (id: string, status: string) => setStatuses(previous => ({ ...previous, [id]: status }));
+  const setStatus = (id: string, status: string) => {
+    setStatuses(previous => ({ ...previous, [id]: status }));
+    if (id === active() && status !== "Connected") setShifted(false);
+  };
   onMount(() => {
     const viewport = window.visualViewport;
     const updateHeight = () => document.documentElement.style.setProperty("--viewport-height", `${viewport?.height ?? window.innerHeight}px`);
@@ -88,6 +95,7 @@ export default function App() {
         setTabs(retained);
         const previous = localStorage.getItem("ormos.activeTerminal");
         setActive(retained.find(tab => tab.id === previous)?.id ?? retained[0]?.id ?? "");
+        setVisited(new Set(active() ? [active()] : []));
         setBusy(false);
         if (!retained.length) await addTerminal(); else persist();
       } catch (e) { if (!disposed) { setError(String(e)); setBusy(false); } }
@@ -138,10 +146,12 @@ export default function App() {
           <div id="terminal-content" class="pane-content">
           <div class="terminal-stack">
             <For each={tabs().map(tab => tab.id)}>{id => <div class="terminal-session" hidden={active() !== id}>
-              <TerminalPane id={id} onStatus={status => setStatus(id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
+              <Show when={visited().has(id)}>
+                <TerminalPane id={id} shifted={() => active() === id && shifted()} clearShift={() => setShifted(false)} onStatus={status => setStatus(id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
+              </Show>
             </div>}</For>
           </div>
-          <TerminalQuickControls enabled={statuses()[active()] === "Connected"} keyboard={() => controls.get(active())?.keyboard()} type={data => controls.get(active())?.type(data)} />
+          <TerminalQuickControls enabled={statuses()[active()] === "Connected"} shifted={shifted()} shift={() => setShifted(previous => !previous)} keyboard={() => controls.get(active())?.keyboard()} type={data => controls.get(active())?.type(data)} />
           </div>
           </section>
         </div>
