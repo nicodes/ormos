@@ -197,8 +197,10 @@ func (s *previewServe) open(ctx context.Context, port int, scheme, host string, 
 			}
 			return true
 		}
-		route.publicPort = port
-		if !available(port) {
+		// Keep the app port free of tailnet listeners. Some dev servers probe
+		// wildcard addresses when restarting, even when bound to localhost.
+		route.publicPort = route.localPort
+		if !available(route.publicPort) {
 			route.publicPort = 0
 			for candidate := 20000; candidate <= 65535; candidate++ {
 				if available(candidate) {

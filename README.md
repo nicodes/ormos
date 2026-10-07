@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: ad9364235173bcd80f5307d8ac8f300214766719200aa7e5496cd358a7e553a5 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 41ef7dbe098f1b6573fc75d8203e7491fc8c720abb3dafaa74983e48615f295b -->
 
 # Ormos
 
@@ -54,7 +54,7 @@ ormos ui --port 4242 --hosts box.example.ts.net:4242
 tailscale serve --bg --https=4242 http://127.0.0.1:4242
 ```
 
-Visit `https://box.example.ts.net:4242` from a device on the same tailnet. Start your app normally in the terminal, then enter its local port, such as `3000`, in Preview. Ormos checks that it is listening on localhost, opens a forwarding listener and automatically exposes that listener privately through Tailscale Serve. There is no per-app setup command or routine Vite allowed-host configuration. Existing Serve routes are preserved; Ormos selects another public preview port when the app's port is occupied. The URL bar keeps displaying the local app port. Network access rules must permit the workspace and preview ports. Local browser use on localhost requires no Tailscale setup.
+Visit `https://box.example.ts.net:4242` from a device on the same tailnet. Start your app normally in the terminal, then enter its local port, such as `3000`, in Preview. Ormos checks that it is listening on localhost, opens a forwarding listener and automatically exposes that listener privately through Tailscale Serve. There is no per-app setup command or routine Vite allowed-host configuration. Existing Serve routes are preserved. Each app gets an unused public preview port separate from its local app port, so development servers can restart on their normal ports. The URL bar keeps displaying the local app port. Network access rules must permit the workspace and preview ports. Local browser use on localhost requires no Tailscale setup.
 
 There is no application login: anyone permitted to reach the UI can control its terminals as its operating-system user. Keep it private and limit network access to trusted users/devices. Ormos rejects foreign origins for terminal mutations and WebSocket upgrades, and unlisted UI hostnames. Terminal controls cannot be embedded in an iframe. Forwarded previews use a different port/origin from the UI and are sandboxed.
 

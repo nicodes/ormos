@@ -57,7 +57,7 @@ func TestPreviewPreservesExistingServeRoutes(t *testing.T) {
 		s.status = func(context.Context) (*serveConfig, error) { return cfg, nil }
 		original := s.start
 		s.start = func(ctx context.Context, scheme string, public, local int) (*serveSession, error) {
-			if public == 3000 || local == 3000 || public == local {
+			if public == 3000 || local == 3000 {
 				t.Fatal("overwrote an existing route or bypassed proxy")
 			}
 			return original(ctx, scheme, public, local)
@@ -84,7 +84,7 @@ func TestPreviewConcurrentRequestsReuseSessionAndShutdown(t *testing.T) {
 	var wg sync.WaitGroup
 	for range 12 {
 		wg.Go(func() {
-			if exposed, err := s.open(context.Background(), 3000, "https", "box.test", 4242); err != nil || exposed != 3000 {
+			if exposed, err := s.open(context.Background(), 3000, "https", "box.test", 4242); err != nil || exposed == 3000 {
 				t.Errorf("port=%d error=%v", exposed, err)
 			}
 		})
