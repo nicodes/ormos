@@ -107,6 +107,26 @@ finally:
         page.on('request', request => requests.push(request.url()));
         page.on('pageerror', error => errors.push(error));
         await page.goto(origin);
+        const cdp = await context.newCDPSession(page);
+        const installation = await cdp.send('Page.getAppManifest');
+        assert.equal(installation.url, `${origin}/manifest.webmanifest`);
+        assert.deepEqual(installation.errors, []);
+        const manifest = JSON.parse(installation.data);
+        assert.equal(manifest.display, 'standalone');
+        assert.equal(manifest.start_url, '/');
+        assert.equal(await page.locator('link[rel="apple-touch-icon"]').getAttribute('href'), '/icons/apple-touch-icon.png');
+        for (const icon of manifest.icons) {
+          const dimensions = await page.evaluate(src => new Promise((resolve, reject) => {
+            const image = new Image();
+            image.onload = () => resolve(`${image.naturalWidth}x${image.naturalHeight}`);
+            image.onerror = () => reject(new Error(`Cannot load installation icon ${src}`));
+            image.src = src;
+          }), icon.src);
+          assert.equal(dimensions, icon.sizes);
+        }
+        const installability = await cdp.send('Page.getInstallabilityErrors');
+        assert.deepEqual(installability.installabilityErrors, []);
+        await cdp.detach();
         await page.waitForFunction(() => document.querySelector('.status-dot.online'));
         if (touch) {
           await page.locator('.xterm-screen').tap();
