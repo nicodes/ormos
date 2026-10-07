@@ -287,3 +287,58 @@ func TestUIFlowResumeAndInvalidNegotiation(t *testing.T) {
 		}
 	}
 }
+
+func TestUIFlowSlowViewerDoesNotBlockOtherViewers(t *testing.T) {
+	fix := newUIFixture(t, nil)
+	term := &uiTerminal{id: "t_viewers", alive: true}
+	history := bytes.Repeat([]byte("x"), uiOutputWindow+8192)
+	term.append(history)
+	fix.srv.terms[term.id] = term
+	ts := fix.start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dial := func(mode websocket.CompressionMode) *websocket.Conn {
+		t.Helper()
+		conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/api/terminal/"+term.id+"/ws?flow=1", &websocket.DialOptions{CompressionMode: mode, HTTPHeader: http.Header{"Origin": []string{ts.URL}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.CloseNow() })
+		conn.SetReadLimit(uiOutputChunk)
+		if _, _, err := conn.Read(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return conn
+	}
+	slow := dial(websocket.CompressionDisabled)
+	fast := dial(websocket.CompressionNoContextTakeover)
+	for count := 0; count < uiOutputWindow; {
+		_, chunk, err := slow.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count += len(chunk) // Deliberately do not acknowledge the slow viewer.
+	}
+	read := func(expected []byte) {
+		t.Helper()
+		var got []byte
+		for len(got) < len(expected) {
+			_, chunk, err := fast.Read(ctx)
+			if err != nil {
+				t.Fatal("other viewer was blocked:", err)
+			}
+			got = append(got, chunk...)
+			ack, _ := json.Marshal(map[string]any{"type": "ack", "bytes": len(chunk)})
+			if err := fast.Write(ctx, websocket.MessageText, ack); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !bytes.Equal(got, expected) {
+			t.Fatal("concurrent compressed/uncompressed viewers changed shared output")
+		}
+	}
+	read(history)
+	live := bytes.Repeat([]byte("live"), 8192)
+	term.append(live)
+	read(live)
+}
