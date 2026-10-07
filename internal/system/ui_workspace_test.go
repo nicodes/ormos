@@ -168,3 +168,97 @@ func TestUINewTerminalUsesHomeByDefault(t *testing.T) {
 		t.Fatalf("default terminal cwd: %q", fix.spawnLog.String())
 	}
 }
+
+func TestUITerminalReplayRetainsHistoryBeyondOldLimit(t *testing.T) {
+	term := &uiTerminal{}
+	payload := []byte("EARLY_HISTORY\r\n" + strings.Repeat("history line\r\n", 10000))
+	term.append(payload)
+	got, offset, reset := term.replay(nil)
+	if string(got) != string(payload) || offset != 0 || !reset {
+		t.Fatalf("fresh replay lost history: length=%d offset=%d reset=%v", len(got), offset, reset)
+	}
+	// The larger history remains bounded, including at ring wrap boundaries.
+	term.append([]byte(strings.Repeat("x", uiTerminalBufMax)))
+	term.append([]byte("tail"))
+	got, offset, reset = term.replay(nil)
+	if len(got) != uiTerminalBufMax || !strings.HasSuffix(string(got), "tail") || offset != uint64(len(payload)+4) || !reset {
+		t.Fatalf("bounded replay: length=%d offset=%d reset=%v", len(got), offset, reset)
+	}
+}
+
+func TestUITerminalResumeAfterDisconnect(t *testing.T) {
+	fix := newUIFixture(t, nil)
+	term := &uiTerminal{id: "t_resume", alive: true}
+	term.append([]byte("already rendered"))
+	fix.srv.terms[term.id] = term
+	ts := fix.start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	readReplay := func(suffix string, wantOffset uint64, wantReset bool, want string) *websocket.Conn {
+		t.Helper()
+		conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/api/terminal/"+term.id+"/ws"+suffix, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{ts.URL}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.CloseNow() })
+		kind, data, err := conn.Read(ctx)
+		var meta struct {
+			Type   string
+			Offset uint64
+			Reset  bool
+		}
+		if err != nil || kind != websocket.MessageText || json.Unmarshal(data, &meta) != nil || meta.Type != "replay" || meta.Offset != wantOffset || meta.Reset != wantReset {
+			t.Fatalf("replay metadata: %s %v", data, err)
+		}
+		if want != "" {
+			kind, data, err = conn.Read(ctx)
+			if err != nil || kind != websocket.MessageBinary || string(data) != want {
+				t.Fatalf("replay output: %q %v", data, err)
+			}
+		}
+		return conn
+	}
+	conn := readReplay("", 0, true, "already rendered")
+	conn.CloseNow()
+	term.append([]byte(" while disconnected"))
+	conn = readReplay("?since=16", 16, false, " while disconnected")
+	term.append([]byte(" live"))
+	_, data, err := conn.Read(ctx)
+	if err != nil || string(data) != " live" {
+		t.Fatalf("live output: %q %v", data, err)
+	}
+	conn.CloseNow()
+	// No missed output means metadata only, followed directly by new live bytes.
+	conn = readReplay("?since=40", 40, false, "")
+	term.append([]byte(" next"))
+	_, data, err = conn.Read(ctx)
+	if err != nil || string(data) != " next" {
+		t.Fatalf("caught-up output: %q %v", data, err)
+	}
+	conn.CloseNow()
+	readReplay("?since=999", 0, true, "already rendered while disconnected live next").CloseNow()
+	for _, query := range []string{"-1", "oops", "9007199254740992", "1&since=2"} {
+		conn, res, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(ts.URL, "http")+"/api/terminal/"+term.id+"/ws?since="+query, &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{ts.URL}}})
+		if conn != nil {
+			conn.CloseNow()
+		}
+		if err == nil || res == nil || res.StatusCode != http.StatusBadRequest {
+			t.Fatalf("invalid offset %q accepted: %v", query, err)
+		}
+	}
+}
+
+func TestUITerminalExpiredResumeResetsToRetainedTail(t *testing.T) {
+	term := &uiTerminal{}
+	term.append([]byte(strings.Repeat("x", uiTerminalBufMax+10)))
+	since := uint64(9)
+	got, offset, reset := term.replay(&since)
+	if !reset || offset != 10 || len(got) != uiTerminalBufMax {
+		t.Fatalf("expired replay: %d %d %v", len(got), offset, reset)
+	}
+	since = uint64(10)
+	_, offset, reset = term.replay(&since)
+	if reset || offset != 10 {
+		t.Fatal("oldest retained offset should still resume")
+	}
+}
