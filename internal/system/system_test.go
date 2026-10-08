@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/coder/websocket"
@@ -587,51 +588,61 @@ func TestExitReportUsesShutdownContextWhenRunCancelsFirst(t *testing.T) {
 }
 
 func TestExitReportWorkerSurvivesSlowShutdownPublication(t *testing.T) {
-	oldClient, oldTO, oldGrace := httpClient, terminalExitReportShutdownTO, terminalKillGrace
-	t.Cleanup(func() { httpClient, terminalExitReportShutdownTO, terminalKillGrace = oldClient, oldTO, oldGrace })
-	terminalExitReportShutdownTO = 25 * time.Millisecond
-	terminalKillGrace = 2 * time.Millisecond
-	posted := make(chan int, 1)
-	httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.Method == http.MethodPost {
-			var body struct {
-				Generation int `json:"generation"`
+	// A virtual clock tests the 50 ms publication delay and 25 ms report
+	// budget without making correctness depend on CI scheduler latency.
+	synctest.Test(t, func(t *testing.T) {
+		oldClient, oldTO, oldGrace := httpClient, terminalExitReportShutdownTO, terminalKillGrace
+		t.Cleanup(func() { httpClient, terminalExitReportShutdownTO, terminalKillGrace = oldClient, oldTO, oldGrace })
+		terminalExitReportShutdownTO = 25 * time.Millisecond
+		terminalKillGrace = 2 * time.Millisecond
+		posted := make(chan int, 1)
+		httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Method == http.MethodPost {
+				var body struct {
+					Generation int `json:"generation"`
+				}
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					return nil, err
+				}
+				posted <- body.Generation
 			}
-			if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
-				return nil, err
+			return testHTTPResponse(http.StatusNoContent, ""), nil
+		})}
+		d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, terminals: make(map[string]*terminalSession)}
+		done := make(chan struct{})
+		var shutdown sync.Once
+		startShutdown := func() {
+			shutdown.Do(func() { go func() { d.finishShutdown(); close(done) }() })
+		}
+		// Join before restoring globals even when an assertion fails.
+		t.Cleanup(func() { startShutdown(); <-done })
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		d.runCtx = ctx
+		waiting := make(chan struct{})
+		d.beforeExitReportContextWait = func() { close(waiting) }
+		d.reportTerminalExit("record", 11)
+		select {
+		case <-waiting:
+		case <-time.After(time.Second):
+			t.Fatal("report worker did not wait for shutdown context publication")
+		}
+		d.beforeExitReportContextPublish = func() { time.Sleep(50 * time.Millisecond) }
+		startShutdown()
+		select {
+		case generation := <-posted:
+			if generation != 11 {
+				t.Fatalf("exit report generation=%d, want 11", generation)
 			}
-			posted <- body.Generation
+		case <-time.After(time.Second):
+			t.Fatal("report worker dropped its exact-generation report during slow publication")
 		}
-		return testHTTPResponse(http.StatusNoContent, ""), nil
-	})}
-	d := &system{cfg: systemConfig{RelayURL: "ws://relay.test"}, terminals: make(map[string]*terminalSession)}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	d.runCtx = ctx
-	waiting := make(chan struct{})
-	d.beforeExitReportContextWait = func() { close(waiting) }
-	d.reportTerminalExit("record", 11)
-	select {
-	case <-waiting:
-	case <-time.After(time.Second):
-		t.Fatal("report worker did not wait for shutdown context publication")
-	}
-	d.beforeExitReportContextPublish = func() { time.Sleep(50 * time.Millisecond) }
-	done := make(chan struct{})
-	go func() { d.finishShutdown(); close(done) }()
-	select {
-	case generation := <-posted:
-		if generation != 11 {
-			t.Fatalf("exit report generation=%d, want 11", generation)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("shutdown did not finish after report delivery")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("report worker dropped its exact-generation report during slow publication")
-	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("shutdown did not finish after report delivery")
-	}
+	})
 }
 
 func TestShutdownPreventsInFlightAdmissionPublication(t *testing.T) {
