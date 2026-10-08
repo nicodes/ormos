@@ -456,3 +456,87 @@ func TestUITerminalExpiredResumeResetsToRetainedTail(t *testing.T) {
 		t.Fatal("oldest retained offset should still resume")
 	}
 }
+
+func TestUIWorkspaceConnectionLimitIncludesRetiredPTYs(t *testing.T) {
+	fixture := newUIFixture(t, nil)
+	for i := 0; i < uiMaxWorkspaceReaders/uiMaxTerminalReaders; i++ {
+		id := fmt.Sprintf("t_group_%d", i)
+		term := &uiTerminal{id: id, alive: true}
+		if i == 0 {
+			term.append(bytes.Repeat([]byte("x"), uiOutputWindow))
+		}
+		fixture.srv.terms[id] = term
+	}
+	server := fixture.start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var clients []*websocket.Conn
+	t.Cleanup(func() {
+		for _, client := range clients {
+			_ = client.CloseNow()
+		}
+	})
+	dial := func(id string) (*websocket.Conn, *http.Response, error) {
+		return websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/api/terminal/"+id+"/ws?flow=1", &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{server.URL}}})
+	}
+	for i := 0; i < uiMaxWorkspaceReaders; i++ {
+		group := i / uiMaxTerminalReaders
+		client, _, err := dial(fmt.Sprintf("t_group_%d", group))
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, client)
+		client.SetReadLimit(uiOutputChunk + 1024)
+		if _, _, err := client.Read(ctx); err != nil {
+			t.Fatal(err)
+		} // replay boundary
+		if group == 0 {
+			for received := 0; received < uiOutputWindow; {
+				kind, data, err := client.Read(ctx)
+				if err != nil || kind != websocket.MessageBinary {
+					t.Fatalf("output: %v", err)
+				}
+				received += len(data)
+			}
+			// No ACK: all eight retiring viewers remain at a full parser window.
+		}
+	}
+	fixture.srv.mu.Lock()
+	retired := fixture.srv.terms["t_group_0"]
+	delete(fixture.srv.terms, "t_group_0")
+	fixture.srv.terms["t_replacement"] = &uiTerminal{id: "t_replacement", alive: true}
+	fixture.srv.mu.Unlock()
+	retired.mu.Lock()
+	retired.alive = false
+	for update := range retired.updates {
+		close(update)
+		delete(retired.updates, update)
+	}
+	retired.mu.Unlock()
+	client, response, err := dial("t_replacement")
+	if client != nil {
+		_ = client.CloseNow()
+	}
+	if err == nil || response == nil || response.StatusCode != 429 {
+		t.Fatal("retired PTY sockets escaped the workspace connection bound")
+	}
+	_ = clients[0].CloseNow()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fixture.srv.mu.Lock()
+		connections := fixture.srv.connections
+		fixture.srv.mu.Unlock()
+		if connections < uiMaxWorkspaceReaders {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("disconnect did not release the global reservation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	client, _, err = dial("t_replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clients = append(clients, client)
+}

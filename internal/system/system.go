@@ -1191,13 +1191,25 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 	// allocation size, and what a peer may hold across the tunnel is
 	// relay.MaxTunnelWindowBytes — pinned by the guard in
 	// relay/transport_test.go, which is where to change it.
-	netConn := relay.NetConn(ctx, conn)
+	// Root cancellation fulfills shutdown immediately, but canceling the
+	// transport reader can abort TCP while the peer is receiving the committed
+	// ACK. Keep its context alive through the bounded WebSocket close handshake.
+	transport, cancelTransport := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelTransport()
+	netConn := relay.NetConn(transport, conn)
 	sess, err := relay.ServerSession(netConn)
 	if err != nil {
 		conn.Close(websocket.StatusInternalError, "yamux setup failed")
 		return false, fmt.Errorf("yamux: %w", err)
 	}
 	defer sess.Close()
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close(websocket.StatusNormalClosure, "")
+		case <-sess.CloseChan():
+		}
+	}()
 
 	d.setConnected(true)
 	d.logf("tunnel established")
@@ -1222,6 +1234,10 @@ func (d *system) connectAndServe(ctx context.Context) (connected bool, err error
 		stream, err := sess.Accept()
 		if err != nil {
 			return true, nil // connected; session closed
+		}
+		if ctx.Err() != nil {
+			_ = stream.Close()
+			continue
 		}
 		select {
 		case slots <- struct{}{}:

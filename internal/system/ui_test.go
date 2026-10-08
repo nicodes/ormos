@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/png"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -368,10 +369,9 @@ func TestUIServeOverLoopback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := make([]byte, 4096)
-	n, _ := res.Body.Read(body)
+	body, readErr := io.ReadAll(res.Body)
 	res.Body.Close()
-	if res.StatusCode != http.StatusOK || !strings.Contains(string(body[:n]), "ormos") {
+	if readErr != nil || res.StatusCode != http.StatusOK || !strings.Contains(string(body), "ormos") {
 		t.Fatalf("index: status=%d", res.StatusCode)
 	}
 	if res.Header.Get("Cache-Control") != "no-cache" {

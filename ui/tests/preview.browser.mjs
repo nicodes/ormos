@@ -85,6 +85,114 @@ finally:
   }
   const browser = await chromium.launch();
   t.after(() => browser.close());
+  await t.test('preview cold load avoids terminal code and cancels serial port polling', async () => {
+    const context = await browser.newContext();
+    try {
+      await context.addInitScript(() => localStorage.setItem('ormos.view', 'preview'));
+      const page = await context.newPage();
+      const assets = [], sockets = [], polls = [], openings = [];
+      page.on('request', request => {
+        if (request.url().includes('/assets/')) assets.push(request.url());
+        if (request.url().endsWith('/api/action') && request.postDataJSON()?.action === 'open') openings.push(request.url());
+      });
+      page.on('websocket', socket => sockets.push(socket.url()));
+      // Hold the first poll longer than the former three-second interval.
+      await page.route('**/api/ports', route => { polls.push(route); });
+      await page.goto(origin);
+      const address = page.getByRole('combobox', { name: 'Preview address' });
+      await address.waitFor();
+      assert(!assets.some(url => /TerminalPane-/.test(url)), 'Preview must not fetch xterm JavaScript or CSS');
+      assert.equal(sockets.length, 0, 'Preview must not replay terminal history');
+      assert.equal(openings.length, 0, 'A fresh preview must not create an unused shell');
+      await address.click();
+      await page.waitForFunction(() => document.querySelector('.preview-history'));
+      for (let attempt = 0; polls.length === 0; attempt++) { assert(attempt < 100); await new Promise(resolve => setTimeout(resolve, 10)); }
+      await new Promise(resolve => setTimeout(resolve, 3250));
+      assert.equal(polls.length, 1, 'Slow port discovery must not start overlapping requests');
+      const cancelled = new Promise(resolve => page.on('requestfailed', request => { if (request.url().endsWith('/api/ports')) resolve(); }));
+      await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
+      await cancelled;
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      assert.equal(sockets.length, 1);
+      assert.equal(openings.length, 1, 'The first terminal view must open one shell');
+      assert(assets.some(url => /TerminalPane-.*\.js$/.test(url)));
+      await page.getByRole('button', { name: 'Show preview', exact: true }).click();
+      await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
+      assert.equal(sockets.length, 1, 'Returning to a mounted terminal must preserve its connection');
+      // Only the terminal created by this context is closed.
+      await page.getByRole('button', { name: /Close Terminal/ }).click();
+      // Closing the final tab automatically opens a replacement; stop it too.
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      await page.evaluate(async () => {
+        for (const row of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill', id: row.id }) });
+      });
+    } finally { await context.close(); }
+  });
+  await t.test('terminal code loads in parallel with session discovery', async () => {
+    const context = await browser.newContext();
+    try {
+      const page = await context.newPage();
+      let discovery;
+      await page.route('**/api/terminals', route => { discovery = route; });
+      const terminalCode = page.waitForRequest(request => /\/assets\/TerminalPane-.*\.js$/.test(request.url()), { timeout: 5000 });
+      await page.goto(origin);
+      await terminalCode;
+      assert(discovery, 'Terminal preload must not wait for session discovery to finish');
+      await discovery.continue();
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      await page.evaluate(async () => {
+        for (const row of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill', id: row.id }) });
+      });
+    } finally { await context.close(); }
+  });
+  await t.test('missing lazy terminal code leaves preview usable', async () => {
+    const context = await browser.newContext();
+    try {
+      await context.addInitScript(() => localStorage.setItem('ormos.view', 'preview'));
+      const page = await context.newPage(), errors = [];
+      page.on('pageerror', error => errors.push(String(error)));
+      await page.route('**/assets/TerminalPane-*.js', route => route.abort('failed'));
+      await page.goto(origin);
+      await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
+      await page.getByRole('alert').getByText('Terminal unavailable', { exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Show preview', exact: true }).click();
+      const address = page.getByRole('combobox', { name: 'Preview address' });
+      await address.fill(String(firstPort)); await address.press('Enter');
+      await page.frameLocator('iframe').getByRole('heading', { name: 'First app' }).waitFor();
+      assert.deepEqual(errors, []);
+      await page.evaluate(async () => {
+        for (const row of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill', id: row.id }) });
+      });
+    } finally { await context.close(); }
+  });
+  await t.test('denied browser storage preserves terminal and preview use', async () => {
+    const context = await browser.newContext();
+    try {
+      await context.addInitScript(() => Object.defineProperty(window, 'localStorage', { get() { throw new DOMException('Storage denied', 'SecurityError'); } }));
+      const page = await context.newPage(), errors = [];
+      page.on('pageerror', error => errors.push(String(error)));
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      const id = (await page.evaluate(async () => (await (await fetch('/api/terminals')).json()).terminals)).find(row => row.alive).id;
+      await page.getByRole('button', { name: 'Terminal controls', exact: true }).click();
+      const dialog = page.getByRole('dialog', { name: 'Terminal tools' });
+      await dialog.getByRole('tab', { name: 'Saved commands', exact: true }).click();
+      await dialog.getByRole('button', { name: 'Add command', exact: true }).click();
+      await dialog.getByRole('textbox', { name: 'Command title', exact: true }).fill('Cannot persist');
+      await dialog.getByRole('textbox', { name: 'Saved command', exact: true }).fill('echo test');
+      await dialog.getByRole('button', { name: 'Save command', exact: true }).click();
+      await dialog.getByRole('alert').getByText('Could not save commands in this browser.', { exact: true }).waitFor();
+      await page.getByRole('button', { name: 'Terminal controls', exact: true }).click();
+      await page.getByRole('button', { name: 'Show preview', exact: true }).click();
+      const address = page.getByRole('combobox', { name: 'Preview address' });
+      await address.fill(String(firstPort)); await address.press('Enter');
+      await page.frameLocator('iframe').getByRole('heading', { name: 'First app' }).waitFor();
+      await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
+      assert.equal(await page.locator('.xterm').count(), 1);
+      assert.deepEqual(errors, []);
+      await page.evaluate(async id => fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill', id }) }), id);
+    } finally { await context.close(); }
+  });
   for (const touch of [false, true]) {
     await t.test(touch ? 'phone layout' : 'desktop layout', async () => {
       const context = await browser.newContext({ viewport: touch ? { width: 390, height: 844 } : { width: 1440, height: 900 }, hasTouch: touch, isMobile: touch });
@@ -390,6 +498,8 @@ finally:
         await frame().getByRole('heading', { name: 'First app' }).waitFor();
         await page.reload();
         await frame().getByRole('heading', { name: 'First app' }).waitFor();
+        assert.equal(await page.locator('.xterm').count(), 0, 'Preview reload must defer retained terminal rendering');
+        assert.equal(await page.evaluate(() => window.testTerminalSockets.length), 0);
         assert.equal(errors.length, 0, errors.map(String).join('\n'));
         // Hidden PTYs keep running, but after reload only the selected tab
         // mounts a renderer and transfers its history. Visiting another tab
@@ -448,6 +558,29 @@ finally:
       } finally { await context.close(); }
     });
   }
+  await t.test('server shutdown closes connected sockets and reaps owned shells', async () => {
+    const context = await browser.newContext();
+    try {
+      const page = await context.newPage();
+      let closed = false;
+      page.on('websocket', socket => socket.on('close', () => { closed = true; }));
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      await page.getByRole('button', { name: 'Keyboard', exact: true }).click();
+      await page.keyboard.type("trap '' HUP; printf 'SHUTDOWN_%s\\n' READY; while :; do sleep 1; done");
+      await page.keyboard.press('Enter');
+      await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SHUTDOWN_READY'));
+      const exited = once(child, 'exit');
+      const began = Date.now();
+      child.kill('SIGTERM');
+      const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+      try { await exited; } finally { clearTimeout(timer); }
+      assert.equal(child.signalCode, null, 'The server must exit normally after its bounded cleanup');
+      assert.equal(child.exitCode, 0);
+      assert(Date.now() - began < 4000, 'Shutdown must share the grace period across terminals');
+      for (let attempt = 0; !closed; attempt++) { assert(attempt < 100, 'Attached socket survived shutdown'); await new Promise(resolve => setTimeout(resolve, 10)); }
+    } finally { await context.close(); }
+  });
 });
 
 
