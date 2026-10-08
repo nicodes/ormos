@@ -129,6 +129,78 @@ finally:
       });
     } finally { await context.close(); }
   });
+  await t.test('mobile replacements send only the edit and clipboard pastes send once', async () => {
+    const context = await browser.newContext({ isMobile: true, hasTouch: true });
+    try {
+      await context.addInitScript(() => {
+        window.testTyped = [];
+        const send = WebSocket.prototype.send;
+        WebSocket.prototype.send = function(data) {
+          const message = JSON.parse(data);
+          if (message.type === 'input') window.testTyped.push(message.data);
+          return send.call(this, data);
+        };
+      });
+      const page = await context.newPage();
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      await page.getByRole('button', { name: 'Keyboard', exact: true }).click();
+      const edit = async (oldValue, newValue, inputType = 'insertReplacementText', data = null, mobile = true) => {
+        await page.evaluate(({ oldValue, newValue, inputType, data, mobile }) => {
+          window.testTyped = [];
+          const textarea = document.querySelector('.xterm-helper-textarea');
+          textarea.value = oldValue;
+          textarea.setSelectionRange(oldValue.length, oldValue.length);
+          if (mobile) textarea.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, keyCode: 229, key: 'Unidentified' }));
+          textarea.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, inputType, data }));
+          textarea.value = newValue;
+          textarea.dispatchEvent(new InputEvent('input', { bubbles: true, inputType, data }));
+          textarea.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, keyCode: 229 }));
+        }, { oldValue, newValue, inputType, data, mobile });
+        // xterm's legacy mobile fallback sends on a timer.
+        await page.waitForTimeout(50);
+        return page.evaluate(() => window.testTyped.join(''));
+      };
+      assert.equal(await edit('Please fix teh', 'Please fix the'), '\x7f\x7fhe');
+      assert.equal(await edit('Please fix teh', 'Please fix the', 'insertReplacementText', 'the', false), '\x7f\x7fhe');
+      assert.equal(await edit('long message so far: ', 'long message so far: word', 'insertText', 'word'), 'word');
+      assert.equal(await edit('echo ', 'echo echo ', 'insertText', 'echo '), 'echo ', 'Intentional repeated text must be retained');
+      assert.equal(await edit('hello', 'hell', 'deleteContentBackward'), '\x7f');
+      assert.equal(await edit('hello', 'hello', 'insertText', 'hello'), '', 'Unchanged textarea must not resend context');
+      assert.equal(await edit('message: ', 'message: 😀', 'insertText', '😀'), '😀');
+      const unbracket = text => text.startsWith('\x1b[200~') && text.endsWith('\x1b[201~') ? text.slice(6, -6) : text;
+      assert.equal(unbracket(await edit('message: ', 'message: clipboard', 'insertFromPaste', null, false)), 'clipboard');
+      // Real IMEs must retain xterm's composition lifecycle and commit once.
+      await page.evaluate(() => {
+        window.testTyped = [];
+        const textarea = document.querySelector('.xterm-helper-textarea');
+        textarea.value = 'prior context';
+        textarea.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, keyCode: 229 }));
+        textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }));
+        textarea.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, data: '終' }));
+        textarea.value += '終';
+        textarea.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertCompositionText', data: '終', isComposing: true }));
+        textarea.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '終' }));
+        textarea.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, keyCode: 229 }));
+      });
+      await page.waitForTimeout(50);
+      assert.equal(await page.evaluate(() => window.testTyped.join('')), '終');
+      const paste = await page.evaluate(() => {
+        window.testTyped = [];
+        const textarea = document.querySelector('.xterm-helper-textarea');
+        textarea.value = 'old context';
+        const clipboardData = new DataTransfer();
+        clipboardData.setData('text/plain', 'pasted word');
+        const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData });
+        textarea.dispatchEvent(event);
+        return { cancelled: event.defaultPrevented, text: window.testTyped.join('') };
+      });
+      assert.deepEqual({ ...paste, text: unbracket(paste.text) }, { cancelled: true, text: 'pasted word' });
+      await page.evaluate(async () => {
+        for (const row of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill', id: row.id }) });
+      });
+    } finally { await context.close(); }
+  });
   await t.test('saved lists mount only when selected and large prompts obey input credits', async () => {
     const text = '😀終'.repeat(15000), bytes = Buffer.byteLength(text);
     await writeFile(path.join(home, 'paste-app.py'), `import os,tty,termios,hashlib

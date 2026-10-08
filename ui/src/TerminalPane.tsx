@@ -7,6 +7,7 @@ import { shiftTerminalKey } from "./shiftKey";
 import { createTerminalResize } from "./terminalResize";
 import { createTerminalInput } from "./terminalInput";
 import { createTerminalOutput } from "./terminalOutput";
+import { bindTerminalEdits } from "./terminalEdits";
 
 export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void };
 export default function TerminalPane(props: {
@@ -161,10 +162,12 @@ export default function TerminalPane(props: {
     };
     const input = terminal.onData(type);
     const observer = new ResizeObserver(resize.request); observer.observe(container);
-    props.register(props.id, { focus, keyboard, type, paste: data => {
+    const paste = (data: string) => {
       pasting = true;
       try { terminal.paste(data); } finally { pasting = false; }
-    } });
+    };
+    const unbindEdits = bindTerminalEdits(container, textarea, type, paste);
+    props.register(props.id, { focus, keyboard, type, paste });
     connect();
     onCleanup(() => {
       disposed = true; generation++; clearTimeout(retry); discovery?.abort(); observer.disconnect(); resize.dispose(); output.dispose(); transportInput.dispose(); socket?.close();
@@ -174,7 +177,7 @@ export default function TerminalPane(props: {
       container.removeEventListener("touchcancel", touchEnd);
       textarea.removeEventListener("blur", dismissKeyboard);
       container.removeEventListener("pointerdown", touchPointer, true);
-      input.dispose(); terminal.dispose(); props.register(props.id);
+      unbindEdits(); input.dispose(); terminal.dispose(); props.register(props.id);
     });
   });
   return <div class="terminal-container" ref={container} />;
