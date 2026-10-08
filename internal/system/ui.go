@@ -65,18 +65,19 @@ const (
 var uiShellAllowlist = []string{"/bin/sh", "/bin/bash", "/bin/zsh", "/usr/bin/zsh", "/usr/bin/bash"}
 
 type uiTerminal struct {
-	id      string
-	shell   string
-	cwd     string
-	started time.Time
-	alive   bool
-	mu      sync.Mutex
-	history replayRing
-	end     uint64
-	kill    func()
-	input   func([]byte) error
-	resize  func(uint16, uint16) error
-	readers map[chan []byte]bool
+	id          string
+	shell       string
+	cwd         string
+	started     time.Time
+	alive       bool
+	mu          sync.Mutex
+	history     replayRing
+	end         uint64
+	kill        func()
+	input       func([]byte) error
+	resize      func(uint16, uint16) error
+	readers     map[chan []byte]bool
+	attachments int
 }
 
 func (t *uiTerminal) output() string {
@@ -93,9 +94,15 @@ func (t *uiTerminal) append(p []byte) {
 	}
 	t.history.append(p)
 	t.end += uint64(len(p))
+	// PTY reads reuse their buffer. Own one immutable chunk and share it across
+	// readers; neither the WebSocket writer nor compression modifies this data.
+	var chunk []byte
+	if len(t.readers) > 0 {
+		chunk = append([]byte(nil), p...)
+	}
 	for reader := range t.readers {
 		select {
-		case reader <- append([]byte(nil), p...):
+		case reader <- chunk:
 		default:
 			close(reader)
 			delete(t.readers, reader)
