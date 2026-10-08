@@ -16,6 +16,8 @@ import (
 	"github.com/coder/websocket"
 )
 
+const uiMaxTerminalReaders = 8
+
 // No account system: the private listener is the access boundary. Host and
 // Origin checks prevent other browser pages from controlling local terminals.
 func (s *uiServer) hostAllowed(authority string) bool {
@@ -87,13 +89,6 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 		uiError(w, http.StatusNotFound, "no such terminal")
 		return
 	}
-	term.mu.Lock()
-	alive := term.alive
-	term.mu.Unlock()
-	if !alive {
-		uiError(w, http.StatusGone, "terminal exited")
-		return
-	}
 	var since *uint64
 	if values, present := r.URL.Query()["since"]; present {
 		if len(values) != 1 {
@@ -107,6 +102,31 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 		}
 		since = &offset
 	}
+	// Reserve before upgrading, including connections whose slow output queue
+	// was evicted but whose socket is still closing. Failed upgrades release it.
+	term.mu.Lock()
+	if !term.alive {
+		term.mu.Unlock()
+		uiError(w, http.StatusGone, "terminal exited")
+		return
+	}
+	if term.attachments >= uiMaxTerminalReaders {
+		term.mu.Unlock()
+		uiError(w, http.StatusTooManyRequests, "terminal connection limit reached")
+		return
+	}
+	term.attachments++
+	term.mu.Unlock()
+	var chunks chan []byte
+	defer func() {
+		term.mu.Lock()
+		term.attachments--
+		if term.readers[chunks] {
+			delete(term.readers, chunks)
+			close(chunks)
+		}
+		term.mu.Unlock()
+	}()
 	// The exact same-origin check above is stricter than Accept's host check.
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 		CompressionMode:      websocket.CompressionNoContextTakeover,
@@ -120,21 +140,18 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	term.mu.Lock()
+	if !term.alive {
+		term.mu.Unlock()
+		return
+	}
 	if term.readers == nil {
 		term.readers = map[chan []byte]bool{}
 	}
-	chunks := make(chan []byte, 64)
+	chunks = make(chan []byte, 64)
 	term.readers[chunks] = true
+	// Subscribe and snapshot atomically, only after a successful upgrade.
 	history, offset, reset := term.replay(since)
 	term.mu.Unlock()
-	defer func() {
-		term.mu.Lock()
-		if term.readers[chunks] {
-			delete(term.readers, chunks)
-			close(chunks)
-		}
-		term.mu.Unlock()
-	}()
 	// Text metadata precedes binary output. An existing renderer can resume
 	// without replaying bytes it already has; a fresh renderer gets history.
 	metadata, _ := json.Marshal(struct {

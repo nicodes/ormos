@@ -4,6 +4,8 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { request, type TerminalRow } from "./api";
 import { shiftTerminalKey } from "./shiftKey";
+import { createTerminalResize } from "./terminalResize";
+import { terminalInputChunks } from "./terminalInput";
 
 export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void };
 export default function TerminalPane(props: {
@@ -87,7 +89,9 @@ export default function TerminalPane(props: {
     container.addEventListener("touchend", touchEnd);
     container.addEventListener("touchcancel", touchEnd);
     const send = (message: object) => {
-      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+      if (socket?.readyState !== WebSocket.OPEN) return false;
+      socket.send(JSON.stringify(message));
+      return true;
     };
     let pasting = false;
     const type = (data: string) => {
@@ -95,12 +99,14 @@ export default function TerminalPane(props: {
         const shifted = shiftTerminalKey(data);
         if (shifted !== undefined) { data = shifted; props.clearShift(); }
       }
-      for (let i = 0; i < data.length; i += 2048) send({ type: "input", data: data.slice(i, i + 2048) });
+      if (data.length <= 2048) send({ type: "input", data });
+      else for (const chunk of terminalInputChunks(data)) send({ type: "input", data: chunk });
     };
-    const resize = () => {
+    const resize = createTerminalResize(() => {
       if (!container.clientWidth || !container.clientHeight) return;
-      fit.fit(); send({ type: "resize", cols: terminal.cols, rows: terminal.rows });
-    };
+      fit.fit();
+      return { cols: terminal.cols, rows: terminal.rows };
+    }, size => send({ type: "resize", ...size }));
     const connect = () => {
       clearTimeout(retry);
       const current = ++generation;
@@ -109,9 +115,9 @@ export default function TerminalPane(props: {
       if (offset !== undefined) url.searchParams.set("since", String(offset));
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(url); socket = ws; ws.binaryType = "arraybuffer";
-      ws.onopen = () => { if (current === generation) { props.onStatus("Connected"); resize(); } };
+      ws.onopen = () => { if (!disposed && current === generation) { props.onStatus("Connected"); resize.reconnect(); } };
       ws.onmessage = event => {
-        if (current !== generation) return;
+        if (disposed || current !== generation) return;
         if (typeof event.data === "string") {
           const message = JSON.parse(event.data);
           if (message.type === "replay") {
@@ -137,14 +143,14 @@ export default function TerminalPane(props: {
       };
     };
     const input = terminal.onData(type);
-    const observer = new ResizeObserver(resize); observer.observe(container);
+    const observer = new ResizeObserver(resize.request); observer.observe(container);
     props.register(props.id, { focus, keyboard, type, paste: data => {
       pasting = true;
       try { terminal.paste(data); } finally { pasting = false; }
     } });
     connect();
     onCleanup(() => {
-      disposed = true; generation++; clearTimeout(retry); observer.disconnect(); socket?.close();
+      disposed = true; generation++; clearTimeout(retry); observer.disconnect(); resize.dispose(); socket?.close();
       container.removeEventListener("touchstart", touchStart);
       container.removeEventListener("touchmove", touchMove);
       container.removeEventListener("touchend", touchEnd);

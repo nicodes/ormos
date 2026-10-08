@@ -215,6 +215,85 @@ func TestUIWebSocketRejectsForeignOrigin(t *testing.T) {
 	}
 }
 
+func TestUITerminalAttachmentLimitAndCleanup(t *testing.T) {
+	fix := newUIFixture(t, nil)
+	term := &uiTerminal{id: "t_limit", alive: true}
+	fix.srv.terms[term.id] = term
+	ts := fix.start(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	endpoint := ts.URL + "/api/terminal/" + term.id + "/ws"
+	readers := func() int { term.mu.Lock(); defer term.mu.Unlock(); return len(term.readers) }
+	attachments := func() int { term.mu.Lock(); defer term.mu.Unlock(); return term.attachments }
+	// Failed upgrades must release their reservations, including repeated ones.
+	for i := 0; i < uiMaxTerminalReaders+1; i++ {
+		req, _ := http.NewRequest(http.MethodGet, endpoint, nil)
+		req.Header.Set("Origin", ts.URL)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode == http.StatusSwitchingProtocols || readers() != 0 || attachments() != 0 {
+			t.Fatal("failed upgrade retained an attachment")
+		}
+	}
+	dial := func() (*websocket.Conn, *http.Response, error) {
+		return websocket.Dial(ctx, "ws"+strings.TrimPrefix(endpoint, "http"), &websocket.DialOptions{HTTPHeader: http.Header{"Origin": []string{ts.URL}}})
+	}
+	var connections []*websocket.Conn
+	defer func() {
+		for _, conn := range connections {
+			conn.CloseNow()
+		}
+	}()
+	for i := 0; i < uiMaxTerminalReaders; i++ {
+		conn, _, err := dial()
+		if err != nil {
+			t.Fatal(err)
+		}
+		connections = append(connections, conn)
+	}
+	conn, res, err := dial()
+	if conn != nil {
+		conn.CloseNow()
+	}
+	if err == nil || res == nil || res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("excess attachment: response=%v error=%v", res, err)
+	}
+	connections[0].CloseNow()
+	for readers() == uiMaxTerminalReaders {
+		select {
+		case <-ctx.Done():
+			t.Fatal("disconnect leaked attachment")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	conn, _, err = dial()
+	if err != nil {
+		t.Fatal("released slot could not reconnect:", err)
+	}
+	connections = append(connections, conn)
+	if readers() != uiMaxTerminalReaders || attachments() != uiMaxTerminalReaders {
+		t.Fatal("unexpected attachment count")
+	}
+}
+
+func TestUITerminalDrainingAttachmentsRemainBounded(t *testing.T) {
+	fix := newUIFixture(t, nil)
+	// A slow writer may still be exiting after its full reader queue is evicted.
+	// Admission must count its attachment until cleanup, not just live queues.
+	term := &uiTerminal{id: "t_draining", alive: true, attachments: uiMaxTerminalReaders}
+	fix.srv.terms[term.id] = term
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/api/terminal/"+term.id+"/ws", nil)
+	req.Header.Set("Origin", "http://localhost")
+	res := httptest.NewRecorder()
+	fix.srv.routes().ServeHTTP(res, req)
+	if res.Code != http.StatusTooManyRequests || term.attachments != uiMaxTerminalReaders || term.history.buf != nil {
+		t.Fatal("draining connections bypassed the limit or allocated replay history")
+	}
+}
+
 func TestUIDirectAppsCannotControlTerminals(t *testing.T) {
 	fix := newUIFixture(t, nil)
 	fix.srv.hosts = []string{"devbox:8481"}
