@@ -495,8 +495,15 @@ func TestShutdownAckAsyncWritersAreCapped(t *testing.T) {
 }
 
 func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testing.T) {
+	for i := 0; i < 32; i++ {
+		t.Run(fmt.Sprint(i), testShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel)
+	}
+}
+
+func testShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testing.T) {
 	withTempConfigDir(t)
 	received := make(chan relay.ActionAck)
+	cancelInvoked := make(chan struct{})
 	tunnelClosed := make(chan struct{})
 	serverErr := make(chan error, 1)
 	header := fencedHeader(relay.StreamHeader{Kind: relay.KindShutdown})
@@ -526,12 +533,18 @@ func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testin
 		}
 		defer stream.Close()
 		if err := relay.WriteHeader(stream, header); err != nil {
-			serverErr <- err
+			serverErr <- fmt.Errorf("shutdown header write: %w", err)
+			return
+		}
+		select {
+		case <-cancelInvoked:
+		case <-time.After(5 * time.Second):
+			serverErr <- errors.New("shutdown was not committed")
 			return
 		}
 		ack, err := relay.ReadActionAck(stream)
 		if err != nil {
-			serverErr <- err
+			serverErr <- fmt.Errorf("shutdown acknowledgment read: %w", err)
 			return
 		}
 		received <- ack
@@ -547,7 +560,6 @@ func TestShutdownAckCrossesWebSocketBeforeRootCancellationClosesTunnel(t *testin
 		PairingToken: "test-pairing-token",
 	})
 	d.resetDone = true
-	cancelInvoked := make(chan struct{})
 	d.setCancel(func() {
 		close(cancelInvoked)
 		cancelRoot()

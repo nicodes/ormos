@@ -1,17 +1,21 @@
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import TerminalPane, { type TerminalControls } from "./TerminalPane";
+import { createSignal, ErrorBoundary, lazy, For, onCleanup, onMount, Show } from "solid-js";
+import type { TerminalControls } from "./TerminalPane";
+import { readStorage, writeStorage } from "./storage";
 import PreviewPane from "./PreviewPane";
 import TerminalQuickControls from "./TerminalQuickControls";
 import TerminalMenu from "./TerminalMenu";
 import { APIError, request, type TerminalRow } from "./api";
 
+const TerminalPane = lazy(() => import("./TerminalPane"));
+const preloadTerminal = () => void TerminalPane.preload().catch(() => { /* handled by the pane boundary */ });
+
 type TerminalTab = { id: string; label: string };
 function savedTerminals(): TerminalTab[] {
   try {
-    const rows = JSON.parse(localStorage.getItem("ormos.terminalTabs") ?? "null");
-    if (Array.isArray(rows) && rows.every(row => typeof row.id === "string" && typeof row.label === "string")) return rows.map(row => ({ ...row, label: row.label.slice(0, 24) }));
+    const rows = JSON.parse(readStorage("ormos.terminalTabs") ?? "null");
+    if (Array.isArray(rows) && rows.every(row => row && typeof row.id === "string" && typeof row.label === "string")) return [...new Map<string, TerminalTab>(rows.map(row => [row.id, { id: row.id, label: row.label.slice(0, 24) }])).values()];
   } catch { /* start with a fresh terminal if stored state is invalid */ }
-  const old = localStorage.getItem("ormos.terminal");
+  const old = readStorage("ormos.terminal");
   return old ? [{ id: old, label: "Terminal 1" }] : [];
 }
 
@@ -25,20 +29,25 @@ export default function App() {
   const [visited, setVisited] = createSignal<Set<string>>(new Set());
   const [error, setError] = createSignal("");
   const [busy, setBusy] = createSignal(true);
-  const [view, setView] = createSignal<"terminal" | "preview">(localStorage.getItem("ormos.view") === "preview" ? "preview" : "terminal");
+  const [view, setView] = createSignal<"terminal" | "preview">(readStorage("ormos.view") === "preview" ? "preview" : "terminal");
   const [headerMount, setHeaderMount] = createSignal<HTMLDivElement>();
   const switchView = () => {
     saveName();
     setShifted(false);
     setView(previous => previous === "terminal" ? "preview" : "terminal");
-    localStorage.setItem("ormos.view", view());
+    if (view() === "terminal") {
+      preloadTerminal();
+      if (active()) setVisited(previous => new Set([...previous, active()]));
+      else void addTerminal();
+    }
+    writeStorage("ormos.view", view());
   };
   const controls = new Map<string, TerminalControls>();
   let nextNumber = 1;
   let disposed = false;
   const persist = () => {
-    localStorage.setItem("ormos.terminalTabs", JSON.stringify(tabs()));
-    localStorage.setItem("ormos.activeTerminal", active());
+    writeStorage("ormos.terminalTabs", JSON.stringify(tabs()));
+    writeStorage("ormos.activeTerminal", active());
   };
   const rename = (tab: TerminalTab) => {
     setDraftName(tab.label); setEditing(tab.id);
@@ -49,7 +58,7 @@ export default function App() {
     if (label) setTabs(rows => rows.map(tab => tab.id === id ? { ...tab, label } : tab));
     persist();
   };
-  const select = (id: string) => { saveName(); setShifted(false); setVisited(previous => new Set([...previous, id])); setActive(id); persist(); };
+  const select = (id: string) => { saveName(); setShifted(false); if (view() === "terminal" && id) setVisited(previous => new Set([...previous, id])); setActive(id); persist(); };
   const addTerminal = async () => {
     if (busy()) return;
     setBusy(true); setError("");
@@ -82,6 +91,9 @@ export default function App() {
     if (id === active() && status !== "Connected") setShifted(false);
   };
   onMount(() => {
+    // Start terminal code and session discovery together; preview-only loads
+    // defer both rendering and this download until the view is requested.
+    if (view() === "terminal") preloadTerminal();
     const viewport = window.visualViewport;
     const updateHeight = () => document.documentElement.style.setProperty("--viewport-height", `${viewport?.height ?? window.innerHeight}px`);
     viewport?.addEventListener("resize", updateHeight); updateHeight();
@@ -93,11 +105,11 @@ export default function App() {
         nextNumber = Math.max(0, ...saved.map(tab => Number(/\d+$/.exec(tab.label)?.[0] ?? 0))) + 1;
         const retained = saved.filter(tab => terminals.terminals.some(row => row.id === tab.id && row.alive));
         setTabs(retained);
-        const previous = localStorage.getItem("ormos.activeTerminal");
+        const previous = readStorage("ormos.activeTerminal");
         setActive(retained.find(tab => tab.id === previous)?.id ?? retained[0]?.id ?? "");
-        setVisited(new Set(active() ? [active()] : []));
+        setVisited(new Set(view() === "terminal" && active() ? [active()] : []));
         setBusy(false);
-        if (!retained.length) await addTerminal(); else persist();
+        if (!retained.length && view() === "terminal") await addTerminal(); else persist();
       } catch (e) { if (!disposed) { setError(String(e)); setBusy(false); } }
     })();
     onCleanup(() => { disposed = true; viewport?.removeEventListener("resize", updateHeight); });
@@ -147,7 +159,9 @@ export default function App() {
           <div class="terminal-stack">
             <For each={tabs().map(tab => tab.id)}>{id => <div class="terminal-session" hidden={active() !== id}>
               <Show when={visited().has(id)}>
+                <ErrorBoundary fallback={<div class="empty-message" style={{ height: "100%" }} role="alert"><strong>Terminal unavailable</strong><p>Refresh the page to load the current terminal UI.</p></div>}>
                 <TerminalPane id={id} shifted={() => active() === id && shifted()} clearShift={() => setShifted(false)} onStatus={status => setStatus(id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
+                </ErrorBoundary>
               </Show>
             </div>}</For>
           </div>
