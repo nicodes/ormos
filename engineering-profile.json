@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "profile": "go-cli",
+  "commands": {
+    "install": [
+      "make",
+      "install"
+    ],
+    "lint": [
+      "make",
+      "lint"
+    ],
+    "test": [
+      "make",
+      "test"
+    ],
+    "build": [
+      "make",
+      "build"
+    ],
+    "check": [
+      "make",
+      "check"
+    ],
+    "clean": [
+      "make",
+      "clean"
+    ],
+    "dev": {
+      "unsupported": "Interactive terminal agent requires caller-selected configuration and session ownership; no automatic development service is provided."
+    },
+    "stop": {
+      "unsupported": "Interactive terminal agent requires caller-selected configuration and session ownership; no automatic development service is provided."
+    }
+  }
+}
