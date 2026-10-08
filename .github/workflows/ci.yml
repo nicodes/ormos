@@ -56,18 +56,7 @@ jobs:
       # the committed bytes stopped being what ui/ produces.
       - name: The committed web export matches its source
         shell: bash
-        run: |
-          set -euo pipefail
-          cd ui
-          npm ci
-          npm run typecheck
-          npm test
-          npm run build
-          cd ..
-          if ! git diff --exit-code --stat internal/ui/dist; then
-            echo "::error::internal/ui/dist is not what ui/ produces. Run npm ci && npm run build inside ui/ and commit the result."
-            exit 1
-          fi
+        run: make web-check
 
       # Built first: a compile error should fail before a test suite spends
       # minutes reaching the same conclusion more slowly. Same order as
@@ -79,11 +68,7 @@ jobs:
 
       - name: Preview browser regression
         shell: bash
-        run: |
-          set -euo pipefail
-          cd ui
-          npx playwright install --with-deps chromium
-          ORMOS_TEST_BINARY="$GITHUB_WORKSPACE/dist/ormos_Linux_x86_64/ormos" npm run test:browser
+        run: make browser-check
 
       - name: Test
         uses: ./.github/actions/test
@@ -101,43 +86,7 @@ jobs:
       # So the assertions are about what is SELECTED, not what compiles.
       - name: The agent builds for Linux and macOS, and nothing else
         shell: bash
-        run: |
-          set -euo pipefail
-
-          # relay is imported by the hosted backend and must stay portable.
-          # This is the one thing here that is proven by compiling.
-          GOOS=windows go build ./relay/...
-
-          # Each target names its arch explicitly: several of these have no
-          # valid default, and `GOOS=x ${var} go list` does not work — bash
-          # recognises assignment prefixes before expansion, so the expanded
-          # word is run as a command. env takes them as arguments instead.
-          #
-          # android and ios are on this list because they are the two a plain
-          # `linux || darwin` tag SILENTLY INCLUDES: Go sets the linux tag on
-          # android and the darwin tag on ios, so the agent selected and built
-          # there — on kernels with a different security model, different PTY
-          # behaviour, and no CI at all. The tags say `(linux && !android) ||
-          # (darwin && !ios)` for that reason, and this is what holds them to it.
-          for target in \
-            windows/amd64 freebsd/amd64 openbsd/amd64 netbsd/amd64 \
-            solaris/amd64 dragonfly/amd64 illumos/amd64 aix/ppc64 \
-            plan9/amd64 js/wasm wasip1/wasm android/arm64 ios/arm64; do
-            goos="${target%/*}"
-            goarch="${target#*/}"
-            got="$(env GOOS="$goos" GOARCH="$goarch" go list ./... 2>/dev/null || true)"
-            if [ "$got" != "github.com/nicodes/ormos/relay" ]; then
-              echo "::error::$target selects more than relay -- something in the agent is buildable on a platform nothing tests:"
-              echo "$got"
-              exit 1
-            fi
-          done
-
-          # Both supported platforms still build, so this can never pass by
-          # excluding everything.
-          GOOS=linux go build ./...
-          GOOS=darwin go build ./...
-          echo "linux and darwin build; every other platform selects relay alone"
+        run: make platform-check
 
   # macOS is half of what ormos claims to support, and until this job existed
   # nothing verified it. The Build step above cross-compiles for darwin, but
