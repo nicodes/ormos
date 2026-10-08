@@ -5,12 +5,12 @@ import "@xterm/xterm/css/xterm.css";
 import { request, type TerminalRow } from "./api";
 import { shiftTerminalKey } from "./shiftKey";
 import { createTerminalResize } from "./terminalResize";
-import { terminalInputChunks } from "./terminalInput";
+import { createTerminalInput } from "./terminalInput";
 import { createTerminalOutput } from "./terminalOutput";
 
 export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void };
 export default function TerminalPane(props: {
-  id: string; onStatus: (status: string) => void;
+  id: string; onError: (message: string) => void; onStatus: (status: string) => void;
   register: (id: string, controls?: TerminalControls) => void;
   shifted: () => boolean; clearShift: () => void;
 }) {
@@ -20,6 +20,7 @@ export default function TerminalPane(props: {
     let generation = 0;
     let retry: ReturnType<typeof setTimeout> | undefined;
     let socket: WebSocket | undefined;
+    let discovery: AbortController | undefined;
     const terminal = new Terminal({
       cursorBlink: true, cursorStyle: "bar", fontSize: 14, scrollback: 5000,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
@@ -94,14 +95,14 @@ export default function TerminalPane(props: {
       socket.send(JSON.stringify(message));
       return true;
     };
+    const transportInput = createTerminalInput(() => socket?.readyState === WebSocket.OPEN ? socket : undefined, props.onError);
     let pasting = false;
     const type = (data: string) => {
       if (!pasting && props.shifted()) {
         const shifted = shiftTerminalKey(data);
         if (shifted !== undefined) { data = shifted; props.clearShift(); }
       }
-      if (data.length <= 2048) send({ type: "input", data });
-      else for (const chunk of terminalInputChunks(data)) send({ type: "input", data: chunk });
+      transportInput.send(data);
     };
     const resize = createTerminalResize(() => {
       if (!container.clientWidth || !container.clientHeight) return;
@@ -114,21 +115,27 @@ export default function TerminalPane(props: {
       socket?.close(); props.onStatus("Connecting");
       const url = new URL(`/api/terminal/${props.id}/ws`, location.href);
       url.searchParams.set("flow", "1");
+      url.searchParams.set("input", "1");
       const offset = output.offset();
       if (offset !== undefined) url.searchParams.set("since", String(offset));
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(url); socket = ws; ws.binaryType = "arraybuffer";
-      ws.onopen = () => { if (!disposed && current === generation) { props.onStatus("Connected"); resize.reconnect(); } };
+      ws.onopen = () => { if (!disposed && current === generation) { resize.reconnect(); } };
+      let replayStarted = false;
       ws.onmessage = event => {
         if (disposed || current !== generation) return;
         try {
           if (typeof event.data === "string") {
             const message = JSON.parse(event.data);
             if (message.type === "replay") {
+              if (replayStarted) throw new Error("Duplicate terminal replay");
+              replayStarted = true;
               output.begin(message, bytes => {
                 if (!disposed && current === generation && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ack", bytes }));
               });
-            }
+              transportInput.begin(message.inputWindow);
+              props.onStatus("Connected");
+            } else if (message.type === "input-ack") transportInput.ack(message.bytes);
           } else if (event.data instanceof ArrayBuffer) {
             output.receive(new Uint8Array(event.data));
           }
@@ -138,14 +145,17 @@ export default function TerminalPane(props: {
       };
       ws.onclose = () => {
         if (disposed || current !== generation) return;
+        transportInput.disconnect();
         props.onStatus("Disconnected");
         retry = setTimeout(async () => {
+          const controller = new AbortController(); discovery = controller;
           try {
-            const rows = (await request<{ terminals: TerminalRow[] }>("/api/terminals")).terminals;
+            const rows = (await request<{ terminals: TerminalRow[] }>("/api/terminals", undefined, controller.signal)).terminals;
             if (disposed || current !== generation) return;
             if (rows.some(row => row.id === props.id && row.alive)) connect();
             else props.onStatus("Exited");
           } catch { if (!disposed && current === generation) connect(); }
+          finally { if (discovery === controller) discovery = undefined; }
         }, 1500);
       };
     };
@@ -157,7 +167,7 @@ export default function TerminalPane(props: {
     } });
     connect();
     onCleanup(() => {
-      disposed = true; generation++; clearTimeout(retry); observer.disconnect(); resize.dispose(); output.dispose(); socket?.close();
+      disposed = true; generation++; clearTimeout(retry); discovery?.abort(); observer.disconnect(); resize.dispose(); output.dispose(); transportInput.dispose(); socket?.close();
       container.removeEventListener("touchstart", touchStart);
       container.removeEventListener("touchmove", touchMove);
       container.removeEventListener("touchend", touchEnd);

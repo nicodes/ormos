@@ -75,7 +75,7 @@ type uiTerminal struct {
 	end         uint64
 	kill        func()
 	done        chan struct{}
-	input       func([]byte) error
+	input       func(context.Context, []byte) error
 	resize      func(uint16, uint16) error
 	readers     map[chan []byte]bool
 	updates     map[chan struct{}]bool

@@ -48,7 +48,7 @@ func spawnUITerminal(shell, cwd string) (*uiTerminal, error) {
 	t := &uiTerminal{
 		id: id, shell: shell, cwd: cwd, started: time.Now(), alive: true,
 		done: make(chan struct{}), readers: map[chan []byte]bool{},
-		input: func(data []byte) error { _, err := ptmx.Write(data); return err },
+		input: newUITerminalInput(ptmx),
 		resize: func(cols, rows uint16) error {
 			deviceMu.Lock()
 			defer deviceMu.Unlock()

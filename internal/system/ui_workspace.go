@@ -107,6 +107,14 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 	var since *uint64
 	var flow *uiOutputFlow
+	inputCredits := false
+	if values, present := r.URL.Query()["input"]; present {
+		if len(values) != 1 || values[0] != "1" {
+			uiError(w, http.StatusBadRequest, "invalid terminal input control")
+			return
+		}
+		inputCredits = true
+	}
 	if values, present := r.URL.Query()["flow"]; present {
 		if len(values) != 1 || values[0] != "1" {
 			uiError(w, http.StatusBadRequest, "invalid terminal flow control")
@@ -214,12 +222,17 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 	if flow != nil {
 		window = uiOutputWindow
 	}
+	inputWindow := 0
+	if inputCredits {
+		inputWindow = uiInputWindow
+	}
 	metadata, _ := json.Marshal(struct {
-		Type   string `json:"type"`
-		Offset uint64 `json:"offset"`
-		Reset  bool   `json:"reset"`
-		Window int    `json:"window,omitempty"`
-	}{"replay", offset, reset, window})
+		Type        string `json:"type"`
+		Offset      uint64 `json:"offset"`
+		Reset       bool   `json:"reset"`
+		Window      int    `json:"window,omitempty"`
+		InputWindow int    `json:"inputWindow,omitempty"`
+	}{"replay", offset, reset, window, inputWindow})
 	metaCtx, metaCancel := context.WithTimeout(ctx, 10*time.Second)
 	err = conn.Write(metaCtx, websocket.MessageText, metadata)
 	metaCancel()
@@ -255,6 +268,19 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
+	input := newUIInputQueue(ctx, term.input, func(bytes int) error {
+		if !inputCredits {
+			return nil
+		}
+		data, _ := json.Marshal(struct {
+			Type  string `json:"type"`
+			Bytes int    `json:"bytes"`
+		}{"input-ack", bytes})
+		ackCtx, ackCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer ackCancel()
+		return conn.Write(ackCtx, websocket.MessageText, data)
+	}, func() { _ = conn.Close(websocket.StatusPolicyViolation, "terminal input stalled"); cancel() })
+	defer func() { cancel(); <-input.done }()
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
@@ -278,7 +304,8 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case "input":
-			if term.input == nil || term.input([]byte(msg.Data)) != nil {
+			if !input.push([]byte(msg.Data)) {
+				_ = conn.Close(websocket.StatusPolicyViolation, "terminal input limit reached")
 				return
 			}
 		case "resize":
