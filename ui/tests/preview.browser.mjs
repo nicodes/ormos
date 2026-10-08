@@ -93,14 +93,33 @@ finally:
           const Native = window.WebSocket;
           window.testTerminalSockets = [];
           window.testTerminalMessages = [];
+          window.testHoldAcks = false;
+          window.testHeldAcks = [];
           window.testResizeCallbacks = [];
           window.WebSocket = class extends Native {
             constructor(...args) {
               super(...args);
-              if (String(args[0]).includes('/api/terminal/')) window.testTerminalSockets.push(this);
+              if (String(args[0]).includes('/api/terminal/')) {
+                window.testTerminalSockets.push(this);
+                this.testPending = 0; this.testMaximum = 0; this.testWindow = 0;
+                this.addEventListener('message', event => {
+                  if (typeof event.data === 'string') this.testWindow = JSON.parse(event.data).window || 0;
+                  else {
+                    this.testPending += event.data.byteLength;
+                    this.testMaximum = Math.max(this.testMaximum, this.testPending);
+                  }
+                });
+              }
             }
             send(data) {
-              if (this.url.includes('/api/terminal/') && typeof data === 'string') window.testTerminalMessages.push(JSON.parse(data));
+              if (this.url.includes('/api/terminal/') && typeof data === 'string') {
+                const message = JSON.parse(data);
+                window.testTerminalMessages.push(message);
+                if (message.type === 'ack') {
+                  if (window.testHoldAcks) { window.testHeldAcks.push([this, data]); return; }
+                  this.testPending -= message.bytes;
+                }
+              }
               super.send(data);
             }
           };
@@ -394,6 +413,32 @@ finally:
         await page.waitForFunction(() => document.querySelector('input[aria-label="Terminal tab name"]')?.value === 'Terminal 2' && document.querySelector('.tab.selected .status-dot.online'));
         assert.equal(await page.getByRole('textbox', { name: 'Terminal tab name' }).inputValue(), 'Terminal 2');
         assert.equal(await page.locator('.xterm').count(), 1);
+        // Suspend only output acknowledgements. The PTY must finish a burst
+        // and accept input while this browser's parsed-output window is full.
+        await openKeyboard();
+        await page.evaluate(() => { window.testHoldAcks = true; });
+        await page.keyboard.type(`python3 -c "import sys; sys.stdout.write('x'*1048576+'\\r\\nFLOW_'+'DONE\\r\\n'); sys.stdout.flush()"`);
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(() => window.testTerminalSockets.at(-1).testPending === 262144);
+        await page.keyboard.type("printf 'INPUT_%s\\n' OK");
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(async () => {
+          const id = JSON.parse(localStorage.getItem('ormos.terminalTabs')).at(-1).id;
+          const response = await fetch(`/api/terminal/${id}/output`);
+          const data = await response.json();
+          return data.output.includes('FLOW_DONE') && data.output.includes('INPUT_OK');
+        });
+        assert.equal(await page.evaluate(() => window.testTerminalSockets.at(-1).testPending), 262144,
+          'Server must stop output at the parser window while input remains live');
+        await page.evaluate(() => {
+          window.testHoldAcks = false;
+          for (const [socket, data] of window.testHeldAcks.splice(0)) socket.send(data);
+        });
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('INPUT_OK'));
+        const windows = await page.evaluate(() => window.testTerminalSockets.filter(socket => socket.testWindow).map(socket => [socket.testMaximum, socket.testWindow]));
+        assert(windows.length > 0);
+        assert(windows.every(([maximum, window]) => maximum <= window), 'Browser backlog must remain bounded');
+        assert.equal(errors.length, 0, errors.map(String).join('\n'));
         // These IDs come only from this browser context's newly created tabs.
         await page.evaluate(async () => {
           for (const terminal of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) {

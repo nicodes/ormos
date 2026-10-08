@@ -77,6 +77,9 @@ type uiTerminal struct {
 	input       func([]byte) error
 	resize      func(uint16, uint16) error
 	readers     map[chan []byte]bool
+	updates     map[chan struct{}]bool
+	chunkStart  uint64
+	chunk       []byte // immutable recent delivery, at most uiOutputChunk bytes
 	attachments int
 }
 
@@ -106,6 +109,12 @@ func (t *uiTerminal) append(p []byte) {
 		default:
 			close(reader)
 			delete(t.readers, reader)
+		}
+	}
+	for update := range t.updates {
+		select {
+		case update <- struct{}{}:
+		default:
 		}
 	}
 }
@@ -580,6 +589,10 @@ func spawnUITerminal(shell, cwd string) (*uiTerminal, error) {
 		for reader := range t.readers {
 			close(reader)
 			delete(t.readers, reader)
+		}
+		for update := range t.updates {
+			close(update)
+			delete(t.updates, update)
 		}
 		t.mu.Unlock()
 		_ = ptmx.Close()
