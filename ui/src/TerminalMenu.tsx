@@ -78,10 +78,10 @@ export default function TerminalMenu(props: { enabled: boolean; focus: () => voi
           <div class="terminal-menu-keys"><For each={terminalKeys}>{key => <button disabled={!props.enabled} aria-label={key.name} onPointerDown={e => e.preventDefault()} onClick={() => props.type(key.data)}><TerminalKeyIcon label={key.label} icon={"icon" in key ? key.icon : undefined} /></button>}</For></div>
         </div>
         <div id="saved-command-panel" role="tabpanel" aria-labelledby="saved-command-tab" hidden={tab() !== "saved"}>
-          <SavedItems visible={tab() === "saved"} registerEditor={setCommandEditor} createRequest={createCommand()} kind="command" enabled={props.enabled} use={command => { props.type(`${command}\r`); setOpen(false); }} />
+          <Show when={tab() === "saved"}><SavedItems visible={true} registerEditor={setCommandEditor} createRequest={createCommand()} kind="command" enabled={props.enabled} use={command => { props.type(`${command}\r`); setOpen(false); }} /></Show>
         </div>
         <div id="saved-prompt-panel" role="tabpanel" aria-labelledby="saved-prompt-tab" hidden={tab() !== "prompts"}>
-          <SavedItems visible={tab() === "prompts"} registerEditor={setPromptEditor} createRequest={createPrompt()} kind="prompt" enabled={props.enabled} use={prompt => { props.paste(prompt); setOpen(false); props.focus(); }} />
+          <Show when={tab() === "prompts"}><SavedItems visible={true} registerEditor={setPromptEditor} createRequest={createPrompt()} kind="prompt" enabled={props.enabled} use={prompt => { props.paste(prompt); setOpen(false); props.focus(); }} /></Show>
         </div>
       </div>
     </Portal></Show>

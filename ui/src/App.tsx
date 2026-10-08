@@ -94,12 +94,13 @@ export default function App() {
     // Start terminal code and session discovery together; preview-only loads
     // defer both rendering and this download until the view is requested.
     if (view() === "terminal") preloadTerminal();
+    const discovery = new AbortController();
     const viewport = window.visualViewport;
     const updateHeight = () => document.documentElement.style.setProperty("--viewport-height", `${viewport?.height ?? window.innerHeight}px`);
     viewport?.addEventListener("resize", updateHeight); updateHeight();
     void (async () => {
       try {
-        const terminals = await request<{ terminals: TerminalRow[] }>("/api/terminals");
+        const terminals = await request<{ terminals: TerminalRow[] }>("/api/terminals", undefined, discovery.signal);
         if (disposed) return;
         const saved = savedTerminals();
         nextNumber = Math.max(0, ...saved.map(tab => Number(/\d+$/.exec(tab.label)?.[0] ?? 0))) + 1;
@@ -112,7 +113,7 @@ export default function App() {
         if (!retained.length && view() === "terminal") await addTerminal(); else persist();
       } catch (e) { if (!disposed) { setError(String(e)); setBusy(false); } }
     })();
-    onCleanup(() => { disposed = true; viewport?.removeEventListener("resize", updateHeight); });
+    onCleanup(() => { disposed = true; discovery.abort(); viewport?.removeEventListener("resize", updateHeight); });
   });
   return (
     <main class="app">
@@ -160,7 +161,7 @@ export default function App() {
             <For each={tabs().map(tab => tab.id)}>{id => <div class="terminal-session" hidden={active() !== id}>
               <Show when={visited().has(id)}>
                 <ErrorBoundary fallback={<div class="empty-message" style={{ height: "100%" }} role="alert"><strong>Terminal unavailable</strong><p>Refresh the page to load the current terminal UI.</p></div>}>
-                <TerminalPane id={id} shifted={() => active() === id && shifted()} clearShift={() => setShifted(false)} onStatus={status => setStatus(id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
+                <TerminalPane id={id} onError={setError} shifted={() => active() === id && shifted()} clearShift={() => setShifted(false)} onStatus={status => setStatus(id, status)} register={(id, value) => value ? controls.set(id, value) : controls.delete(id)} />
                 </ErrorBoundary>
               </Show>
             </div>}</For>
