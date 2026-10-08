@@ -5,3 +5,6 @@
 
 # Installer regression fixtures are Python scripts.
 __pycache__/
+
+/dist/
+/.artifacts/
