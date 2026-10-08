@@ -90,6 +90,14 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var since *uint64
+	var flow *uiOutputFlow
+	if values, present := r.URL.Query()["flow"]; present {
+		if len(values) != 1 || values[0] != "1" {
+			uiError(w, http.StatusBadRequest, "invalid terminal flow control")
+			return
+		}
+		flow = newUIOutputFlow()
+	}
 	if values, present := r.URL.Query()["since"]; present {
 		if len(values) != 1 {
 			uiError(w, http.StatusBadRequest, "invalid terminal offset")
@@ -118,12 +126,17 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 	term.attachments++
 	term.mu.Unlock()
 	var chunks chan []byte
+	var updates chan struct{}
 	defer func() {
 		term.mu.Lock()
 		term.attachments--
 		if term.readers[chunks] {
 			delete(term.readers, chunks)
 			close(chunks)
+		}
+		if term.updates[updates] {
+			delete(term.updates, updates)
+			close(updates)
 		}
 		term.mu.Unlock()
 	}()
@@ -144,21 +157,36 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 		term.mu.Unlock()
 		return
 	}
-	if term.readers == nil {
-		term.readers = map[chan []byte]bool{}
-	}
-	chunks = make(chan []byte, 64)
-	term.readers[chunks] = true
 	// Subscribe and snapshot atomically, only after a successful upgrade.
-	history, offset, reset := term.replay(since)
+	var history []byte
+	offset, reset := term.replayStart(since)
+	if flow != nil {
+		if term.updates == nil {
+			term.updates = map[chan struct{}]bool{}
+		}
+		updates = make(chan struct{}, 1)
+		term.updates[updates] = true
+	} else {
+		if term.readers == nil {
+			term.readers = map[chan []byte]bool{}
+		}
+		chunks = make(chan []byte, 64)
+		term.readers[chunks] = true
+		history, _, _ = term.replay(since)
+	}
 	term.mu.Unlock()
 	// Text metadata precedes binary output. An existing renderer can resume
 	// without replaying bytes it already has; a fresh renderer gets history.
+	window := 0
+	if flow != nil {
+		window = uiOutputWindow
+	}
 	metadata, _ := json.Marshal(struct {
 		Type   string `json:"type"`
 		Offset uint64 `json:"offset"`
 		Reset  bool   `json:"reset"`
-	}{"replay", offset, reset})
+		Window int    `json:"window,omitempty"`
+	}{"replay", offset, reset, window})
 	metaCtx, metaCancel := context.WithTimeout(ctx, 10*time.Second)
 	err = conn.Write(metaCtx, websocket.MessageText, metadata)
 	metaCancel()
@@ -167,6 +195,10 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() {
 		defer cancel()
+		if flow != nil {
+			term.streamOutput(ctx, conn, flow, updates, offset)
+			return
+		}
 		// Start reading input/resizes immediately while history is streamed.
 		// Bounded messages let the browser parse/paint before the whole tail arrives.
 		for len(history) > 0 {
@@ -196,16 +228,22 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var msg struct {
-			Type string `json:"type"`
-			Data string `json:"data"`
-			Cols uint16 `json:"cols"`
-			Rows uint16 `json:"rows"`
+			Type  string `json:"type"`
+			Data  string `json:"data"`
+			Cols  uint16 `json:"cols"`
+			Rows  uint16 `json:"rows"`
+			Bytes int    `json:"bytes"`
 		}
 		if err := json.Unmarshal(data, &msg); err != nil {
 			conn.Close(websocket.StatusPolicyViolation, "invalid terminal message")
 			return
 		}
 		switch msg.Type {
+		case "ack":
+			if flow == nil || !flow.ack(msg.Bytes) {
+				conn.Close(websocket.StatusPolicyViolation, "invalid terminal acknowledgement")
+				return
+			}
 		case "input":
 			if term.input == nil || term.input([]byte(msg.Data)) != nil {
 				return
@@ -234,19 +272,48 @@ func writeTerminalChunk(ctx context.Context, conn *websocket.Conn, chunk []byte)
 // replay is called under term.mu together with subscribing to live output,
 // so bytes cannot be skipped or delivered twice at the replay/live boundary.
 func (t *uiTerminal) replay(since *uint64) ([]byte, uint64, bool) {
+	start, reset := t.replayStart(since)
+	return t.copyOutput(start, int(t.end-start)), start, reset
+}
+
+func (t *uiTerminal) replayStart(since *uint64) (uint64, bool) {
 	start := t.end - uint64(t.history.size)
 	reset := since == nil || *since < start || *since > t.end
 	if !reset {
 		start = *since
 	}
-	count := int(t.end - start)
+	return start, reset
+}
+
+// Called under term.mu. A cursor outside the ring must reconnect/reset; never
+// silently combine a missing ANSI/UTF-8 prefix with the current parser state.
+func (t *uiTerminal) replayChunk(cursor uint64, limit int) ([]byte, bool) {
+	if cursor < t.end-uint64(t.history.size) || cursor > t.end {
+		return nil, false
+	}
+	// Share the most recent immutable delivery between readers at the same
+	// position, including partial credits. Lagging readers still use the ring.
+	if cursor >= t.chunkStart && cursor-t.chunkStart < uint64(len(t.chunk)) {
+		i := int(cursor - t.chunkStart)
+		return t.chunk[i : i+min(limit, len(t.chunk)-i)], true
+	}
+	count := min(int(t.end-cursor), limit, uiOutputChunk)
 	if count == 0 {
-		return nil, start, reset
+		return nil, true
+	}
+	t.chunkStart = cursor
+	t.chunk = t.copyOutput(cursor, count)
+	return t.chunk, true
+}
+
+func (t *uiTerminal) copyOutput(start uint64, count int) []byte {
+	if count == 0 {
+		return nil
 	}
 	// Copy only the requested suffix, without copying the whole retained ring.
-	i := (t.history.start + t.history.size - count) % len(t.history.buf)
+	i := (t.history.start + t.history.size - int(t.end-start)) % len(t.history.buf)
 	out := make([]byte, count)
 	n := copy(out, t.history.buf[i:min(i+count, len(t.history.buf))])
 	copy(out[n:], t.history.buf[:count-n])
-	return out, start, reset
+	return out
 }
