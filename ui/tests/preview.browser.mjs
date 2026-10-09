@@ -549,7 +549,7 @@ print('PAINT_FINISHED', flush=True)
         await page.waitForFunction(previous => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]) > previous, previous, { timeout: 3000 });
         const quick = page.getByRole('toolbar', { name: 'Quick terminal controls' });
         assert.equal(await quick.getByRole('button').count(), 8);
-        const lastControl = await quick.getByRole('button', { name: 'Ctrl C', exact: true }).boundingBox();
+        const lastControl = await quick.getByRole('button', { name: 'More terminal keys', exact: true }).boundingBox();
         assert(lastControl.x + lastControl.width <= (touch ? 390 : 1440), 'Toolbar must fit the viewport');
         // Inspect actual WebSocket input while the fixture has a raw PTY,
         // so Ctrl+C and Esc test their bytes without terminating a shell.
@@ -559,10 +559,26 @@ print('PAINT_FINISHED', flush=True)
           const send = socket.send.bind(socket);
           socket.send = data => { const message = JSON.parse(data); if (message.type === 'input') window.testKeyInput.push(message.data); send(data); };
         });
-        for (const name of ['Tab', 'Escape', 'Up arrow', 'Down arrow', 'Enter', 'Ctrl C']) {
-          await pressControl(quick.getByRole('button', { name, exact: true }));
-        }
-        assert.deepEqual(await page.evaluate(() => window.testKeyInput), ['\t', '\x1b', '\x1b[A', '\x1b[B', '\r', '\x03']);
+        const collapsed = await quick.boundingBox();
+        assert.equal(await quick.getByRole('button', { name: 'Tab', exact: true }).count(), 0);
+        await pressControl(quick.getByRole('button', { name: 'More terminal keys', exact: true }));
+        assert.equal(await quick.getByRole('button', { name: 'Fewer terminal keys', exact: true }).getAttribute('aria-expanded'), 'true');
+        const expanded = await quick.boundingBox();
+        const extras = await page.locator('#extra-terminal-keys').boundingBox();
+        const base = await page.locator('.quick-key-bar').boundingBox();
+        assert(expanded.height > collapsed.height && expanded.y < collapsed.y, 'More keys must expand upward');
+        assert(extras.y + extras.height <= base.y, 'Extra keys must appear above the compact row');
+        assert.deepEqual(await page.evaluate(() => window.testKeyInput), [], 'Expanding must not send terminal input');
+        await page.screenshot({ path: path.join(artifacts, `expanded-keys-${touch ? 'phone' : 'desktop'}.png`) });
+        const keys = [
+          ['Tab', '\t'], ['Escape', '\x1b'], ['Left arrow', '\x1b[D'], ['Up arrow', '\x1b[A'],
+          ['Down arrow', '\x1b[B'], ['Right arrow', '\x1b[C'], ['Enter', '\r'], ['Ctrl C', '\x03'],
+          ['Home', '\x1b[H'], ['End', '\x1b[F'], ['Page up', '\x1b[5~'], ['Page down', '\x1b[6~'],
+          ['Backspace', '\x7f'], ['Delete', '\x1b[3~'], ['Clear screen (Ctrl L)', '\x0c'],
+          ['Clear line (Ctrl U)', '\x15'], ['Delete word (Ctrl W)', '\x17'], ['Ctrl D', '\x04'],
+        ];
+        for (const [name] of keys) await pressControl(quick.getByRole('button', { name, exact: true }));
+        assert.deepEqual(await page.evaluate(() => window.testKeyInput), keys.map(([, bytes]) => bytes));
         if (touch) {
           assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'none');
           assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), true);
@@ -583,6 +599,9 @@ print('PAINT_FINISHED', flush=True)
         await pressControl(shift);
         await page.keyboard.type('s');
         assert.deepEqual(await page.evaluate(() => window.testKeyInput), ['S', 's', '\x1b[Z', 's']);
+        await pressControl(quick.getByRole('button', { name: 'Fewer terminal keys', exact: true }));
+        assert.equal(await quick.getByRole('button').count(), 8);
+        assert.equal(await quick.getByRole('button', { name: 'More terminal keys', exact: true }).getAttribute('aria-expanded'), 'false');
         assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'text');
         assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), false);
         assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);

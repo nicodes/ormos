@@ -8,4 +8,13 @@ export const terminalKeys = [
   { id: "down", label: "↓", data: "\x1b[B", name: "Down arrow", icon: "m6 12 6 6 6-6M12 6v12" },
   { id: "left", label: "←", data: "\x1b[D", name: "Left arrow", icon: "m12 6-6 6 6 6M6 12h12" },
   { id: "right", label: "→", data: "\x1b[C", name: "Right arrow", icon: "m12 6 6 6-6 6M6 12h12" },
+  { id: "home", label: "Home", data: "\x1b[H", name: "Home", icon: "M5 4v16m14-8H9m4-4-4 4 4 4" },
+  { id: "end", label: "End", data: "\x1b[F", name: "End", icon: "M19 4v16M5 12h10m-4-4 4 4-4 4" },
+  { id: "page-up", label: "PgUp", data: "\x1b[5~", name: "Page up", icon: "m6 11 6-6 6 6m-12 7 6-6 6 6" },
+  { id: "page-down", label: "PgDn", data: "\x1b[6~", name: "Page down", icon: "m6 6 6 6 6-6m-12 7 6 6 6-6" },
+  { id: "backspace", label: "Backspace", data: "\x7f", name: "Backspace", icon: "M9 5h12v14H9l-7-7 7-7Zm4 4 6 6m0-6-6 6" },
+  { id: "delete", label: "Del", data: "\x1b[3~", name: "Delete" },
+  { id: "clear", label: "Ctrl+L", data: "\x0c", name: "Clear screen (Ctrl L)" },
+  { id: "clear-line", label: "Ctrl+U", data: "\x15", name: "Clear line (Ctrl U)" },
+  { id: "delete-word", label: "Ctrl+W", data: "\x17", name: "Delete word (Ctrl W)" },
 ] as const;
