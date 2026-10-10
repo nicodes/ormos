@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 212bd578d3e57e99d35dfa18fc2b2621263884137b1236e7f49fb1653d671246 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 028afd1789d682a4c18d620409ecb81da2a630e1381b1eb26ff61e53af96749d -->
 
 # Ormos
 
@@ -69,7 +69,7 @@ There is no application login: anyone permitted to reach the UI can control its 
 
 Tailscale must be installed and connected on the machine, and the user running Ormos must have permission to manage Serve. This permission is configured once for that operating-system user; Ormos does not elevate privileges. Existing routes are preserved, and public Funnel routes are never created. Only routes Ormos creates are owned by its foreground CLI sessions; those routes end when Ormos shuts down normally. Apps keep running independently, and existing Serve routes remain configured. At most 32 temporary app routes are retained per Ormos process.
 
-Ormos forwards app requests only to a fixed localhost destination per preview. It does not inject scripts or select ports through a cookie. Each window's iframe connects independently. App access is governed by its listener configuration, Tailscale rules and the app itself; Local `policy.json` port rules control preview forwarding and automatic exposure and deny sensitive ports by default; unreadable policy fails closed, and existing previews recheck policy on every request. These rules do not restrict an app's preexisting direct network access. Terminals belong to the running Ormos process and end when it stops. `ormos relay` and `ormos --config PATH` remain for legacy compatibility; the former hosted backend is deprecated.
+Ormos forwards app requests only to a fixed localhost destination per preview. It does not inject scripts or select ports through a cookie. Each window's iframe connects independently. App access is governed by its listener configuration, Tailscale rules and the app itself; Local `policy.json` port rules control preview forwarding and automatic exposure and deny sensitive ports by default; unreadable policy fails closed, and existing previews recheck policy on every request. These rules do not restrict an app's preexisting direct network access. Terminals belong to the running Ormos process and end when it stops. Starting with v0.2.8, `ormos relay` and `ormos --config PATH` reject before reading credentials or contacting a service. Use the local UI with private network access.
 
 In the terminal popup, the plus icon at the right of the tabs adds a command or prompt to the selected list. It is hidden while editing and on the keyboard tab. Save uses a checkmark below the inputs; switching tabs or closing the popup discards unsaved changes.
 
