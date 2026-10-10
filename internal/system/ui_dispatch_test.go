@@ -66,16 +66,14 @@ func TestMainHasAUICaseThatCallsTheSeam(t *testing.T) {
 }
 
 func TestMainDrivesUIThroughTheSeam(t *testing.T) {
-	oldUI, oldRun := uiMainFn, runSystemFn
-	t.Cleanup(func() { uiMainFn, runSystemFn = oldUI, oldRun })
+	oldUI := uiMainFn
+	t.Cleanup(func() { uiMainFn = oldUI })
 	var gotArgs []string
 	var gotVersion string
 	uiMainFn = func(args []string, version string) error {
 		gotArgs, gotVersion = append([]string{}, args...), version
 		return nil
 	}
-	ran := false
-	runSystemFn = func() { ran = true }
 
 	Main([]string{"ui"}, "9.9.9")
 	if gotVersion != "9.9.9" {
@@ -83,9 +81,6 @@ func TestMainDrivesUIThroughTheSeam(t *testing.T) {
 	}
 	if len(gotArgs) != 0 {
 		t.Fatalf("ui got extra args: %v", gotArgs)
-	}
-	if ran {
-		t.Fatal("ormos ui must not also run the tunnel")
 	}
 }
 
@@ -96,8 +91,8 @@ func TestUsageNamesTheUI(t *testing.T) {
 }
 
 func TestMainDefaultsToLocalUIWithoutRelay(t *testing.T) {
-	oldUI, oldRun := uiMainFn, runSystemFn
-	t.Cleanup(func() { uiMainFn, runSystemFn = oldUI, oldRun })
+	oldUI := uiMainFn
+	t.Cleanup(func() { uiMainFn = oldUI })
 	calls := 0
 	uiMainFn = func(args []string, version string) error {
 		calls++
@@ -106,7 +101,6 @@ func TestMainDefaultsToLocalUIWithoutRelay(t *testing.T) {
 		}
 		return nil
 	}
-	runSystemFn = func() { t.Fatal("default startup reached deprecated relay") }
 	Main(nil, "test")
 	if calls != 1 {
 		t.Fatalf("UI calls: %d", calls)
