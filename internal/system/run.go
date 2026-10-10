@@ -1,9 +1,7 @@
 //go:build (linux && !android) || (darwin && !ios)
 
-// Package system is ormos on a personal machine: it opens a single outbound
-// WebSocket to the relay and serves terminal and port-proxy streams multiplexed
-// over it. With no arguments it runs the tunnel; with a TTY it also shows a
-// Bubble Tea status dashboard.
+// Package system serves the local Ormos terminal UI. Hosted relay command
+// entries fail before reading credentials or contacting a service.
 //
 // # Supported platforms
 //
@@ -54,27 +52,19 @@ import (
 	"github.com/nicodes/ormos/relay"
 )
 
-// Main accepts `ormos`, `ormos --config PATH`, `ormos --help` and
-// `ormos --version`, `ormos --protocol-version`, and nothing else — no `-h`
-// shorthand, no subcommands.
-// Parsed by hand rather than with the flag package, which would accept
-// single-dash spellings and add its own -h.
-//
-// The version is passed in rather than declared here: it is stamped at release
-// time with -ldflags "-X main.version=...", and main is the one package name
-// that flag can name without knowing this directory's import path.
-// uiMainFn and runSystemFn are dispatch seams: ui_dispatch_test.go drives Main
-// through them so a command can never again exist in one switch and vanish in
-// the other.
+// Main defaults to the local UI and accepts explicit UI and inspection flags.
+// The version is stamped by the release build. uiMainFn is the local dispatch
+// seam used to verify argument forwarding without starting a real server.
 var uiMainFn = RunUI
-var runSystemFn = runSystem
 
 func Main(args []string, version string) {
 	if len(args) == 0 {
 		args = []string{"ui"}
 	}
 	switch {
-	case len(args) == 1 && args[0] == "relay":
+	case args[0] == "relay" || args[0] == "--config":
+		fmt.Fprintln(os.Stderr, "error: hosted relay mode is retired; use the local UI with private network access")
+		os.Exit(2)
 	case len(args) == 1 && args[0] == "--help":
 		usage()
 		return
@@ -90,17 +80,11 @@ func Main(args []string, version string) {
 			os.Exit(2)
 		}
 		return
-	case len(args) == 2 && args[0] == "--config" && args[1] != "":
-		configFileOverride = args[1]
-	case args[0] == "--config":
-		fmt.Fprintln(os.Stderr, "error: --config needs a path, e.g. --config ~/.ormos-dev/config.json")
-		os.Exit(2)
 	default:
 		fmt.Fprintf(os.Stderr, "unexpected argument %q\n\n", args[0])
 		usage()
 		os.Exit(2)
 	}
-	runSystemFn()
 }
 
 var usageText = `ormos — a local terminal and app preview
@@ -123,10 +107,7 @@ Use an HTTPS workspace for Godot and other apps requiring a secure context.
 There is no application account or login. Trusted network access is required.
 Terminals end when Ormos stops; browser disconnects leave them running.
 
-Legacy compatibility (deprecated hosted backend):
-  ormos relay              run the former relay-connected agent
-  ormos --config PATH      run that agent with a separate config file
-  ormos --protocol-version print its tunnel protocol version
+Hosted relay commands are retired. Saved local UI entries and private access remain supported.
 `
 
 func usage() {
