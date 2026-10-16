@@ -1,4 +1,4 @@
-name: CI
+name: "Build & Test"
 
 # Every push and pull request: build, then test.
 #
