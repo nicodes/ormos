@@ -1,4 +1,4 @@
-name: Actionlint
+name: "Workflow Lint"
 
 # Lints the workflows themselves: a typo in a job key, an expression that never
 # resolves, a `run:` step shellcheck would reject. These files gate every merge
@@ -24,11 +24,13 @@ concurrency:
 
 jobs:
   actionlint:
+    name: "Workflow lint"
     runs-on: ubuntu-latest
     # Seconds of work. Ten minutes means something hung.
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: "Check out source"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The binary is fetched at a pinned version and verified against its
       # published SHA-256 before it runs -- the same guarantee a SHA-pinned

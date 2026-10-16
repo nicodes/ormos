@@ -40,14 +40,16 @@ jobs:
   # the Linux tarball to check the version it reports, neither of which is a
   # macOS thing. Cross-compiling for darwin is the release job's business.
   darwin:
+    name: "Build (macOS)"
     runs-on: macos-latest
     timeout-minutes: 20
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: "Check out source"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Setup
+      - name: "Set up"
         uses: ./.github/actions/setup
 
       - name: Go version
@@ -58,6 +60,7 @@ jobs:
         uses: ./.github/actions/test
 
   release:
+    name: "Release"
     needs: darwin
     runs-on: ubuntu-latest
     # Bounded, so a step that hangs fails here rather than sitting until the
@@ -68,7 +71,8 @@ jobs:
       id-token: write # OIDC identity for build provenance
       attestations: write # record the provenance attestation
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: "Check out source"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The version arithmetic below reads the tag history. A shallow clone
           # does not have it.
@@ -112,7 +116,7 @@ jobs:
 
       # Toolchain install, the go.mod/.mise.toml pin guard and the Go build
       # cache -- the same definition CI runs, from .github/actions/setup.
-      - name: Setup
+      - name: "Set up"
         uses: ./.github/actions/setup
 
       # The same steps CI runs, from the same definition. Running them again

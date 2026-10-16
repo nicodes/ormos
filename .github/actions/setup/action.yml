@@ -1,4 +1,4 @@
-name: Setup
+name: "Set up"
 description: >
   The toolchain install, the pin-agreement guard and the Go build cache —
   defined once, used by every job in CI and Release.
@@ -22,7 +22,8 @@ runs:
     # its toolchain the same way. The cost is that the Go version now lives
     # in .mise.toml as well as go.mod; the step below is what keeps them
     # honest.
-    - uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+    - name: "Set up tools"
+      uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
 
     # mise installs the Go toolchain from .mise.toml, but go.mod carries its
     # own `go` directive and GOTOOLCHAIN=auto will silently download whatever

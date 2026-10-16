@@ -33,6 +33,7 @@ concurrency:
 
 jobs:
   ci:
+    name: "Test"
     runs-on: ubuntu-latest
     # Bounded, so a step that hangs fails here rather than sitting until the
     # runner's own timeout hours later.
@@ -41,13 +42,14 @@ jobs:
       # Third-party actions are pinned by SHA, with the tag in a trailing
       # comment so the version is still readable. A tag is a moving reference:
       # whoever can move it can run code in this job.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: "Check out source"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Toolchain install, the go.mod/.mise.toml pin guard and the Go build
       # cache -- one definition, shared with Release and with the Darwin job
       # below. See .github/actions/setup for why an action and not three
       # inline copies.
-      - name: Setup
+      - name: "Set up"
         uses: ./.github/actions/setup
 
       # The web export is COMMITTED (internal/ui/embed.go says why: a bare
@@ -107,12 +109,14 @@ jobs:
   # compiling in the job above; what it needs proving about it HERE is that the
   # tests pass on a Mac.
   darwin:
+    name: "Build (macOS)"
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: "Check out source"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Setup
+      - name: "Set up"
         uses: ./.github/actions/setup
 
       # Which Go this job actually got. When a failure happens only here, the
