@@ -7,7 +7,7 @@ updates:
   schedule:
     interval: weekly
     day: monday
-    time: 09:23
+    time: "09:23"
     timezone: Etc/UTC
   groups:
     routine-updates:
@@ -58,7 +58,7 @@ updates:
       - minor
       - patch
     managed-releases:
-      patterns: &id001
+      patterns:
       - nicodes/tools/*
       - nicodes/cicd/*
       - nicodes/komizo-actions/*
@@ -97,7 +97,7 @@ updates:
   schedule:
     interval: weekly
     day: monday
-    time: 09:23
+    time: "09:23"
     timezone: Etc/UTC
   groups:
     routine-updates:
@@ -148,7 +148,11 @@ updates:
       - minor
       - patch
     managed-releases:
-      patterns: *id001
+      patterns:
+      - nicodes/tools/*
+      - nicodes/cicd/*
+      - nicodes/komizo-actions/*
+      - aviorstudio/gdam-actions/*
       update-types:
       - minor
       - patch
