@@ -49,6 +49,19 @@ jobs:
       # cache -- one definition, shared with Release and with the Darwin job
       # below. See .github/actions/setup for why an action and not three
       # inline copies.
+      - name: Record tested integration identity
+        if: github.event_name == 'pull_request'
+        uses: nicodes/tools/integration-identity@ca747e13a51f301f51635c262d883d57d6084ae3 # v0.27.1
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+      - name: Upload artifacts
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fleet-integration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/fleet-integration.json
+          if-no-files-found: error
+          retention-days: 7
       - name: "Set up"
         uses: ./.github/actions/setup
 
