@@ -51,7 +51,7 @@ jobs:
       # inline copies.
       - name: Record tested integration identity
         if: github.event_name == 'pull_request'
-        uses: nicodes/tools/integration-identity@ca747e13a51f301f51635c262d883d57d6084ae3 # v0.27.1
+        uses: nicodes/tools/integration-identity@247267492cd455647facafcfcc6eed4c63c49c0e # v0.27.2
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
       - name: Upload artifacts
