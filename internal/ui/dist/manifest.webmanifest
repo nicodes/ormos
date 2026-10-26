@@ -1,7 +1,7 @@
 {
   "id": "/",
-  "name": "Ormos",
-  "short_name": "Ormos",
+  "name": "ormos",
+  "short_name": "ormos",
   "description": "A terminal and local app preview in your browser.",
   "start_url": "/",
   "scope": "/",

@@ -6,7 +6,7 @@ export function previewURL(target: PreviewTarget, workspace: URL): string {
   if (!Number.isInteger(target.port) || target.port < 1 || target.port > 65535) throw new Error("Enter a port between 1 and 65535.");
   const origin = new URL(workspace.origin);
   origin.port = String(target.port);
-  if (origin.origin === workspace.origin) throw new Error("Choose an app port, not the Ormos port.");
+  if (origin.origin === workspace.origin) throw new Error("Choose an app port, not the ormos port.");
   if (!target.path.startsWith("/") || target.path.startsWith("//") || target.path.includes("\\")) throw new Error("Use a local app path.");
   const url = new URL(target.path, origin);
   if (url.origin !== origin.origin) throw new Error("Use a local app path.");

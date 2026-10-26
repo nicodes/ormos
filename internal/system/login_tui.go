@@ -136,16 +136,16 @@ func (m loginModel) View() string {
 	return body + "\n" + footer
 }
 
-// blockOrmos renders "ORMOS" as five-row block letters.
+// blockOrmos renders "ormos" as five-row block letters.
 func blockOrmos() string {
 	glyphs := map[rune][5]string{
-		'O': {"█████", "█   █", "█   █", "█   █", "█████"},
-		'R': {"████ ", "█   █", "████ ", "█  █ ", "█   █"},
-		'M': {"█   █", "██ ██", "█ █ █", "█   █", "█   █"},
-		'S': {"█████", "█    ", "█████", "    █", "█████"},
+		'o': {"     ", " ▄▄▄ ", "█   █", "█   █", " ▀▀▀ "},
+		'r': {"     ", "█ ▄▄ ", "██   ", "█    ", "█    "},
+		'm': {"     ", "█▄ ▄ ", "█ █ █", "█ █ █", "█ █ █"},
+		's': {"     ", " ▄▄▄ ", "█▄▄  ", "   █ ", "▀▀▀  "},
 	}
 	rows := make([]string, 5)
-	for _, ch := range "ORMOS" {
+	for _, ch := range "ormos" {
 		g := glyphs[ch]
 		for i := 0; i < 5; i++ {
 			if rows[i] != "" {

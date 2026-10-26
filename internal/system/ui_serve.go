@@ -72,7 +72,7 @@ func loopbackAppListening(ctx context.Context, port int) error {
 	}
 	address := conn.RemoteAddr().String()
 	conn.Close()
-	// Updated Ormos instances identify their control listener. Never translate
+	// Updated ormos instances identify their control listener. Never translate
 	// a preview's Origin into another workspace's trusted localhost origin.
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://"+address+"/", nil)
 	if err != nil {
@@ -84,7 +84,7 @@ func loopbackAppListening(ctx context.Context, port int) error {
 	if err == nil {
 		res.Body.Close()
 		if res.Header.Get("X-Ormos-Workspace") == "1" {
-			return &previewSetupError{http.StatusForbidden, "Choose an app port, not an Ormos workspace port."}
+			return &previewSetupError{http.StatusForbidden, "Choose an app port, not an ormos workspace port."}
 		}
 	}
 	return nil
@@ -132,7 +132,7 @@ func (s *previewServe) open(ctx context.Context, port int, scheme, host string, 
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	// Prevent routing back into Ormos or one of its forwarding listeners.
+	// Prevent routing back into ormos or one of its forwarding listeners.
 	for key, route := range s.sessions {
 		if route.session != nil {
 			select {
@@ -145,7 +145,7 @@ func (s *previewServe) open(ctx context.Context, port int, scheme, host string, 
 	}
 	for _, route := range s.sessions {
 		if port == route.localPort {
-			return 0, &previewSetupError{http.StatusForbidden, "Choose an app port, not an Ormos preview port."}
+			return 0, &previewSetupError{http.StatusForbidden, "Choose an app port, not an ormos preview port."}
 		}
 	}
 	if err := s.listening(ctx, port); err != nil {
@@ -160,7 +160,7 @@ func (s *previewServe) open(ctx context.Context, port int, scheme, host string, 
 		return route.publicPort, nil
 	}
 	if len(s.sessions) >= maxPreviewRoutes {
-		return 0, &previewSetupError{http.StatusTooManyRequests, "Preview port limit reached. Restart Ormos to release its preview ports."}
+		return 0, &previewSetupError{http.StatusTooManyRequests, "Preview port limit reached. Restart ormos to release its preview ports."}
 	}
 	local := host == "localhost" || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())
 	var cfg *serveConfig
@@ -171,7 +171,7 @@ func (s *previewServe) open(ctx context.Context, port int, scheme, host string, 
 			if errors.Is(err, exec.ErrNotFound) {
 				return 0, &previewSetupError{http.StatusServiceUnavailable, "Install and connect Tailscale on this machine, then refresh."}
 			}
-			return 0, &previewSetupError{http.StatusServiceUnavailable, "Allow Ormos's user to manage Tailscale Serve, then refresh."}
+			return 0, &previewSetupError{http.StatusServiceUnavailable, "Allow ormos's user to manage Tailscale Serve, then refresh."}
 		}
 	}
 	bind := "127.0.0.1:0"
@@ -358,7 +358,7 @@ func (s *uiServer) apiPreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if body.Port == s.controlPort || strconv.Itoa(body.Port) == control {
-		uiError(w, http.StatusForbidden, "Choose an app port, not the Ormos port.")
+		uiError(w, http.StatusForbidden, "Choose an app port, not the ormos port.")
 		return
 	}
 	pol, err := uiLoadPolicy()
