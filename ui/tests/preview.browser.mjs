@@ -25,7 +25,7 @@ const close = server => new Promise((resolve, reject) => server.close(error => e
 
 // Uses the already-built release binary. Tests own ephemeral app ports and PTYs.
 test('isolated localhost previews retain navigation, terminal state and scrolling', { timeout: 90000 }, async t => {
-  assert(process.env.ORMOS_TEST_BINARY, 'Set ORMOS_TEST_BINARY to a built Ormos executable.');
+  assert(process.env.ORMOS_TEST_BINARY, 'Set ORMOS_TEST_BINARY to a built ormos executable.');
   const home = await mkdtemp(path.join(tmpdir(), 'ormos-direct-'));
   const artifacts = process.env.ORMOS_TEST_ARTIFACTS || home;
   await mkdir(artifacts, { recursive: true });
@@ -80,7 +80,7 @@ finally:
   for (let attempt = 0; ; attempt++) {
     try { await fetch(origin); break; }
     catch {
-      assert(attempt < 100 && child.exitCode === null, output || 'Ormos did not start');
+      assert(attempt < 100 && child.exitCode === null, output || 'ormos did not start');
       await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
