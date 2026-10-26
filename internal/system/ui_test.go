@@ -334,7 +334,7 @@ func TestUIPWAAssets(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.ID != "/" || manifest.Name != "Ormos" || manifest.StartURL != "/" || manifest.Scope != "/" || manifest.Display != "standalone" {
+	if manifest.ID != "/" || manifest.Name != "ormos" || manifest.StartURL != "/" || manifest.Scope != "/" || manifest.Display != "standalone" {
 		t.Fatalf("unexpected installation manifest: %+v", manifest)
 	}
 	if len(manifest.Icons) != 2 {

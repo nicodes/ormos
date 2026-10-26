@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install a published Ormos binary; no Go or Node toolchain is needed.
+# Install a published ormos binary; no Go or Node toolchain is needed.
 set -eu
 
 release=latest
@@ -87,7 +87,7 @@ printf '%s\n' "$release" | LC_ALL=C grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || fail
 asset=ormos_${platform}_${arch}.tar.gz
 base=$repo_url/releases/download/$release
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ormos-install.XXXXXXXX") || fail 'Could not create a temporary directory.'
-printf 'Installing Ormos %s (%s %s)...\n' "$release" "$platform" "$arch"
+printf 'Installing ormos %s (%s %s)...\n' "$release" "$platform" "$arch"
 fetch "$base/checksums.txt" --output "$work_dir/checksums.txt" || fail "Could not download checksums for $release. Check that the release is published."
 fetch "$base/$asset" --output "$work_dir/$asset" || fail "Could not download $asset for $release."
 expected=$(awk -v name="$asset" '$2 == name || $2 == "*" name { count++; digest=$1 } END { if (count == 1) print digest }' "$work_dir/checksums.txt")
@@ -99,7 +99,7 @@ else
 fi
 [ "$actual" = "$expected" ] || fail 'Checksum verification failed; the installed binary was not changed.'
 tar -xzf "$work_dir/$asset" -C "$work_dir" ormos || fail 'The release archive could not be extracted.'
-[ -f "$work_dir/ormos" ] && [ ! -L "$work_dir/ormos" ] || fail 'The archive does not contain a regular Ormos executable.'
+[ -f "$work_dir/ormos" ] && [ ! -L "$work_dir/ormos" ] || fail 'The archive does not contain a regular ormos executable.'
 chmod 755 "$work_dir/ormos"
 reported=$("$work_dir/ormos" --version) || fail 'The downloaded binary cannot run on this machine.'
 [ "$reported" = "${release#v}" ] || fail "The binary reports $reported, expected ${release#v}; installation was not changed."
@@ -107,19 +107,19 @@ reported=$("$work_dir/ormos" --version) || fail 'The downloaded binary cannot ru
 mkdir -p "$install_dir" || fail "Could not create $install_dir; choose a writable directory with --install-dir."
 [ ! -d "$install_dir/ormos" ] || fail "$install_dir/ormos is a directory."
 # Stage on the destination filesystem so replacement is atomic, including when
-# Ormos is running. The running process continues using its original binary.
+# ormos is running. The running process continues using its original binary.
 stage_dir=$(mktemp -d "$install_dir/.ormos-install.XXXXXXXX") || fail "Cannot write to $install_dir."
 cp "$work_dir/ormos" "$stage_dir/ormos"
 chmod 755 "$stage_dir/ormos"
 mv -f "$stage_dir/ormos" "$install_dir/ormos"
-printf 'Installed Ormos %s at %s/ormos\n' "$release" "$install_dir"
+printf 'Installed ormos %s at %s/ormos\n' "$release" "$install_dir"
 add_user_bin_to_profile() {
     profile=$1
-    marker='# Ormos installer: user executables'
+    marker='# ormos installer: user executables'
     if [ -f "$profile" ] && grep -F "$marker" "$profile" >/dev/null 2>&1; then return; fi
     if ! cat >> "$profile" <<'PROFILE'
 
-# Ormos installer: user executables
+# ormos installer: user executables
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *) export PATH="$HOME/.local/bin:$PATH" ;;
