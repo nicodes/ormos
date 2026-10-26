@@ -115,11 +115,12 @@ mv -f "$stage_dir/ormos" "$install_dir/ormos"
 printf 'Installed ormos %s at %s/ormos\n' "$release" "$install_dir"
 add_user_bin_to_profile() {
     profile=$1
-    marker='# ormos installer: user executables'
+    # Stable shell-profile sentinel used to make repeated installs idempotent.
+    marker='# Ormos installer: user executables'
     if [ -f "$profile" ] && grep -F "$marker" "$profile" >/dev/null 2>&1; then return; fi
     if ! cat >> "$profile" <<'PROFILE'
 
-# ormos installer: user executables
+# Ormos installer: user executables
 case ":$PATH:" in
     *":$HOME/.local/bin:"*) ;;
     *) export PATH="$HOME/.local/bin:$PATH" ;;
