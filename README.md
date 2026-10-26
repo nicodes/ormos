@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 028afd1789d682a4c18d620409ecb81da2a630e1381b1eb26ff61e53af96749d -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: d2fcb61a77d80e348e0a6bba7ee4bd1c5b6a5595adf3f306828e50c97acb50c1 -->
 
 # Ormos
 
@@ -85,3 +85,7 @@ Terminal content fills the pane between the shared header and a bottom quick-con
 Before loading an app, Ormos prepares its forwarding route and the browser makes a credential-free HEAD reachability check, bounded by a 20-second overall timeout. Failure shows a centered “App unavailable” title and a short subtitle identifying the next step. This check does not certify that embedding is permitted; use Open in new tab if the app blocks iframes. Refresh checks the address again and reloads it. Navigation history retains up to 200 entered addresses; recent history retains 50 unique entries.
 
 The terminal uses a blinking light-gray vertical-bar cursor.
+
+## Repository development
+
+Install the [Komizo release](https://github.com/nicodes/komizo#install) matching `komizo.lock`. Run `komizo check` for the full verification gate and `komizo check --explain` to inspect the selected checks. `komizo run build` compiles the declared artifacts. Interactive product sessions use the CLI directly.
