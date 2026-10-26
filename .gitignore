@@ -8,3 +8,9 @@ __pycache__/
 
 /dist/
 /.artifacts/
+
+.artifacts/
+
+.komizo.mise*.toml
+
+.komizo.mise*.lock
