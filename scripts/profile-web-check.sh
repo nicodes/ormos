@@ -2,7 +2,6 @@
 set -euo pipefail
 export GOTOOLCHAIN=local
 cd ui
-npm ci
 npm run typecheck
 npm test
 npm run build
