@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: d2fcb61a77d80e348e0a6bba7ee4bd1c5b6a5595adf3f306828e50c97acb50c1 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 045e7cd4c41f74792af619a7a4b532d159802c5c701673ea7041293cee525f5d -->
 
 # Ormos
 
@@ -23,7 +23,7 @@ curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --ver
 curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --install-dir "$HOME/bin"
 ```
 
-The short form is `-v 0.2.1`. Omitting a version uses `latest`; `--version latest` and `-v latest` also work. A leading `v` on a version is optional. Custom install directories must be on your PATH. The installer is also included in release assets starting with v0.2.0. The terminal UI requires v0.2.0 or later; automatic preview forwarding requires v0.2.3 or later. You can also manually extract a platform archive from [Releases](https://github.com/nicodes/ormos/releases), or use Go matching `go.mod` and `.mise.toml`:
+The short form is `-v 0.2.1`. Omitting a version uses `latest`; `--version latest` and `-v latest` also work. A leading `v` on a version is optional. Custom install directories must be on your PATH. The installer is also included in release assets starting with v0.2.0. The terminal UI requires v0.2.0 or later; automatic preview forwarding requires v0.2.3 or later. You can also manually extract a platform archive from [Releases](https://github.com/nicodes/ormos/releases), or use Go matching `go.mod` and `komizo.lock`:
 
 ```sh
 go install github.com/nicodes/ormos@latest
