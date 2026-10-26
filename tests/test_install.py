@@ -180,7 +180,7 @@ else:
                 for name in names:
                     contents = (self.home / name).read_text()
                     self.assertTrue(contents.startswith("# keep user settings\n"))
-                    self.assertEqual(contents.count("# ormos installer: user executables"), 1)
+                    self.assertEqual(contents.count("# Ormos installer: user executables"), 1)
 
     def test_archive_from_the_shared_build_action(self):
         fixture = os.environ.get("ORMOS_INSTALL_TEST_ARCHIVE")
