@@ -50,7 +50,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: "Set up"
-        uses: ./.github/actions/setup
+        uses: nicodes/komizo/setup@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Go version
         shell: bash
@@ -114,26 +116,17 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      # Toolchain install, the go.mod/.mise.toml pin guard and the Go build
-      # cache -- the same definition CI runs, from .github/actions/setup.
-      - name: "Set up"
-        uses: ./.github/actions/setup
-
-      # The same steps CI runs, from the same definition. Running them again
-      # against this exact commit is not redundant: CI passing on this SHA
-      # earlier is a claim about that run, and a release is the artefact people
-      # actually execute.
-      #
-      # Build before Test, as everywhere else. It costs a cross-compile of four
-      # platforms on a release whose tests then fail -- and buys one ordering
-      # with no exceptions to remember.
-      - name: Build
-        uses: ./.github/actions/build
+      - name: Set up locked Komizo
+        uses: nicodes/komizo/setup@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Check project
+        uses: nicodes/komizo/run@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
         with:
-          version: ${{ steps.release.outputs.version }}
-
-      - name: Test
-        uses: ./.github/actions/test
+          target: check
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          MISE_GITHUB_TOKEN: ${{ github.token }}
 
       # checksums.txt only says the archives match a file uploaded by whoever
       # uploaded them; provenance ties them to this workflow, this repository

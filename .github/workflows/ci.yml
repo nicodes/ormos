@@ -1,143 +1,80 @@
-name: "Build & Test"
-
-# Every push and pull request: build, then test.
-#
-# Nothing is published, so a green CI means one thing — this commit is good.
-#
-# TWO jobs, and only two, because a job is a machine and ormos is a two-platform
-# product. Splitting phases across machines would be waste — each would pay its
-# own checkout and toolchain to split one green tick in two — so build and test
-# are separate STEPS of the Linux job. Splitting PLATFORMS is not waste: macOS is
-# a different kernel, and the claim "this runs on macOS" is otherwise checked by
-# nobody. The Darwin job exists to make that claim falsifiable.
-#
-# The steps are .github/actions/*, the same ones Release runs. There is one
-# definition of each, and it is the one guarding a release; two would drift in a
-# single direction, with the release-side copy trimmed for speed until it no
-# longer matched what people trust on a pull request. The Darwin job reuses the
-# same setup and test actions for the same reason — one definition of
-# "installed" and one of "tested".
-
-on:
+name: Build & Test
+'on':
   pull_request:
+    types:
+    - opened
+    - synchronize
+    - reopened
+    - ready_for_review
   push:
-    branches: [main]
-  workflow_dispatch:
-
+    branches:
+    - main
+  workflow_dispatch: null
 permissions:
   contents: read
-
+  attestations: read
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   ci:
-    name: "Test"
-    runs-on: ubuntu-latest
-    # Bounded, so a step that hangs fails here rather than sitting until the
-    # runner's own timeout hours later.
-    timeout-minutes: 20
+    name: Test
+    runs-on: ubuntu-24.04
+    env:
+      MISE_GITHUB_TOKEN: ${{ github.token }}
+    timeout-minutes: 45
     steps:
-      # Third-party actions are pinned by SHA, with the tag in a trailing
-      # comment so the version is still readable. A tag is a moving reference:
-      # whoever can move it can run code in this job.
-      - name: "Check out source"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Toolchain install, the go.mod/.mise.toml pin guard and the Go build
-      # cache -- one definition, shared with Release and with the Darwin job
-      # below. See .github/actions/setup for why an action and not three
-      # inline copies.
-      - name: Record tested integration identity
-        if: github.event_name == 'pull_request'
-        uses: nicodes/tools/integration-identity@247267492cd455647facafcfcc6eed4c63c49c0e # v0.27.2
-        env:
-          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
-      - name: Upload artifacts
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: fleet-integration-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .artifacts/fleet-integration.json
-          if-no-files-found: error
-          retention-days: 7
-      - name: "Set up"
-        uses: ./.github/actions/setup
-
-      # The web export is COMMITTED (internal/ui/embed.go says why: a bare
-      # `go install` must build on a machine with no Node). Rebuilding it from
-      # source and diffing is the drift check, not the build -- if this fails,
-      # the committed bytes stopped being what ui/ produces.
-      - name: The committed web export matches its source
-        shell: bash
-        run: make web-check
-
-      # Built first: a compile error should fail before a test suite spends
-      # minutes reaching the same conclusion more slowly. Same order as
-      # release.yml, which is the point — one ordering, no exceptions to
-      # remember. (The steps used to run the other way round while both this
-      # comment and the header above said "build, then test".)
-      - name: Build
-        uses: ./.github/actions/build
-
-      - name: Preview browser regression
-        shell: bash
-        run: make browser-check
-
-      - name: Test
-        uses: ./.github/actions/test
-
-      # The agent is Linux and macOS. That is a decision, and a decision with
-      # nothing checking it is a comment.
-      #
-      # It cannot be checked by building: `go build ./...` SKIPS packages with
-      # no buildable files, so once internal/system is tagged out, a Windows
-      # build of ./... exits 0 having compiled only relay. Which means that
-      # without this step, a file that lost its build tag would sail through
-      # both jobs, and the first person to find out would be whoever ran it on
-      # an untested kernel.
-      #
-      # So the assertions are about what is SELECTED, not what compiles.
-      - name: The agent builds for Linux and macOS, and nothing else
-        shell: bash
-        run: make platform-check
-
-  # macOS is half of what ormos claims to support, and until this job existed
-  # nothing verified it. The Build step above cross-compiles for darwin, but
-  # that proves only that the symbols resolve — it does not run a line of the
-  # code on the platform.
-  #
-  # It matters most for the terminal. The agent polls a raw PTY master
-  # descriptor through RawConn.Control, which on darwin goes via the libc
-  # trampoline rather than a kernel ppoll, and creack/pty builds the master
-  # differently on the two platforms (Linux os.OpenFile, macOS os.NewFile on an
-  # already-open blocking descriptor). That is exactly the difference the
-  # output-coalescing path reasons about, so it is exactly the code a
-  # cross-compile cannot vouch for.
-  #
-  # Test only, no Build: the build action archives with sha256sum and unpacks
-  # the Linux archive to check the version it reports, neither of which is a
-  # macOS thing. What a darwin binary needs proving about it is proven by
-  # compiling in the job above; what it needs proving about it HERE is that the
-  # tests pass on a Mac.
-  darwin:
-    name: "Build (macOS)"
+    - name: Check out source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Set up locked Komizo
+      uses: nicodes/komizo/setup@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
+      env:
+        GH_TOKEN: ${{ github.token }}
+      timeout-minutes: 5
+    - name: Record tested integration identity
+      if: github.event_name == 'pull_request'
+      env:
+        EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+      run: |
+        komizo exec --tools python -- bash -euo pipefail <<'KOMIZO_COMMAND'
+        python3 "$CICD_ENGINEERING/helpers/integration-identity.py"
+        KOMIZO_COMMAND
+    - name: Upload artifacts
+      if: github.event_name == 'pull_request'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: fleet-integration-${{ github.run_id }}-${{ github.run_attempt }}
+        path: .artifacts/fleet-integration.json
+        if-no-files-found: error
+        retention-days: 7
+        include-hidden-files: true
+    - name: Check project
+      uses: nicodes/komizo/run@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
+      with:
+        target: check
+  macos:
+    name: Test (macOS)
     runs-on: macos-latest
-    timeout-minutes: 20
+    env:
+      MISE_GITHUB_TOKEN: ${{ github.token }}
+    timeout-minutes: 45
     steps:
-      - name: "Check out source"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: "Set up"
-        uses: ./.github/actions/setup
-
-      # Which Go this job actually got. When a failure happens only here, the
-      # first question is whether the toolchain differs, and the log should
-      # answer it without a rerun.
-      - name: Go version
-        shell: bash
-        run: go version
-
-      - name: Test
-        uses: ./.github/actions/test
+    - name: Check out source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Set up locked Komizo
+      uses: nicodes/komizo/setup@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
+      env:
+        GH_TOKEN: ${{ github.token }}
+      timeout-minutes: 5
+    - name: Check source
+      uses: nicodes/komizo/run@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
+      with:
+        target: lint-source
+    - name: Check project
+      uses: nicodes/komizo/run@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
+      with:
+        target: install test vuln

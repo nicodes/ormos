@@ -4,16 +4,15 @@
   "ci_workflow": "ci.yml",
   "required_checks": [
     "Test",
-    "Build (macOS)"
+    "Test (macOS)"
   ],
   "integration_job": "ci",
   "dispatch_workflow": "ci.yml",
   "max_group_size": 10,
   "managed_dependencies": [
-    "nicodes/tools/*",
-    "nicodes/cicd/*",
+    "aviorstudio/gdam-actions/*",
     "nicodes/komizo-actions/*",
-    "aviorstudio/gdam-actions/*"
+    "nicodes/komizo/*"
   ],
   "sensitive_dependencies": [
     "*clerk*",
