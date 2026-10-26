@@ -45,7 +45,7 @@ jobs:
         ref: main
       timeout-minutes: 3
     - name: Set up locked Komizo
-      uses: nicodes/komizo/setup@c5f5ce398dcae5c7b3f8157e8331e7fcdf0c9e03
+      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
       env:
         GH_TOKEN: ${{ github.token }}
       timeout-minutes: 5
