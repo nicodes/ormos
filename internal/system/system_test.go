@@ -141,7 +141,10 @@ func TestReconnectRunsTerminalReconciliation(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); d.Run(ctx) }()
 
-	deadline := time.After(2 * time.Second)
+	// This exercises a failed reconciliation followed by a real reconnect
+	// backoff. Allow that retry under race instrumentation on shared runners;
+	// the assertions concern retained/pruned terminal state, not a 2s SLA.
+	deadline := time.After(10 * time.Second)
 	for {
 		d.terminalMu.Lock()
 		_, keep := d.terminals["keep"]
