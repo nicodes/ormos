@@ -1,6 +1,6 @@
 //go:build (linux && !android) || (darwin && !ios)
 
-// Package system serves the local Ormos terminal UI. Hosted relay command
+// Package system serves the local ormos terminal UI. Hosted relay command
 // entries fail before reading credentials or contacting a service.
 //
 // # Supported platforms
@@ -102,10 +102,10 @@ UI options:
   --bind IP                UI bind address (default 127.0.0.1)
 
 Serve the loopback UI privately through Tailscale Serve for phone access.
-Enter a local HTTP app port; Ormos forwards and exposes previews automatically.
+Enter a local HTTP app port; ormos forwards and exposes previews automatically.
 Use an HTTPS workspace for Godot and other apps requiring a secure context.
 There is no application account or login. Trusted network access is required.
-Terminals end when Ormos stops; browser disconnects leave them running.
+Terminals end when ormos stops; browser disconnects leave them running.
 
 Hosted relay commands are retired. Saved local UI entries and private access remain supported.
 `
