@@ -1,15 +1,5 @@
 name: Release
-
-# Cut a release: bump the tag, cross-compile, publish archives with checksums
-# and build provenance.
-#
-# The tag is a PLAIN v0.0.1, not a prefixed one. This repository is the Go
-# module, so `go install github.com/nicodes/ormos@v0.0.2` only resolves if the
-# tag is exactly that. A prefixed tag would publish a release nobody could
-# install by version, and `@latest` would go on resolving to a pseudo-version of
-# whatever main happened to be.
-
-on:
+'on':
   workflow_dispatch:
     inputs:
       bump:
@@ -17,160 +7,121 @@ on:
         required: true
         type: choice
         options:
-          - patch
-          - minor
-          - major
-
+        - patch
+        - minor
+        - major
 permissions: {}
-
 concurrency: release-${{ github.repository }}
-
 jobs:
-  # A release publishes ormos_Darwin_x86_64 and ormos_Darwin_arm64. Until this
-  # job existed, no macOS machine had run a line of this code before those
-  # archives went out — the cross-compile on the Linux job proves the symbols
-  # resolve and nothing more.
-  #
-  # This is the same argument release.yml already makes for re-running Test at
-  # all ("CI passing on this SHA earlier is a claim about that run, and a
-  # release is the artefact people actually execute"), applied to the platform
-  # CI has only just started testing.
-  #
-  # Test only, no Build: the build action archives with sha256sum and unpacks
-  # the Linux tarball to check the version it reports, neither of which is a
-  # macOS thing. Cross-compiling for darwin is the release job's business.
   darwin:
-    name: "Build (macOS)"
+    name: Build (macOS)
     runs-on: macos-latest
     timeout-minutes: 20
     permissions:
       contents: read
     steps:
-      - name: "Check out source"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: "Set up"
-        uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Go version
-        shell: bash
-        run: go version
-
-      - name: Test
-        uses: ./.github/actions/test
-
+    - name: Check out source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - name: Set up
+      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Go version
+      shell: bash
+      run: go version
+    - name: Test
+      uses: ./.github/actions/test
   release:
-    name: "Release"
+    name: Release
     needs: darwin
     runs-on: ubuntu-latest
-    # Bounded, so a step that hangs fails here rather than sitting until the
-    # runner's own timeout hours later.
     timeout-minutes: 20
     permissions:
-      contents: write # create the tag and the release
-      id-token: write # OIDC identity for build provenance
-      attestations: write # record the provenance attestation
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - name: "Check out source"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # The version arithmetic below reads the tag history. A shallow clone
-          # does not have it.
-          fetch-depth: 0
-
-      - name: Determine release version
-        id: release
-        env:
-          BUMP: ${{ inputs.bump }}
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo 'Run releases from the main branch.' >&2
-            exit 1
-          fi
-          git fetch --tags --force
-          latest="$(git tag --list 'v[0-9]*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
-          if [ -z "$latest" ]; then
-            # The first release is 0.0.1 whatever was asked for. Under 0.x a
-            # minor claims a milestone that has not happened, and a first
-            # release is not the place to claim one. The bump choice starts
-            # mattering once there is a tag to bump.
-            version="0.0.1"
-          else
-            IFS=. read -r major minor patch <<< "$latest"
-            case "$BUMP" in
-              major) major=$((major + 1)); minor=0; patch=0 ;;
-              minor) minor=$((minor + 1)); patch=0 ;;
-              patch) patch=$((patch + 1)) ;;
-              *) echo "Unsupported bump: $BUMP" >&2; exit 1 ;;
-            esac
-            version="${major}.${minor}.${patch}"
-          fi
-          tag="v${version}"
-          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-            echo "Tag already exists: $tag" >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-      - name: Set up locked komizo
-        uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
-        env:
-          GH_TOKEN: ${{ github.token }}
-      - name: Check project
-        uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
-        with:
-          target: check
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
-          MISE_GITHUB_TOKEN: ${{ github.token }}
-
-      # checksums.txt only says the archives match a file uploaded by whoever
-      # uploaded them; provenance ties them to this workflow, this repository
-      # and this commit, and `gh attestation verify` checks that against a
-      # public transparency log.
-      - name: Attest build provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-path: |
-            dist/*.tar.gz
-            dist/install.sh
-
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.release.outputs.tag }}
-        run: |
-          set -euo pipefail
-          cat > dist/notes.md <<NOTES
-          ormos $TAG
-
-          A local terminal and app preview with a built-in SolidJS UI.
-          No hosted backend or app login is needed. Entering a localhost app
-          port automatically configures private Tailscale Serve when needed.
-
-          Install the prebuilt binary (Linux/macOS, x86_64/arm64):
-
-          \`\`\`sh
-          curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh | sh -s -- --version $TAG
-          \`\`\`
-
-          Or install with Go:
-
-          \`\`\`sh
-          go install github.com/nicodes/ormos@$TAG
-          \`\`\`
-
-          Run \`ormos ui\` and open \`http://127.0.0.1:4242\`.
-          The installer verifies the archive's SHA-256 checksum and binary
-          version. Archives and the installer also carry build provenance:
-
-          \`\`\`sh
-          gh attestation verify ormos_Linux_x86_64.tar.gz --repo $GITHUB_REPOSITORY
-          \`\`\`
-          NOTES
-          gh release create "$TAG" dist/*.tar.gz dist/install.sh dist/checksums.txt \
-            --target "$GITHUB_SHA" --title "$TAG" --notes-file dist/notes.md
+    - name: Check out source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+    - name: Determine release version
+      id: release
+      env:
+        BUMP: ${{ inputs.bump }}
+      run: |
+        set -euo pipefail
+        if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+          echo 'Run releases from the main branch.' >&2
+          exit 1
+        fi
+        git fetch --tags --force
+        latest="$(git tag --list 'v[0-9]*' | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+        if [ -z "$latest" ]; then
+          # The first release is 0.0.1 whatever was asked for. Under 0.x a
+          # minor claims a milestone that has not happened, and a first
+          # release is not the place to claim one. The bump choice starts
+          # mattering once there is a tag to bump.
+          version="0.0.1"
+        else
+          IFS=. read -r major minor patch <<< "$latest"
+          case "$BUMP" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+            *) echo "Unsupported bump: $BUMP" >&2; exit 1 ;;
+          esac
+          version="${major}.${minor}.${patch}"
+        fi
+        tag="v${version}"
+        if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+          echo "Tag already exists: $tag" >&2
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+    - name: Set up locked komizo
+      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Check project
+      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      with:
+        target: check
+      env:
+        VERSION: ${{ steps.release.outputs.version }}
+        MISE_GITHUB_TOKEN: ${{ github.token }}
+    - name: Attest build provenance
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+      with:
+        subject-path: |
+          dist/*.tar.gz
+          dist/install.sh
+    - name: Upload accepted release artifacts
+      id: accepted
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: accepted-cli-${{ github.sha }}-${{ github.run_attempt }}
+        path: |-
+          dist/*.tar.gz
+          dist/*.zip
+          dist/checksums.txt
+          dist/install.sh
+        if-no-files-found: error
+        retention-days: 7
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      artifact-id: ${{ steps.accepted.outputs.artifact-id }}
+  publish:
+    name: Publish release
+    needs: release
+    uses: nicodes/tools/.github/workflows/cli-publish.yml@0276991861118d6e70a92cd11432dd664d3b030f
+    permissions:
+      contents: write
+    with:
+      tools-ref: '0276991861118d6e70a92cd11432dd664d3b030f'
+      binary: ormos
+      tag: ${{ needs.release.outputs.tag }}
+      artifact-id: ${{ needs.release.outputs.artifact-id }}
+      extra-files: install.sh
