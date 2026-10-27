@@ -98,7 +98,7 @@ else
     actual=$(shasum -a 256 "$work_dir/$asset" | awk '{print $1}')
 fi
 [ "$actual" = "$expected" ] || fail 'Checksum verification failed; the installed binary was not changed.'
-tar -xzf "$work_dir/$asset" -C "$work_dir" ormos || fail 'The release archive could not be extracted.'
+tar --no-same-owner -xzf "$work_dir/$asset" -C "$work_dir" ormos || fail 'The release archive could not be extracted.'
 [ -f "$work_dir/ormos" ] && [ ! -L "$work_dir/ormos" ] || fail 'The archive does not contain a regular ormos executable.'
 chmod 755 "$work_dir/ormos"
 reported=$("$work_dir/ormos" --version) || fail 'The downloaded binary cannot run on this machine.'
