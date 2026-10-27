@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: c7a9d5ff7e96d2926f86c05f97fd8cb9530bbf6673eaed28ec750fb5c8c6c076 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: e43dc9c7a284c18ed807ff45cc6320fb1994f4823406d1326008e5a93eed73dc -->
 
 # ormos
 
@@ -11,7 +11,7 @@ Automatic localhost preview forwarding requires v0.2.3 or later. Older releases 
 Install the latest published prebuilt release on Linux or macOS (x86_64 or arm64):
 
 ```sh
-curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh
+curl -fsSL https://ormos.dev/install | sh
 ```
 
 The installer detects your platform, checks the archive's SHA-256 digest and binary version, and installs to `~/.local/bin` without sudo. Go and Node.js are not needed. It adds the standard user bin directory to Bash/Zsh startup files when absent from PATH; open a new terminal afterward, or use `~/.local/bin/ormos` immediately. It does not start ormos, install a service, or change Tailscale configuration. Run the same command again to update; restart a running ormos process when ready to use the new binary.
@@ -19,8 +19,8 @@ The installer detects your platform, checks the archive's SHA-256 digest and bin
 To pin a version or choose another writable directory:
 
 ```sh
-curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --version 0.2.1
-curl -fsSL https://github.com/nicodes/ormos/raw/main/install.sh | sh -s -- --install-dir "$HOME/bin"
+curl -fsSL https://ormos.dev/install | sh -s -- --version 0.2.1
+curl -fsSL https://ormos.dev/install | sh -s -- --install-dir "$HOME/bin"
 ```
 
 The short form is `-v 0.2.1`. Omitting a version uses `latest`; `--version latest` and `-v latest` also work. A leading `v` on a version is optional. Custom install directories must be on your PATH. The installer is also included in release assets starting with v0.2.0. The terminal UI requires v0.2.0 or later; automatic preview forwarding requires v0.2.3 or later. You can also manually extract a platform archive from [Releases](https://github.com/nicodes/ormos/releases), or use Go matching `go.mod` and `komizo.lock`:
