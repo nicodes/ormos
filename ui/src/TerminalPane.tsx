@@ -9,6 +9,7 @@ import { createTerminalInput } from "./terminalInput";
 import { createTerminalOutput } from "./terminalOutput";
 import { bindTerminalEdits } from "./terminalEdits";
 import { bindTerminalTouch } from "./terminalTouch";
+import { bindTerminalPixelScroll } from "./terminalPixelScroll";
 
 export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void; scrollToBottom: () => void };
 export default function TerminalPane(props: {
@@ -54,7 +55,7 @@ export default function TerminalPane(props: {
     };
     textarea.addEventListener("blur", dismissKeyboard);
     container.addEventListener("pointerdown", touchPointer, true);
-    const touchScroll = bindTerminalTouch(container, terminal);
+    const touchScroll = bindTerminalTouch(container, terminal, bindTerminalPixelScroll(terminal));
     const send = (message: object) => {
       if (socket?.readyState !== WebSocket.OPEN) return false;
       socket.send(JSON.stringify(message));
