@@ -594,7 +594,7 @@ print('PAINT_FINISHED', flush=True)
         await scroll(-240);
         await page.waitForFunction(previous => Number(document.querySelector('.xterm-screen').textContent.match(/APP_SCROLL_(\d+)/)?.[1]) > previous, previous, { timeout: 3000 });
         const quick = page.getByRole('toolbar', { name: 'Quick terminal controls' });
-        assert.equal(await quick.getByRole('button').count(), 8);
+        assert.equal(await quick.getByRole('button').count(), 9);
         const lastControl = await quick.getByRole('button', { name: 'More terminal keys', exact: true }).boundingBox();
         assert(lastControl.x + lastControl.width <= (touch ? 390 : 1440), 'Toolbar must fit the viewport');
         // Inspect actual WebSocket input while the fixture has a raw PTY,
@@ -646,7 +646,7 @@ print('PAINT_FINISHED', flush=True)
         await page.keyboard.type('s');
         assert.deepEqual(await page.evaluate(() => window.testKeyInput), ['S', 's', '\x1b[Z', 's']);
         await pressControl(quick.getByRole('button', { name: 'Fewer terminal keys', exact: true }));
-        assert.equal(await quick.getByRole('button').count(), 8);
+        assert.equal(await quick.getByRole('button').count(), 9);
         assert.equal(await quick.getByRole('button', { name: 'More terminal keys', exact: true }).getAttribute('aria-expanded'), 'false');
         assert.equal(await page.locator('.xterm-helper-textarea').getAttribute('inputmode'), 'text');
         assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => node.readOnly), false);
@@ -683,8 +683,17 @@ print('PAINT_FINISHED', flush=True)
         assert(reconnects.some(url => url.includes('since=')), 'Reconnect must request only missed bytes');
         // Reconnect must also preserve the current scroll position.
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_0001'));
-        await moveScrollbar(true);
+        const bottom = quick.getByRole('button', { name: 'Scroll to bottom', exact: true });
+        const bottomBox = await bottom.boundingBox();
+        assert(bottomBox && bottomBox.width >= 44 && bottomBox.height >= 44 && bottomBox.x >= 0 && bottomBox.x + bottomBox.width <= page.viewportSize().width, 'Scroll to bottom stays visible with a full touch target');
+        await openKeyboard();
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_0001'));
+        const inputsBeforeScroll = await page.evaluate(() => window.testTerminalMessages.filter(message => message.type === 'input').length);
+        await pressControl(bottom);
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_6000'));
+        await pressControl(bottom); // Already at the bottom is harmless.
+        assert.equal(await page.evaluate(() => window.testTerminalMessages.filter(message => message.type === 'input').length), inputsBeforeScroll, 'Scrolling must not send terminal input');
+        assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true, 'Scrolling preserves keyboard focus');
         await page.screenshot({ path: path.join(artifacts, `terminal-${touch ? 'phone' : 'desktop'}.png`) });
         // Saved commands and prompts share the compact row and editor actions.
         for (const kind of ['command', 'prompt']) {
