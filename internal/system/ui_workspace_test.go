@@ -374,7 +374,7 @@ func TestUINewTerminalUsesHomeByDefault(t *testing.T) {
 
 func TestUITerminalReplayRetainsHistoryBeyondOldLimit(t *testing.T) {
 	term := &uiTerminal{}
-	payload := []byte("EARLY_HISTORY\r\n" + strings.Repeat("history line\r\n", 10000))
+	payload := []byte("EARLY_HISTORY\r\n" + strings.Repeat("\x1b[H\x1b[2Kredraw", 400000))
 	term.append(payload)
 	got, offset, reset := term.replay(nil)
 	if string(got) != string(payload) || offset != 0 || !reset {

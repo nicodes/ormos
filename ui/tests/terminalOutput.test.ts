@@ -63,3 +63,23 @@ test("reject malformed replay metadata and output without a replay boundary", ()
   f.parse();
   assert.doesNotThrow(() => f.output.receive(new Uint8Array(1)));
 });
+
+test("geometry and replay completion follow parser writes; disconnected callbacks cannot refit", () => {
+  const queue: (() => void)[] = [], events: string[] = [];
+  const output = createTerminalOutput((data, parsed) => queue.push(() => { if (data.length) events.push("output"); parsed?.(); }),
+    () => events.push("reset"), queueMicrotask, {
+      resize: size => events.push(`${size.cols}x${size.rows}`), ready: () => events.push("fit"),
+    });
+  output.begin({ offset: 0, reset: true, size: { cols: 80, rows: 24 } }, () => {});
+  output.receive(new Uint8Array([1]));
+  output.resize({ cols: 40, rows: 10 });
+  output.receive(new Uint8Array([2]));
+  output.complete();
+  assert.deepEqual(events, []);
+  while (queue.length) queue.shift()!();
+  assert.deepEqual(events, ["reset", "80x24", "output", "40x10", "output", "fit"]);
+  output.complete(); output.disconnect(); queue.shift()!();
+  assert.equal(events.filter(event => event === "fit").length, 1);
+  assert.throws(() => output.resize({ cols: 0, rows: 24 }));
+  assert.throws(() => output.begin({ offset: 0, reset: true, size: { cols: 80, rows: 1001 } }, () => {}));
+});
