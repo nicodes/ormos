@@ -51,7 +51,7 @@ var (
 	uiListeningPorts  = listeningPorts
 	uiSpawnTerminal   = spawnUITerminal
 	uiMaxTerminals    = 8
-	uiTerminalBufMax  = 4 << 20
+	uiTerminalBufMax  = 32 << 20
 	uiTerminalKillGap = 2 * time.Second
 )
 
@@ -72,6 +72,7 @@ type uiTerminal struct {
 	alive       bool
 	mu          sync.Mutex
 	history     replayRing
+	sizes       []uiTerminalSize
 	end         uint64
 	kill        func()
 	done        chan struct{}
@@ -99,6 +100,7 @@ func (t *uiTerminal) append(p []byte) {
 	t.growHistory(min(uiTerminalBufMax, t.history.size+len(p)))
 	t.history.append(p)
 	t.end += uint64(len(p))
+	t.trimSizes()
 	// PTY reads reuse their buffer. Own one immutable chunk and share it across
 	// readers; neither the WebSocket writer nor compression modifies this data.
 	var chunk []byte

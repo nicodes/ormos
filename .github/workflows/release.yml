@@ -16,9 +16,12 @@ jobs:
   darwin:
     name: Build (macOS)
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
+    env:
+      MISE_GITHUB_TOKEN: ${{ github.token }}
     permissions:
       contents: read
+      attestations: read
     steps:
     - name: Check out source
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -26,11 +29,14 @@ jobs:
       uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
       env:
         GH_TOKEN: ${{ github.token }}
-    - name: Go version
-      shell: bash
-      run: go version
-    - name: Test
-      uses: ./.github/actions/test
+    - name: Check source
+      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      with:
+        target: lint-source
+    - name: Check project
+      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      with:
+        target: install test vuln
   release:
     name: Release
     needs: darwin

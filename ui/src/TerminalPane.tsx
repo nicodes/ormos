@@ -22,13 +22,17 @@ export default function TerminalPane(props: {
     let retry: ReturnType<typeof setTimeout> | undefined;
     let socket: WebSocket | undefined;
     let discovery: AbortController | undefined;
+    let replaying = true;
     const terminal = new Terminal({
-      cursorBlink: true, cursorStyle: "bar", fontSize: 14, scrollback: 5000,
+      cursorBlink: true, cursorStyle: "bar", fontSize: 14, scrollback: 100000,
       fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
       theme: { background: "#0b0f19", foreground: "#d1d5db", cursor: "#d1d5db", selectionBackground: "#374151" },
     });
     const fit = new FitAddon(); terminal.loadAddon(fit); terminal.open(container);
-    const output = createTerminalOutput((data, parsed) => terminal.write(data, parsed), () => terminal.reset());
+    const output = createTerminalOutput((data, parsed) => terminal.write(data, parsed), () => terminal.reset(), queueMicrotask, {
+      resize: size => terminal.resize(size.cols, size.rows),
+      ready: () => { replaying = false; resize.reconnect(); },
+    });
     const textarea = terminal.textarea!;
     const touchKeyboard = () => window.matchMedia("(pointer: coarse)").matches;
     const dismissKeyboard = () => {
@@ -106,22 +110,23 @@ export default function TerminalPane(props: {
       transportInput.send(data);
     };
     const resize = createTerminalResize(() => {
-      if (!container.clientWidth || !container.clientHeight) return;
+      if (replaying || !container.clientWidth || !container.clientHeight) return;
       fit.fit();
       return { cols: terminal.cols, rows: terminal.rows };
     }, size => send({ type: "resize", ...size }));
     const connect = () => {
       clearTimeout(retry);
       const current = ++generation;
+      replaying = true;
       socket?.close(); props.onStatus("Connecting");
       const url = new URL(`/api/terminal/${props.id}/ws`, location.href);
       url.searchParams.set("flow", "1");
       url.searchParams.set("input", "1");
+      url.searchParams.set("geometry", "1");
       const offset = output.offset();
       if (offset !== undefined) url.searchParams.set("since", String(offset));
       url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new WebSocket(url); socket = ws; ws.binaryType = "arraybuffer";
-      ws.onopen = () => { if (!disposed && current === generation) { resize.reconnect(); } };
       let replayStarted = false;
       ws.onmessage = event => {
         if (disposed || current !== generation) return;
@@ -136,7 +141,9 @@ export default function TerminalPane(props: {
               });
               transportInput.begin(message.inputWindow);
               props.onStatus("Connected");
-            } else if (message.type === "input-ack") transportInput.ack(message.bytes);
+            } else if (message.type === "size") output.resize(message);
+            else if (message.type === "replay-end") output.complete();
+            else if (message.type === "input-ack") transportInput.ack(message.bytes);
           } else if (event.data instanceof ArrayBuffer) {
             output.receive(new Uint8Array(event.data));
           }
@@ -147,6 +154,8 @@ export default function TerminalPane(props: {
       ws.onclose = () => {
         if (disposed || current !== generation) return;
         transportInput.disconnect();
+        output.disconnect();
+        replaying = true;
         props.onStatus("Disconnected");
         retry = setTimeout(async () => {
           const controller = new AbortController(); discovery = controller;
