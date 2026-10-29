@@ -1,4 +1,5 @@
 import type { Terminal } from "@xterm/xterm";
+import type { bindTerminalPixelScroll } from "./terminalPixelScroll";
 
 type Point = { x: number; y: number };
 
@@ -81,7 +82,7 @@ export function createTouchScroll(
   };
 }
 
-export function bindTerminalTouch(container: HTMLElement, terminal: Terminal) {
+export function bindTerminalTouch(container: HTMLElement, terminal: Terminal, pixelScroll: ReturnType<typeof bindTerminalPixelScroll>) {
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   const mode = () => `${terminal.buffer.active.type}/${terminal.modes.mouseTrackingMode}`;
   let gestureMode = "", lineHeight = 0, remainder = 0;
@@ -101,20 +102,18 @@ export function bindTerminalTouch(container: HTMLElement, terminal: Terminal) {
         deltaY: Math.sign(lines), clientX: point.x, clientY: point.y,
       }));
     } else {
-      const buffer = terminal.buffer.active;
-      if (pixels < 0 ? buffer.viewportY <= 0 : buffer.viewportY >= buffer.baseY) return false;
-      // xterm's public API renders whole rows. Carry fractional travel across
-      // frames rather than losing slow finger movement or using private APIs.
-      remainder += pixels;
-      const lines = Math.trunc(remainder / lineHeight);
-      remainder -= lines * lineHeight;
-      if (lines) terminal.scrollLines(lines);
+      return pixelScroll.scroll(pixels, lineHeight);
     }
     return true;
   }, { momentum: () => !reducedMotion.matches });
-  const stop = () => { identifier = undefined; remainder = 0; scroll.stop(); };
+  const cancel = () => { identifier = undefined; remainder = 0; scroll.stop(); };
+  const stop = () => { cancel(); pixelScroll.reset(); };
+  const pointer = (event: PointerEvent) => {
+    if (event.pointerType === "touch" && container.contains(event.target as Node)) cancel();
+    else stop();
+  };
   const start = (event: TouchEvent) => {
-    stop();
+    cancel();
     if (event.touches.length !== 1 || !visible() || (event.target as Element).closest(".scrollbar")) return;
     const height = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect().height;
     if (!height) return;
@@ -140,7 +139,7 @@ export function bindTerminalTouch(container: HTMLElement, terminal: Terminal) {
   container.addEventListener("touchcancel", stop);
   // Any new interaction takes over from a fling, including the toolbar and
   // tab/view controls outside this container. Synthetic app wheels are ours.
-  document.addEventListener("pointerdown", stop, true);
+  document.addEventListener("pointerdown", pointer, true);
   document.addEventListener("keydown", stop, true);
   document.addEventListener("paste", stop, true);
   document.addEventListener("wheel", wheel, { capture: true, passive: true });
@@ -150,12 +149,13 @@ export function bindTerminalTouch(container: HTMLElement, terminal: Terminal) {
     stop,
     dispose() {
       scroll.dispose();
+      pixelScroll.dispose();
       resize.dispose();
       container.removeEventListener("touchstart", start);
       container.removeEventListener("touchmove", move);
       container.removeEventListener("touchend", end);
       container.removeEventListener("touchcancel", stop);
-      document.removeEventListener("pointerdown", stop, true);
+      document.removeEventListener("pointerdown", pointer, true);
       document.removeEventListener("keydown", stop, true);
       document.removeEventListener("paste", stop, true);
       document.removeEventListener("wheel", wheel, true);
