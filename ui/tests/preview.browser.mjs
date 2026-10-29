@@ -581,6 +581,18 @@ print('PAINT_FINISHED', flush=True)
           return lines.length > 0 && !lines.includes('SCROLL_ROW_0200');
         }, null, { timeout: 3000 });
         assert.equal(await page.evaluate(() => window.scrollY), 0, 'Scrolling must stay inside the terminal');
+        if (touch) {
+          const first = await page.evaluate(() => Number(document.querySelector('.xterm-screen').textContent.match(/SCROLL_ROW_(\d+)/)?.[1]));
+          await page.waitForFunction(first => Number(document.querySelector('.xterm-screen').textContent.match(/SCROLL_ROW_(\d+)/)?.[1]) < first, first, { timeout: 1000 });
+          // A new toolbar interaction must stop a fling immediately, keeping
+          // the explicit bottom action stable while momentum would still run.
+          await page.getByRole('button', { name: 'Scroll to bottom', exact: true }).tap();
+          await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
+          await page.waitForTimeout(180);
+          assert(await page.locator('.xterm-screen').textContent().then(text => text.includes('SCROLL_ROW_0200')), 'Scroll to bottom must cancel touch momentum');
+          await scroll(240);
+          await page.waitForFunction(() => !document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
+        }
         await scroll(-240);
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
         await openKeyboard();
@@ -597,6 +609,13 @@ print('PAINT_FINISHED', flush=True)
         assert.equal(await quick.getByRole('button').count(), 9);
         const lastControl = await quick.getByRole('button', { name: 'More terminal keys', exact: true }).boundingBox();
         assert(lastControl.x + lastControl.width <= (touch ? 390 : 1440), 'Toolbar must fit the viewport');
+        await pressControl(quick.getByRole('button', { name: 'Scroll to bottom', exact: true }));
+        if (touch) {
+          await page.waitForTimeout(50); // Drain already-delivered app mouse reports.
+          const stopped = await appPosition();
+          await page.waitForTimeout(180);
+          assert.equal(await appPosition(), stopped, 'Toolbar interaction must stop application scroll momentum');
+        }
         // Inspect actual WebSocket input while the fixture has a raw PTY,
         // so Ctrl+C and Esc test their bytes without terminating a shell.
         await page.evaluate(() => {
