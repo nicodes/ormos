@@ -87,6 +87,59 @@ finally:
   }
   const browser = await chromium.launch();
   t.after(() => browser.close());
+  await t.test('touch scrollback moves by pixels across row boundaries without changing the PTY grid', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent('<div id="terminal" style="width:600px;height:180px;overflow:hidden"></div>');
+      await page.addStyleTag({ path: path.resolve('node_modules/@xterm/xterm/css/xterm.css') });
+      await page.addScriptTag({ path: path.resolve('node_modules/@xterm/xterm/lib/xterm.js') });
+      const helper = stripTypeScriptTypes(await readFile('src/terminalPixelScroll.ts', 'utf8')).replace('export function', 'function');
+      await page.addScriptTag({ content: helper + '; window.bindTerminalPixelScroll = bindTerminalPixelScroll;' });
+      const result = await page.evaluate(async () => {
+        const terminal = new Terminal({ cols: 30, rows: 6, fontSize: 14, theme: { foreground: '#d1d5db', background: '#0b0f19' } });
+        terminal.open(document.getElementById('terminal'));
+        const write = data => new Promise(resolve => terminal.write(data, resolve));
+        const frame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        await write(Array.from({ length: 100 }, (_, i) => `\x1b[31mROW_${String(i).padStart(4, '0')}\x1b[0m 界\r\n`).join(''));
+        terminal.scrollToLine(20); await frame();
+        const adapter = bindTerminalPixelScroll(terminal);
+        const screen = terminal.element.querySelector('.xterm-screen');
+        const height = screen.getBoundingClientRect().height / terminal.rows;
+        const samples = [];
+        let expected = 20 * height;
+        for (const pixels of [1, 1, 1, height - 2, 1, -1, -height, -0.5]) {
+          adapter.scroll(pixels, height); expected += pixels; await frame();
+          const offset = screen.style.transform ? -new DOMMatrixReadOnly(getComputedStyle(screen).transform).m42 : 0;
+          const actual = terminal.buffer.active.viewportY * height + offset;
+          const extra = terminal.element.querySelector('.terminal-overscan-row');
+          samples.push({ expected, actual, filledEdge: !offset || extra?.textContent.trimEnd() === terminal.buffer.active.getLine(terminal.buffer.active.viewportY + terminal.rows).translateToString(true) });
+        }
+        const extra = terminal.element.querySelector('.terminal-overscan-row');
+        const colorsPreserved = extra.querySelector('.xterm-fg-1') !== null;
+        const wideCell = [...extra.querySelectorAll('span')].find(span => span.textContent === '界');
+        const wideCellPreserved = Math.abs(parseFloat(wideCell.style.width) - screen.getBoundingClientRect().width / terminal.cols * 2) < 0.01;
+        const beforeOutput = screen.style.transform;
+        await write('LIVE_OUTPUT\r\n'); await frame();
+        const liveOutputPreservedOffset = screen.style.transform === beforeOutput;
+        const gridUnchanged = terminal.rows === 6 && terminal.cols === 30;
+        terminal.scrollToBottom(); await frame();
+        const bottomCleared = !screen.style.transform && !terminal.element.querySelector('.terminal-overscan-row');
+        adapter.scroll(-1, height); await frame();
+        terminal.resize(30, 7); await frame();
+        const resizeCleared = !screen.style.transform && !terminal.element.querySelector('.terminal-overscan-row');
+        adapter.scroll(-1, height); await frame();
+        await write('\x1b[?1049h'); await frame();
+        const alternateCleared = !screen.style.transform && !terminal.element.querySelector('.terminal-overscan-row');
+        adapter.dispose(); terminal.dispose();
+        return { samples, colorsPreserved, wideCellPreserved, liveOutputPreservedOffset, gridUnchanged, bottomCleared, resizeCleared, alternateCleared };
+      });
+      for (const sample of result.samples) {
+        assert(Math.abs(sample.expected - sample.actual) < 0.01, JSON.stringify(sample));
+        assert(sample.filledEdge, 'Fractional scrolling must fill the exposed bottom edge');
+      }
+      for (const [name, value] of Object.entries(result)) if (name !== 'samples') assert.equal(value, true, name);
+    } finally { await page.close(); }
+  });
   await t.test('history replays Codex-style cursor redraws at their original grids', async () => {
     const page = await browser.newPage();
     try {
@@ -575,6 +628,26 @@ print('PAINT_FINISHED', flush=True)
             await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
           } finally { await session.detach(); }
         };
+        if (touch) {
+          await page.emulateMedia({ reducedMotion: 'reduce' });
+          const session = await context.newCDPSession(page);
+          try {
+            await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+            await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + 25 }] });
+            await page.waitForFunction(() => !!document.querySelector('.xterm-screen').style.transform);
+            const before = await page.locator('.xterm-screen').evaluate(node => new DOMMatrixReadOnly(getComputedStyle(node).transform).m42);
+            await session.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: y + 27 }] });
+            await page.waitForFunction(before => Math.abs(new DOMMatrixReadOnly(getComputedStyle(document.querySelector('.xterm-screen')).transform).m42 - before - 2) < 0.01, before);
+            await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+            const offset = await page.locator('.xterm-screen').evaluate(node => node.style.transform);
+            await session.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
+            assert.equal(await page.locator('.xterm-screen').evaluate(node => node.style.transform), offset, 'Catching a fling must preserve its fractional position');
+            await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+            await page.screenshot({ path: path.join(artifacts, 'phone-fractional-scroll.png') });
+          } finally { await session.detach(); }
+          await page.getByRole('button', { name: 'Scroll to bottom', exact: true }).tap();
+          await page.emulateMedia({ reducedMotion: 'no-preference' });
+        }
         await scroll(240);
         await page.waitForFunction(() => {
           const lines = document.querySelector('.xterm-screen').textContent.match(/SCROLL_ROW_(\d+)/g) || [];
