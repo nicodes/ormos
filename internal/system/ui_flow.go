@@ -4,6 +4,7 @@ package system
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -76,19 +77,56 @@ func (f *uiOutputFlow) ack(count int) bool {
 
 // A slow browser consumes the shared bounded ring rather than a private queue
 // of output copies. PTY capture continues even if every browser is suspended.
-func (t *uiTerminal) streamOutput(ctx context.Context, conn *websocket.Conn, flow *uiOutputFlow, updates <-chan struct{}, cursor uint64) {
+func (t *uiTerminal) streamOutput(ctx context.Context, conn *websocket.Conn, flow *uiOutputFlow, updates <-chan struct{}, cursor, replayEnd uint64, replaySize *uiTerminalSize) {
+	geometry := replaySize != nil
+	replaying := geometry
+	control := func(message any) error {
+		data, err := json.Marshal(message)
+		if err != nil {
+			return err
+		}
+		writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return conn.Write(writeCtx, websocket.MessageText, data)
+	}
 	for {
 		available, err := flow.capacity(ctx)
 		if err != nil {
 			return
 		}
 		t.mu.Lock()
-		chunk, valid := t.replayChunk(cursor, min(available, uiOutputChunk))
+		limit := min(available, uiOutputChunk)
+		var size uiTerminalSize
+		if geometry {
+			size = t.sizeAt(cursor)
+			limit = t.geometryLimit(cursor, limit)
+			if replaying && cursor < replayEnd {
+				limit = min(limit, int(replayEnd-cursor))
+			}
+		}
+		chunk, valid := t.replayChunk(cursor, limit)
 		alive := t.alive
 		t.mu.Unlock()
 		if !valid {
 			conn.Close(websocket.StatusTryAgainLater, "terminal history expired; reconnect")
 			return
+		}
+		if geometry && (size.Cols != replaySize.Cols || size.Rows != replaySize.Rows) {
+			if err := control(struct {
+				Type string `json:"type"`
+				uiTerminalSize
+			}{"size", size}); err != nil {
+				return
+			}
+			*replaySize = size
+		}
+		if replaying && cursor >= replayEnd {
+			if err := control(struct {
+				Type string `json:"type"`
+			}{"replay-end"}); err != nil {
+				return
+			}
+			replaying = false
 		}
 		if len(chunk) == 0 {
 			if !alive {

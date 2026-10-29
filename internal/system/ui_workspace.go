@@ -134,6 +134,7 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 		}
 		since = &offset
 	}
+	geometry := r.URL.Query().Get("geometry") == "1" && flow != nil
 	// A retired terminal can still have a slow socket draining its tail. Count
 	// those sockets globally until their handlers finish, even after the PTY
 	// leaves the terminal table, so repeated open/kill cycles stay bounded.
@@ -201,6 +202,12 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 	// Subscribe and snapshot atomically, only after a successful upgrade.
 	var history []byte
 	offset, reset := term.replayStart(since)
+	replayEnd := term.end
+	var replaySize *uiTerminalSize
+	if geometry {
+		size := term.sizeAt(offset)
+		replaySize = &size
+	}
 	if flow != nil {
 		if term.updates == nil {
 			term.updates = map[chan struct{}]bool{}
@@ -227,12 +234,13 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 		inputWindow = uiInputWindow
 	}
 	metadata, _ := json.Marshal(struct {
-		Type        string `json:"type"`
-		Offset      uint64 `json:"offset"`
-		Reset       bool   `json:"reset"`
-		Window      int    `json:"window,omitempty"`
-		InputWindow int    `json:"inputWindow,omitempty"`
-	}{"replay", offset, reset, window, inputWindow})
+		Type        string          `json:"type"`
+		Offset      uint64          `json:"offset"`
+		Reset       bool            `json:"reset"`
+		Window      int             `json:"window,omitempty"`
+		InputWindow int             `json:"inputWindow,omitempty"`
+		Size        *uiTerminalSize `json:"size,omitempty"`
+	}{"replay", offset, reset, window, inputWindow, replaySize})
 	metaCtx, metaCancel := context.WithTimeout(ctx, 10*time.Second)
 	err = conn.Write(metaCtx, websocket.MessageText, metadata)
 	metaCancel()
@@ -242,7 +250,7 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		defer cancel()
 		if flow != nil {
-			term.streamOutput(ctx, conn, flow, updates, offset)
+			term.streamOutput(ctx, conn, flow, updates, offset, replayEnd, replaySize)
 			return
 		}
 		// Start reading input/resizes immediately while history is streamed.
@@ -313,7 +321,7 @@ func (s *uiServer) terminalWS(w http.ResponseWriter, r *http.Request) {
 				conn.Close(websocket.StatusPolicyViolation, "invalid terminal size")
 				return
 			}
-			if term.resize == nil || term.resize(msg.Cols, msg.Rows) != nil {
+			if term.setSize(msg.Cols, msg.Rows) != nil {
 				return
 			}
 		default:

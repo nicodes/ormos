@@ -7,6 +7,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { stripTypeScriptTypes } from 'node:module';
 import { chromium } from 'playwright';
 
 const listen = async handler => {
@@ -86,6 +87,51 @@ finally:
   }
   const browser = await chromium.launch();
   t.after(() => browser.close());
+  await t.test('history replays Codex-style cursor redraws at their original grids', async () => {
+    const page = await browser.newPage();
+    try {
+      await page.setContent('<div id="reference"></div><div id="replayed"></div><div id="legacy"></div>');
+      await page.addScriptTag({ path: path.resolve('node_modules/@xterm/xterm/lib/xterm.js') });
+      const helper = stripTypeScriptTypes(await readFile('src/terminalOutput.ts', 'utf8')).replace('export function', 'function');
+      await page.addScriptTag({ content: helper + '; window.createTerminalOutput = createTerminalOutput;' });
+      const result = await page.evaluate(async () => {
+        const make = (id, cols, rows) => {
+          const term = new Terminal({ cols, rows, scrollback: 100000 });
+          term.open(document.getElementById(id)); return term;
+        };
+        const reference = make('reference', 20, 6), replayed = make('replayed', 20, 12), legacy = make('legacy', 20, 12);
+        const write = (term, data) => new Promise(resolve => term.write(data, resolve));
+        const first = 'KEEP_ONCE\r\n012345678901234567890123456789\r\nSTATUS_OLD\r\n\x1b[2A\r\x1b[JFINAL\r\n';
+        const second = 'RESPONSE_ONCE_xxxxxxxxxxxxxxxx\r\n\x1b[1A\r\x1b[JRESPONSE_ONCE_xxxxxxxxxxxxxxxx\r\n';
+        await write(reference, first); reference.resize(40, 10);
+        await write(reference, second); reference.resize(20, 12);
+        await write(legacy, first + second);
+        let done;
+        const finished = new Promise(resolve => { done = resolve; });
+        const output = createTerminalOutput((data, parsed) => replayed.write(data, parsed), () => replayed.reset(), queueMicrotask, {
+          resize: size => replayed.resize(size.cols, size.rows),
+          ready: () => { replayed.resize(20, 12); done(); },
+        });
+        output.begin({ offset: 0, reset: true, size: { cols: 20, rows: 6 }, window: 262144 }, () => {});
+        output.receive(new TextEncoder().encode(first));
+        output.resize({ cols: 40, rows: 10 });
+        output.receive(new TextEncoder().encode(second));
+        output.complete(); await finished;
+        const lines = term => Array.from({ length: term.buffer.active.length }, (_, i) => term.buffer.active.getLine(i).translateToString(true)).join('\n').trimEnd();
+        const expected = lines(reference), actual = lines(replayed), wrongGrid = lines(legacy);
+        // More than the former 5,000-line cap, after the geometry comparison.
+        await write(replayed, 'EARLIEST_HISTORY\r\n' + 'retained line\r\n'.repeat(6000) + 'LATEST_HISTORY');
+        const retained = lines(replayed);
+        reference.dispose(); replayed.dispose(); legacy.dispose();
+        return { expected, actual, wrongGrid, earliest: retained.includes('EARLIEST_HISTORY'), latest: retained.includes('LATEST_HISTORY') };
+      });
+      assert.notEqual(result.wrongGrid, result.expected, 'Fixture must reproduce corruption from replaying at the current viewport size');
+      assert.equal(result.actual, result.expected, 'Grid changes must be applied between the corresponding parser writes');
+      assert.equal(result.actual.split('RESPONSE_ONCE_').length - 1, 1);
+      assert.equal(result.wrongGrid.split('RESPONSE_ONCE_').length - 1, 2, 'Wrong-grid replay must reproduce a duplicated response');
+      assert(result.earliest && result.latest, 'History beyond 5,000 display lines must remain available');
+    } finally { await page.close(); }
+  });
   await t.test('preview cold load avoids terminal code and cancels serial port polling', async () => {
     const context = await browser.newContext();
     try {
@@ -607,15 +653,15 @@ print('PAINT_FINISHED', flush=True)
         assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);
         await page.keyboard.type('q');
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('SCROLL_ROW_0200'));
-        // More than 64 KiB but fewer than 5,000 display lines: refresh must
+        // More than 5,000 display lines: refresh must
         // retain the earliest marker, not only the old tiny server replay.
         await openKeyboard();
-        await page.keyboard.type("printf '\\033c'; i=1; while [ \"$i\" -le 3000 ]; do printf 'HISTORY_%04d_abcdefghijklmnop\\n' \"$i\"; i=$((i+1)); done");
+        await page.keyboard.type("printf '\\033c'; i=1; while [ \"$i\" -le 6000 ]; do printf 'HISTORY_%04d_abcdefghijklmnop\\n' \"$i\"; i=$((i+1)); done");
         await page.keyboard.press('Enter');
-        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_6000'));
         await page.reload();
         await page.waitForFunction(() => document.querySelector('.status-dot.online'));
-        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_6000'));
         const moveScrollbar = async bottom => {
           const track = await page.locator('.xterm .scrollbar.vertical').boundingBox();
           const slider = await page.locator('.xterm .scrollbar.vertical .slider').boundingBox();
@@ -638,7 +684,7 @@ print('PAINT_FINISHED', flush=True)
         // Reconnect must also preserve the current scroll position.
         await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_0001'));
         await moveScrollbar(true);
-        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_3000'));
+        await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('HISTORY_6000'));
         await page.screenshot({ path: path.join(artifacts, `terminal-${touch ? 'phone' : 'desktop'}.png`) });
         // Saved commands and prompts share the compact row and editor actions.
         for (const kind of ['command', 'prompt']) {
