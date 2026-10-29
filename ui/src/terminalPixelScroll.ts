@@ -76,7 +76,11 @@ export function bindTerminalPixelScroll(terminal: Terminal) {
       }
       const next = Math.max(0, Math.min(buffer.baseY * height, position + pixels));
       const moved = next !== position;
-      position = next; expectedRow = Math.floor(position / height);
+      position = next;
+      // Multiplying and dividing fractional cell heights can land just below
+      // an integer (for example 7 * (590 / 43) / (590 / 43)). Keep exact row
+      // boundaries stable without rounding away meaningful pixel movement.
+      expectedRow = Math.floor(position / height + 1e-9);
       ownScroll = true;
       try { terminal.scrollToLine(expectedRow); } finally { ownScroll = false; }
       paint();

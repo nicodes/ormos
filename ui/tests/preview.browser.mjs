@@ -130,8 +130,15 @@ finally:
         adapter.scroll(-1, height); await frame();
         await write('\x1b[?1049h'); await frame();
         const alternateCleared = !screen.style.transform && !terminal.element.querySelector('.terminal-overscan-row');
+        await write('\x1b[?1049l'); await frame();
+        let fractionalGridStable = true;
+        for (const [row, fractionalHeight] of [[7, 590 / 43], [31, 52 / 3]]) {
+          terminal.scrollToLine(row); await frame(); adapter.reset();
+          adapter.scroll(0, fractionalHeight); await frame();
+          fractionalGridStable &&= terminal.buffer.active.viewportY === row && !screen.style.transform;
+        }
         adapter.dispose(); terminal.dispose();
-        return { samples, colorsPreserved, wideCellPreserved, liveOutputPreservedOffset, gridUnchanged, bottomCleared, resizeCleared, alternateCleared };
+        return { samples, colorsPreserved, wideCellPreserved, liveOutputPreservedOffset, gridUnchanged, bottomCleared, resizeCleared, alternateCleared, fractionalGridStable };
       });
       for (const sample of result.samples) {
         assert(Math.abs(sample.expected - sample.actual) < 0.01, JSON.stringify(sample));
