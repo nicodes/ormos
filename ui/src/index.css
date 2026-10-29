@@ -1,16 +1,16 @@
 @import "tailwindcss" source(none);
 @source "./";
 
-:root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #0b0f19; color: #f9fafb; }
+:root { --safe-area-bottom: env(safe-area-inset-bottom); height: 100%; overflow: hidden; color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #0b0f19; color: #f9fafb; }
 * { box-sizing: border-box; }
-body { margin: 0; }
+body { margin: 0; height: 100%; overflow: hidden; }
 [hidden] { display: none !important; }
 button, input { font: inherit; }
 button { border: 1px solid #374151; background: #1f2937; color: #d1d5db; border-radius: 6px; padding: 8px 11px; white-space: nowrap; cursor: pointer; }
 button:disabled { opacity: .4; cursor: default; }
 input { min-width: 0; width: 100%; border: 1px solid #374151; border-radius: 6px; background: #0b0f19; color: #f9fafb; padding: 7px 10px; font-size: 16px; }
 input:focus, button:focus-visible { outline: 2px solid #9ca3af; outline-offset: -2px; }
-.app { height: var(--viewport-height, 100dvh); display: flex; flex-direction: column; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+.app { position: fixed; top: var(--viewport-top, 0px); left: 0; width: 100%; height: var(--viewport-height, 100dvh); display: flex; flex-direction: column; padding: max(0px, calc(env(safe-area-inset-top) - var(--viewport-top, 0px))) env(safe-area-inset-right) max(0px, calc(var(--safe-area-bottom) - var(--viewport-bottom-occlusion, 0px))) env(safe-area-inset-left); }
 .error { display: flex; align-items: center; justify-content: space-between; padding: 6px 12px; font-size: 13px; color: #fca5a5; background: #351c25; flex: none; }
 .error button { border: 0; background: transparent; padding: 2px 8px; }
 .workspace { flex: 1; min-height: 0; display: flex; flex-direction: column; }
