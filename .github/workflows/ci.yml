@@ -29,7 +29,7 @@ jobs:
       with:
         persist-credentials: false
     - name: Set up locked komizo
-      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/setup@1b740f28682948a2d5eb4613744bb262d2056e6c
       env:
         GH_TOKEN: ${{ github.token }}
       timeout-minutes: 5
@@ -51,7 +51,7 @@ jobs:
         retention-days: 7
         include-hidden-files: true
     - name: Check project
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@1b740f28682948a2d5eb4613744bb262d2056e6c
       with:
         target: check
   macos:
@@ -66,15 +66,15 @@ jobs:
       with:
         persist-credentials: false
     - name: Set up locked komizo
-      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/setup@1b740f28682948a2d5eb4613744bb262d2056e6c
       env:
         GH_TOKEN: ${{ github.token }}
       timeout-minutes: 5
     - name: Check source
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@1b740f28682948a2d5eb4613744bb262d2056e6c
       with:
         target: lint-source
     - name: Check project
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@1b740f28682948a2d5eb4613744bb262d2056e6c
       with:
         target: install test vuln

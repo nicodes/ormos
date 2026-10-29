@@ -26,15 +26,15 @@ jobs:
     - name: Check out source
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up
-      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/setup@1b740f28682948a2d5eb4613744bb262d2056e6c
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Check source
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@1b740f28682948a2d5eb4613744bb262d2056e6c
       with:
         target: lint-source
     - name: Check project
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@1b740f28682948a2d5eb4613744bb262d2056e6c
       with:
         target: install test vuln
   release:
@@ -88,11 +88,11 @@ jobs:
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
     - name: Set up locked komizo
-      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/setup@1b740f28682948a2d5eb4613744bb262d2056e6c
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Check project
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@1b740f28682948a2d5eb4613744bb262d2056e6c
       with:
         target: check
       env:
