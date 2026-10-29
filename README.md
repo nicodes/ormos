@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 08ada67b864d12bf06a407a1111a212149d7bd8496a84ec5face9ebbc358f051 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: db5cfabd99ce5482073ddcec4662095e75b99849947e1ff16ec1f9c36442bf81 -->
 
 # ormos
 
@@ -8,26 +8,23 @@ Automatic localhost preview forwarding requires v0.2.3 or later. Older releases 
 
 ## Install and run
 
-Install the latest published prebuilt release on Linux or macOS (x86_64 or arm64):
+Linux and macOS (x86_64 or arm64), using prebuilt binaries:
+
+With curl:
 
 ```sh
 curl -fsSL https://ormos.dev/install | sh
 ```
 
-The installer detects your platform, checks the archive's SHA-256 digest and binary version, and installs to `~/.local/bin` without sudo. Go and Node.js are not needed. It adds the standard user bin directory to Bash/Zsh startup files when absent from PATH; open a new terminal afterward, or use `~/.local/bin/ormos` immediately. It does not start ormos, install a service, or change Tailscale configuration. Run the same command again to update; restart a running ormos process when ready to use the new binary.
-
-To pin a version or choose another writable directory:
+Or with mise:
 
 ```sh
-curl -fsSL https://ormos.dev/install | sh -s -- --version 0.2.1
-curl -fsSL https://ormos.dev/install | sh -s -- --install-dir "$HOME/bin"
+mise use --global github:nicodes/ormos@latest
 ```
 
-The short form is `-v 0.2.1`. Omitting a version uses `latest`; `--version latest` and `-v latest` also work. A leading `v` on a version is optional. Custom install directories must be on your PATH. The installer is also included in release assets starting with v0.2.0. The terminal UI requires v0.2.0 or later; automatic preview forwarding requires v0.2.3 or later. You can also manually extract a platform archive from [Releases](https://github.com/nicodes/ormos/releases), or use Go matching `go.mod` and `komizo.lock`:
+The shell installer detects your platform, checks the archive's SHA-256 digest and binary version, and installs to `~/.local/bin` without sudo. It adds the standard user bin directory to Bash/Zsh startup files when absent from PATH; open a new terminal afterward. Mise manages its own installation directory and PATH through its shell activation. Neither method requires Go or Node.js.
 
-```sh
-go install github.com/nicodes/ormos@latest
-```
+Installation does not start ormos, install a service, or change Tailscale configuration. Rerun your chosen installation command to update; restart a running ormos process when ready to use the new binary.
 
 Start the UI:
 
