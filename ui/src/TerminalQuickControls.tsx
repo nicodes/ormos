@@ -5,7 +5,7 @@ import { terminalKeys } from "./terminalKeys";
 const navigation = ["left", "up", "down", "right", "enter"].map(id => terminalKeys.find(key => key.id === id)!);
 const extra = terminalKeys.filter(key => !navigation.some(primary => primary.id === key.id));
 
-export default function TerminalQuickControls(props: { enabled: boolean; shifted: boolean; shift: () => void; keyboard: () => void; type: (data: string) => void }) {
+export default function TerminalQuickControls(props: { enabled: boolean; shifted: boolean; shift: () => void; keyboard: () => void; type: (data: string) => void; scrollToBottom: () => void }) {
   const [expanded, setExpanded] = createSignal(false);
   const keyButton = (key: typeof terminalKeys[number]) => <button type="button" class="quick-key" aria-label={key.name} title={key.name} disabled={!props.enabled} onPointerDown={event => event.preventDefault()} onClick={() => props.type(key.data)}><TerminalKeyIcon label={key.label} icon={"icon" in key ? key.icon : undefined} /></button>;
   return <div class="terminal-quick-controls" role="toolbar" aria-label="Quick terminal controls">
@@ -18,7 +18,9 @@ export default function TerminalQuickControls(props: { enabled: boolean; shifted
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 9 9h-5v9H8v-9H3Z" /></svg>
     </button></div>
     <div class="quick-key-group"><For each={navigation}>{keyButton}</For></div>
-    </div><button type="button" class="quick-key" aria-label={expanded() ? "Fewer terminal keys" : "More terminal keys"} title={expanded() ? "Fewer terminal keys" : "More terminal keys"} aria-expanded={expanded()} aria-controls="extra-terminal-keys" onPointerDown={event => event.preventDefault()} onClick={() => setExpanded(previous => !previous)}>
+    </div><button type="button" class="quick-key" aria-label="Scroll to bottom" title="Scroll to bottom" disabled={!props.enabled} onPointerDown={event => event.preventDefault()} onClick={props.scrollToBottom}>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 21h14" /></svg>
+    </button><button type="button" class="quick-key" aria-label={expanded() ? "Fewer terminal keys" : "More terminal keys"} title={expanded() ? "Fewer terminal keys" : "More terminal keys"} aria-expanded={expanded()} aria-controls="extra-terminal-keys" onPointerDown={event => event.preventDefault()} onClick={() => setExpanded(previous => !previous)}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d={expanded() ? "m6 9 6 6 6-6" : "m6 15 6-6 6 6"} /></svg>
     </button></div>
   </div>;

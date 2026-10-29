@@ -9,7 +9,7 @@ import { createTerminalInput } from "./terminalInput";
 import { createTerminalOutput } from "./terminalOutput";
 import { bindTerminalEdits } from "./terminalEdits";
 
-export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void };
+export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void; scrollToBottom: () => void };
 export default function TerminalPane(props: {
   id: string; onError: (message: string) => void; onStatus: (status: string) => void;
   register: (id: string, controls?: TerminalControls) => void;
@@ -176,7 +176,7 @@ export default function TerminalPane(props: {
       try { terminal.paste(data); } finally { pasting = false; }
     };
     const unbindEdits = bindTerminalEdits(container, textarea, type, paste);
-    props.register(props.id, { focus, keyboard, type, paste });
+    props.register(props.id, { focus, keyboard, type, paste, scrollToBottom: () => terminal.scrollToBottom() });
     connect();
     onCleanup(() => {
       disposed = true; generation++; clearTimeout(retry); discovery?.abort(); observer.disconnect(); resize.dispose(); output.dispose(); transportInput.dispose(); socket?.close();

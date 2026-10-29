@@ -166,7 +166,7 @@ export default function App() {
               </Show>
             </div>}</For>
           </div>
-          <TerminalQuickControls enabled={statuses()[active()] === "Connected"} shifted={shifted()} shift={() => setShifted(previous => !previous)} keyboard={() => controls.get(active())?.keyboard()} type={data => controls.get(active())?.type(data)} />
+          <TerminalQuickControls enabled={statuses()[active()] === "Connected"} shifted={shifted()} shift={() => setShifted(previous => !previous)} keyboard={() => controls.get(active())?.keyboard()} type={data => controls.get(active())?.type(data)} scrollToBottom={() => controls.get(active())?.scrollToBottom()} />
           </div>
           </section>
         </div>
