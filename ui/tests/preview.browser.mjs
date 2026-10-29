@@ -147,6 +147,62 @@ finally:
       for (const [name, value] of Object.entries(result)) if (name !== 'samples') assert.equal(value, true, name);
     } finally { await page.close(); }
   });
+  await t.test('phone toolbar follows keyboard viewport resizing and panning', async () => {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+    try {
+      await context.addInitScript(() => {
+        const viewport = new EventTarget();
+        let bounds = { height: undefined, top: 0, scale: 1 };
+        Object.defineProperties(viewport, {
+          height: { get: () => bounds.height ?? window.innerHeight },
+          offsetTop: { get: () => bounds.top },
+          scale: { get: () => bounds.scale },
+        });
+        window.testKeyboardViewport = (next, event = 'resize') => { bounds = { ...bounds, ...next }; viewport.dispatchEvent(new Event(event)); };
+        Object.defineProperty(window, 'visualViewport', { value: viewport });
+      });
+      const page = await context.newPage();
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      // Model a home-screen phone's persistent home-indicator inset. The
+      // browser emulator has no physical keyboard or safe-area obstruction.
+      await page.addStyleTag({ content: ':root { --safe-area-bottom: 34px; }' });
+      const toolbar = page.getByRole('toolbar', { name: 'Quick terminal controls' });
+      const bottom = async () => { const box = await toolbar.boundingBox(); return box.y + box.height; };
+      assert.equal(await bottom(), 810, 'Closed keyboard retains the home-indicator inset');
+      await toolbar.getByRole('button', { name: 'Keyboard', exact: true }).tap();
+      for (const bounds of [{ height: 600, top: 0 }, { height: 470, top: 0 }, { height: 430, top: 38 }]) {
+        await page.evaluate(bounds => window.testKeyboardViewport(bounds), bounds);
+        await page.waitForFunction(bottom => Math.abs(document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom - bottom) < 0.1, bounds.top + bounds.height);
+        const box = await toolbar.boundingBox();
+        assert(box.y >= bounds.top && box.height >= 44, 'The full toolbar stays above the keyboard');
+      }
+      await page.evaluate(() => window.testKeyboardViewport({ top: 64 }, 'scroll'));
+      assert.equal(await bottom(), 494, 'Viewport panning without resize moves the toolbar too');
+      await toolbar.getByRole('button', { name: 'More terminal keys', exact: true }).tap();
+      assert.equal(await bottom(), 494, 'Expanded keys grow upward from the keyboard edge');
+      assert(await page.locator('#extra-terminal-keys').isVisible());
+      assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true, 'Keyboard and quick controls retain terminal focus');
+      assert.equal(await page.evaluate(() => window.scrollY), 0, 'The document must not scroll behind the app');
+      await toolbar.getByRole('button', { name: 'Fewer terminal keys', exact: true }).tap();
+      await page.screenshot({ path: path.join(artifacts, 'phone-keyboard-viewport.png') });
+      await page.evaluate(() => window.testKeyboardViewport({ height: 844, top: 0 }));
+      assert.equal(await bottom(), 810, 'Closing the keyboard restores safe-area padding');
+      await page.evaluate(() => window.testKeyboardViewport({ height: 220, top: 70, scale: 2 }));
+      assert.equal(await bottom(), 810, 'Pinch zoom must not resize or reflow the app');
+      await page.evaluate(() => window.testKeyboardViewport({ height: 400, top: 20, scale: 1 }));
+      assert.equal(await bottom(), 420, 'Returning from zoom resumes viewport tracking');
+    } finally { await context.close(); }
+    const fallback = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    try {
+      await fallback.addInitScript(() => Object.defineProperty(window, 'visualViewport', { value: undefined }));
+      const page = await fallback.newPage();
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      await page.setViewportSize({ width: 390, height: 500 });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 500);
+    } finally { await fallback.close(); }
+  });
   await t.test('history replays Codex-style cursor redraws at their original grids', async () => {
     const page = await browser.newPage();
     try {

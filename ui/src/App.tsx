@@ -1,6 +1,7 @@
 import { createSignal, ErrorBoundary, lazy, For, onCleanup, onMount, Show } from "solid-js";
 import type { TerminalControls } from "./TerminalPane";
 import { readStorage, writeStorage } from "./storage";
+import { bindAppViewport } from "./viewport";
 import PreviewPane from "./PreviewPane";
 import TerminalQuickControls from "./TerminalQuickControls";
 import TerminalMenu from "./TerminalMenu";
@@ -95,9 +96,7 @@ export default function App() {
     // defer both rendering and this download until the view is requested.
     if (view() === "terminal") preloadTerminal();
     const discovery = new AbortController();
-    const viewport = window.visualViewport;
-    const updateHeight = () => document.documentElement.style.setProperty("--viewport-height", `${viewport?.height ?? window.innerHeight}px`);
-    viewport?.addEventListener("resize", updateHeight); updateHeight();
+    const unbindViewport = bindAppViewport();
     void (async () => {
       try {
         const terminals = await request<{ terminals: TerminalRow[] }>("/api/terminals", undefined, discovery.signal);
@@ -113,7 +112,7 @@ export default function App() {
         if (!retained.length && view() === "terminal") await addTerminal(); else persist();
       } catch (e) { if (!disposed) { setError(String(e)); setBusy(false); } }
     })();
-    onCleanup(() => { disposed = true; discovery.abort(); viewport?.removeEventListener("resize", updateHeight); });
+    onCleanup(() => { disposed = true; discovery.abort(); unbindViewport(); });
   });
   return (
     <main class="app">
