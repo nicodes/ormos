@@ -203,6 +203,49 @@ finally:
       await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 500);
     } finally { await fallback.close(); }
   });
+  await t.test('Android keyboard geometry keeps controls above an overreported viewport', async () => {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+    try {
+      await context.addInitScript(() => {
+        const viewport = new EventTarget(), keyboard = new EventTarget();
+        let bounds = { height: 844, top: 0, scale: 1 };
+        keyboard.overlaysContent = false; keyboard.boundingRect = new DOMRect();
+        Object.defineProperties(viewport, { height: { get: () => bounds.height }, offsetTop: { get: () => bounds.top }, scale: { get: () => bounds.scale } });
+        Object.defineProperty(window, 'visualViewport', { value: viewport });
+        Object.defineProperty(navigator, 'virtualKeyboard', { value: keyboard });
+        window.testAndroidKeyboard = {
+          viewport(next) { bounds = { ...bounds, ...next }; viewport.dispatchEvent(new Event('resize')); },
+          keyboard(top) { keyboard.boundingRect = top ? new DOMRect(0, top, 390, 844 - top) : new DOMRect(); keyboard.dispatchEvent(new Event('geometrychange')); },
+        };
+      });
+      const page = await context.newPage(); await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      assert((await page.locator('meta[name="viewport"]').getAttribute('content')).includes('interactive-widget=resizes-content'));
+      assert.equal(await page.evaluate(() => navigator.virtualKeyboard.overlaysContent), true);
+      await page.addStyleTag({ content: ':root { --safe-area-bottom: 24px; }' });
+      const toolbar = page.getByRole('toolbar', { name: 'Quick terminal controls' });
+      const bottom = () => toolbar.evaluate(node => node.getBoundingClientRect().bottom);
+      assert.equal(await bottom(), 820);
+      await toolbar.getByRole('button', { name: 'Keyboard', exact: true }).tap();
+      // No viewport event accompanies this keyboard event. Its top is 24px
+      // above the viewport bottom: the overlap the old test couldn't model.
+      await page.evaluate(() => { window.testAndroidKeyboard.viewport({ height: 500 }); window.testAndroidKeyboard.keyboard(476); });
+      assert.equal(await bottom(), 476, 'Use the actual keyboard top, not the overreported viewport bottom');
+      await toolbar.getByRole('button', { name: 'More terminal keys', exact: true }).tap();
+      assert.equal(await bottom(), 476, 'Expanded keys stay above the keyboard too');
+      assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);
+      await page.evaluate(() => window.testAndroidKeyboard.viewport({ height: 476 }));
+      assert.equal(await bottom(), 476, 'Do not subtract keyboard height twice when the viewport already shrank');
+      await page.evaluate(() => window.testAndroidKeyboard.viewport({ height: 844 }));
+      await page.evaluate(() => window.testAndroidKeyboard.keyboard(440));
+      assert.equal(await bottom(), 440, 'A geometry-only update must follow changing keyboard height');
+      await page.evaluate(() => window.testAndroidKeyboard.viewport({ height: 500, scale: 1.25 }));
+      assert.equal(await bottom(), 440, 'Page zoom must not suppress keyboard avoidance');
+      await page.evaluate(() => window.testAndroidKeyboard.keyboard(0));
+      assert.equal(await bottom(), 820, 'Closing the keyboard while zoomed restores the safe layout');
+      await page.screenshot({ path: path.join(artifacts, 'android-keyboard-geometry.png') });
+    } finally { await context.close(); }
+  });
   await t.test('history replays Codex-style cursor redraws at their original grids', async () => {
     const page = await browser.newPage();
     try {
