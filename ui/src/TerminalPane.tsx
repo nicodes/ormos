@@ -8,6 +8,7 @@ import { createTerminalResize } from "./terminalResize";
 import { createTerminalInput } from "./terminalInput";
 import { createTerminalOutput } from "./terminalOutput";
 import { bindTerminalEdits } from "./terminalEdits";
+import { bindTerminalTouch } from "./terminalTouch";
 
 export type TerminalControls = { focus: () => void; keyboard: () => void; type: (data: string) => void; paste: (data: string) => void; scrollToBottom: () => void };
 export default function TerminalPane(props: {
@@ -40,8 +41,9 @@ export default function TerminalPane(props: {
       textarea.readOnly = touchKeyboard();
     };
     dismissKeyboard();
-    const focus = () => { dismissKeyboard(); terminal.focus(); };
+    const focus = () => { touchScroll.stop(); dismissKeyboard(); terminal.focus(); };
     const keyboard = () => {
+      touchScroll.stop();
       // A fresh focus inside the button's user gesture opens mobile keyboards.
       textarea.blur(); textarea.readOnly = false; textarea.inputMode = "text";
       terminal.focus();
@@ -52,49 +54,7 @@ export default function TerminalPane(props: {
     };
     textarea.addEventListener("blur", dismissKeyboard);
     container.addEventListener("pointerdown", touchPointer, true);
-    // xterm handles wheels, but its custom viewport does not handle touch swipes.
-    // Reuse xterm's wheel handling for apps that own scrolling/mouse input.
-    // Ordinary shell swipes only scroll the local buffer.
-    let touch: { x: number; y: number; scrolling: boolean } | undefined;
-    const touchStart = (event: TouchEvent) => {
-      touch = event.touches.length === 1
-        ? { x: event.touches[0].clientX, y: event.touches[0].clientY, scrolling: false }
-        : undefined;
-    };
-    const touchEnd = () => { touch = undefined; };
-    const touchMove = (event: TouchEvent) => {
-      if (!touch || event.touches.length !== 1) {
-        touchEnd(); return;
-      }
-      const point = event.touches[0];
-      const distance = point.clientY - touch.y;
-      if (!touch.scrolling) {
-        if (Math.abs(distance) < 8) return;
-        if (Math.abs(point.clientX - touch.x) > Math.abs(distance)) { touchEnd(); return; }
-        touch.scrolling = true;
-      }
-      event.preventDefault();
-      const height = terminal.element?.querySelector(".xterm-screen")?.getBoundingClientRect().height;
-      if (!height) return;
-      const lineHeight = height / terminal.rows;
-      const lines = Math.trunc(distance / lineHeight);
-      if (lines) {
-        if (terminal.buffer.active.type === "alternate" || terminal.modes.mouseTrackingMode !== "none") {
-          const screen = terminal.element?.querySelector(".xterm-screen");
-          for (let i = 0; i < Math.abs(lines); i++) {
-            screen?.dispatchEvent(new WheelEvent("wheel", {
-              bubbles: true, cancelable: true, deltaMode: WheelEvent.DOM_DELTA_LINE,
-              deltaY: -Math.sign(lines), clientX: point.clientX, clientY: point.clientY,
-            }));
-          }
-        } else terminal.scrollLines(-lines);
-        touch.y += lines * lineHeight;
-      }
-    };
-    container.addEventListener("touchstart", touchStart, { passive: true });
-    container.addEventListener("touchmove", touchMove, { passive: false });
-    container.addEventListener("touchend", touchEnd);
-    container.addEventListener("touchcancel", touchEnd);
+    const touchScroll = bindTerminalTouch(container, terminal);
     const send = (message: object) => {
       if (socket?.readyState !== WebSocket.OPEN) return false;
       socket.send(JSON.stringify(message));
@@ -113,7 +73,7 @@ export default function TerminalPane(props: {
       if (replaying || !container.clientWidth || !container.clientHeight) return;
       fit.fit();
       return { cols: terminal.cols, rows: terminal.rows };
-    }, size => send({ type: "resize", ...size }));
+    }, size => { touchScroll.stop(); return send({ type: "resize", ...size }); });
     const connect = () => {
       clearTimeout(retry);
       const current = ++generation;
@@ -135,7 +95,7 @@ export default function TerminalPane(props: {
             const message = JSON.parse(event.data);
             if (message.type === "replay") {
               if (replayStarted) throw new Error("Duplicate terminal replay");
-              replayStarted = true;
+              replayStarted = true; touchScroll.stop();
               output.begin(message, bytes => {
                 if (!disposed && current === generation && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ack", bytes }));
               });
@@ -153,7 +113,7 @@ export default function TerminalPane(props: {
       };
       ws.onclose = () => {
         if (disposed || current !== generation) return;
-        transportInput.disconnect();
+        touchScroll.stop(); transportInput.disconnect();
         output.disconnect();
         replaying = true;
         props.onStatus("Disconnected");
@@ -176,14 +136,11 @@ export default function TerminalPane(props: {
       try { terminal.paste(data); } finally { pasting = false; }
     };
     const unbindEdits = bindTerminalEdits(container, textarea, type, paste);
-    props.register(props.id, { focus, keyboard, type, paste, scrollToBottom: () => terminal.scrollToBottom() });
+    props.register(props.id, { focus, keyboard, type, paste, scrollToBottom: () => { touchScroll.stop(); terminal.scrollToBottom(); } });
     connect();
     onCleanup(() => {
       disposed = true; generation++; clearTimeout(retry); discovery?.abort(); observer.disconnect(); resize.dispose(); output.dispose(); transportInput.dispose(); socket?.close();
-      container.removeEventListener("touchstart", touchStart);
-      container.removeEventListener("touchmove", touchMove);
-      container.removeEventListener("touchend", touchEnd);
-      container.removeEventListener("touchcancel", touchEnd);
+      touchScroll.dispose();
       textarea.removeEventListener("blur", dismissKeyboard);
       container.removeEventListener("pointerdown", touchPointer, true);
       unbindEdits(); input.dispose(); terminal.dispose(); props.register(props.id);
