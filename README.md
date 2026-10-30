@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: ab1b9fa45f9c1753051ec1eb75041037428285e466ba13decc566c5f5b9351c5 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: d4095fd0fe07926197b29e461f1d7ea9d75afef21460ded7ad67ae8146f5e6d8 -->
 
 # ormos
 
@@ -82,3 +82,16 @@ Terminal content fills the pane between the shared header and a bottom quick-con
 Before loading an app, ormos prepares its forwarding route and the browser makes a credential-free HEAD reachability check, bounded by a 20-second overall timeout. Failure shows a centered “App unavailable” title and a short subtitle identifying the next step. This check does not certify that embedding is permitted; use Open in new tab if the app blocks iframes. Refresh checks the address again and reloads it. Navigation history retains up to 200 entered addresses; recent history retains 50 unique entries.
 
 The terminal uses a blinking light-gray vertical-bar cursor.
+
+## Contributor verification
+
+Tool versions and native tasks live in `mise.toml`. Prepare the pinned helper source and run the complete gate:
+
+```sh
+git clone https://github.com/nicodes/tools.git .ci-tools
+git -C .ci-tools checkout --detach 091101094fedf5ce2e67c339c1c9c842d6a662dc
+mise install
+mise run check
+```
+
+Native build and test commands retain source and output checks, with receipts in `.artifacts/verification`. Existing product release rules and artifacts remain owned by this repository. End users install the product’s published distribution.
