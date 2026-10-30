@@ -31,9 +31,10 @@ export function bindAppViewport() {
     const { top } = bounds;
     const bottom = keyboardVisible ? Math.min(top + bounds.height, rect.top) : top + bounds.height;
     const height = Math.max(0, bottom - top);
-    // The docked keyboard already covers the navigation safe area. Subtract
-    // the actual occlusion once, rather than adding that inset above it too.
-    const occluded = Math.max(0, document.documentElement.clientHeight - bottom);
+    // Native viewport clipping already consumes the system inset. An overlay
+    // keyboard does not: preserve the browser-reported safe area above its
+    // bounds. Using the keyboard-clamped bottom here erased that padding.
+    const occluded = Math.max(0, document.documentElement.clientHeight - (top + bounds.height));
     style.setProperty("--viewport-height", `${height}px`);
     style.setProperty("--viewport-top", `${top}px`);
     style.setProperty("--viewport-bottom-occlusion", `${occluded}px`);

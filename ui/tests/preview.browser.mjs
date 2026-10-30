@@ -238,12 +238,52 @@ finally:
       assert.equal(await bottom(), 476, 'Do not subtract keyboard height twice when the viewport already shrank');
       await page.evaluate(() => window.testAndroidKeyboard.viewport({ height: 844 }));
       await page.evaluate(() => window.testAndroidKeyboard.keyboard(440));
-      assert.equal(await bottom(), 440, 'A geometry-only update must follow changing keyboard height');
+      assert.equal(await bottom(), 416, 'Overlay geometry must retain the 24px system inset when the viewport is full height');
       await page.evaluate(() => window.testAndroidKeyboard.viewport({ height: 500, scale: 1.25 }));
       assert.equal(await bottom(), 440, 'Page zoom must not suppress keyboard avoidance');
       await page.evaluate(() => window.testAndroidKeyboard.keyboard(0));
       assert.equal(await bottom(), 820, 'Closing the keyboard while zoomed restores the safe layout');
       await page.screenshot({ path: path.join(artifacts, 'android-keyboard-geometry.png') });
+    } finally { await context.close(); }
+  });
+  await t.test('Android overlay keyboard preserves the system safe area above the keyboard', async () => {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+    try {
+      const page = await context.newPage(), cdp = await context.newCDPSession(page);
+      await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 24 } });
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      const toolbar = page.getByRole('toolbar', { name: 'Quick terminal controls' });
+      const bottom = () => toolbar.evaluate(node => node.getBoundingClientRect().bottom);
+      assert.equal(await bottom(), 820);
+      await toolbar.getByRole('button', { name: 'Keyboard', exact: true }).tap();
+      await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 500, width: 390, height: 344 } });
+      await page.waitForFunction(() => navigator.virtualKeyboard.boundingRect.top === 500 && document.documentElement.style.getPropertyValue('--viewport-height') === '500px');
+      // Model the screenshot: Android's system inset puts the physical
+      // keyboard 24px above the reported overlay boundary. The old code put
+      // the 49px toolbar at y=500, leaving its bottom half behind this layer.
+      await page.evaluate(() => {
+        const keyboard = document.createElement('div'); keyboard.id = 'physical-keyboard';
+        keyboard.style.cssText = 'position:fixed;top:476px;bottom:0;left:0;right:0;z-index:100;background:#30271b;color:white;padding:12px';
+        keyboard.textContent = 'Android keyboard area'; document.body.append(keyboard);
+      });
+      assert.equal(await bottom(), 476, 'The keyboard overlay must not consume the navigation safe area');
+      assert.equal(await page.locator('.app').evaluate(node => getComputedStyle(node).paddingBottom), '24px');
+      const key = toolbar.getByRole('button', { name: 'More terminal keys', exact: true });
+      const box = await key.boundingBox();
+      assert(await page.evaluate(({x,y}) => !!document.elementFromPoint(x,y)?.closest('button'), { x: box.x + box.width / 2, y: box.y + box.height - 1 }), 'The entire bottom of the key must remain reachable');
+      await key.tap(); assert.equal(await bottom(), 476);
+      assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);
+      await page.screenshot({ path: path.join(artifacts, 'android-keyboard-safe-area.png') });
+      await page.evaluate(() => document.querySelector('#physical-keyboard').style.top = '500px');
+      await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 0 } });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 500);
+      assert.equal(await bottom(), 500, 'A browser-reported zero inset must not introduce an artificial gap');
+      await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 0, width: 0, height: 0 } });
+      await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 24 } });
+      await page.evaluate(() => document.querySelector('#physical-keyboard').remove());
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 820);
+      await cdp.detach();
     } finally { await context.close(); }
   });
   await t.test('history replays Codex-style cursor redraws at their original grids', async () => {
