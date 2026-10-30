@@ -26,15 +26,15 @@ jobs:
     - name: Check out source
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up
-      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/setup@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Check source
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
       with:
         target: lint-source
     - name: Check project
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
       with:
         target: install test vuln
   release:
@@ -88,11 +88,11 @@ jobs:
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
     - name: Set up locked komizo
-      uses: nicodes/komizo/setup@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/setup@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Check project
-      uses: nicodes/komizo/run@40086036977a5fc0119d6c4c1d5eb6ae3ab3b4b9
+      uses: nicodes/komizo/run@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
       with:
         target: check
       env:
@@ -122,11 +122,11 @@ jobs:
   publish:
     name: Publish release
     needs: release
-    uses: nicodes/tools/.github/workflows/cli-publish.yml@a404cbcef2a2ccfb7a9aa1961f5d893e0c31ad42
+    uses: nicodes/tools/.github/workflows/cli-publish.yml@9590742a455154ac5967a67952c5758d79d476b9
     permissions:
       contents: write
     with:
-      tools-ref: 'a404cbcef2a2ccfb7a9aa1961f5d893e0c31ad42'
+      tools-ref: '9590742a455154ac5967a67952c5758d79d476b9'
       binary: ormos
       tag: ${{ needs.release.outputs.tag }}
       artifact-id: ${{ needs.release.outputs.artifact-id }}
