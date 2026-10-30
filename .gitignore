@@ -10,7 +10,4 @@ __pycache__/
 /.artifacts/
 
 .artifacts/
-
-.komizo.mise*.toml
-
-.komizo.mise*.lock
+/.ci-tools/

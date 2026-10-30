@@ -25,18 +25,22 @@ jobs:
     steps:
     - name: Check out source
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-    - name: Set up
-      uses: nicodes/komizo/setup@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
+    - name: Set up development tools
+      uses: nicodes/tools/setup@091101094fedf5ce2e67c339c1c9c842d6a662dc
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Check source
-      uses: nicodes/komizo/run@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
-      with:
-        target: lint-source
+      shell: bash
+      run: |-
+        set -euo pipefail
+        mise run lint-source
     - name: Check project
-      uses: nicodes/komizo/run@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
-      with:
-        target: install test vuln
+      shell: bash
+      run: |-
+        set -euo pipefail
+        mise run install
+        mise run test
+        mise run vuln
   release:
     name: Release
     needs: darwin
@@ -56,7 +60,7 @@ jobs:
       id: release
       env:
         BUMP: ${{ inputs.bump }}
-      run: |
+      run: |-
         set -euo pipefail
         if [ "$GITHUB_REF" != "refs/heads/main" ]; then
           echo 'Run releases from the main branch.' >&2
@@ -87,17 +91,18 @@ jobs:
         fi
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
-    - name: Set up locked komizo
-      uses: nicodes/komizo/setup@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
+    - name: Set up development tools
+      uses: nicodes/tools/setup@091101094fedf5ce2e67c339c1c9c842d6a662dc
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Check project
-      uses: nicodes/komizo/run@2ca94e2fd4bb05f41bb228e9c366e5cc733c75e6
-      with:
-        target: check
       env:
         VERSION: ${{ steps.release.outputs.version }}
         MISE_GITHUB_TOKEN: ${{ github.token }}
+      shell: bash
+      run: |-
+        set -euo pipefail
+        mise run check
     - name: Attest build provenance
       uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
       with:
@@ -122,11 +127,11 @@ jobs:
   publish:
     name: Publish release
     needs: release
-    uses: nicodes/tools/.github/workflows/cli-publish.yml@9590742a455154ac5967a67952c5758d79d476b9
+    uses: nicodes/tools/.github/workflows/cli-publish.yml@091101094fedf5ce2e67c339c1c9c842d6a662dc
     permissions:
       contents: write
     with:
-      tools-ref: '9590742a455154ac5967a67952c5758d79d476b9'
+      tools-ref: 091101094fedf5ce2e67c339c1c9c842d6a662dc
       binary: ormos
       tag: ${{ needs.release.outputs.tag }}
       artifact-id: ${{ needs.release.outputs.artifact-id }}
