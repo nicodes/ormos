@@ -286,6 +286,44 @@ finally:
       await cdp.detach();
     } finally { await context.close(); }
   });
+  await t.test('layout report is opt-in, preserves keyboard focus and excludes terminal content', async () => {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+    try {
+      await context.addInitScript(() => Object.defineProperty(navigator, 'clipboard', { value: { writeText: async text => { window.testCopiedLayout = text; } } }));
+      const page = await context.newPage(), requests = [];
+      page.on('request', request => requests.push({ url: request.url(), method: request.method() }));
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      assert.equal(await page.getByRole('button', { name: 'Copy keyboard layout report', exact: true }).count(), 0);
+      assert(!requests.some(request => request.url.includes('viewportReport-')), 'Normal loads do not fetch diagnostics');
+      await page.goto(origin + '/?layout-report=1');
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      const copy = page.getByRole('button', { name: 'Copy keyboard layout report', exact: true });
+      await copy.waitFor();
+      await page.getByRole('toolbar', { name: 'Quick terminal controls' }).getByRole('button', { name: 'Keyboard', exact: true }).tap();
+      await page.keyboard.type("printf REPORT_PRIVATE_SENTINEL"); await page.keyboard.press('Enter');
+      await page.waitForFunction(() => document.querySelector('.xterm-screen').textContent.includes('REPORT_PRIVATE_SENTINEL'));
+      const cdp = await context.newCDPSession(page);
+      await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 24 } });
+      await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 500, width: 390, height: 344 } });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 476);
+      const before = await page.locator('.terminal-quick-controls').boundingBox();
+      const posts = requests.filter(request => request.method === 'POST').length;
+      await copy.tap();
+      await page.waitForFunction(() => window.testCopiedLayout);
+      const raw = await page.evaluate(() => window.testCopiedLayout), report = JSON.parse(raw);
+      assert.equal(report.marker, 'ormos-keyboard-layout-report-1');
+      assert.equal(report.current.safeArea.bottom, 24);
+      assert.equal(report.current.keyboard.bounds.top, 500);
+      assert.equal(report.current.toolbar.bottom, 476);
+      assert.equal(report.current.focused.tag, 'TEXTAREA');
+      assert(!raw.includes('REPORT_PRIVATE_SENTINEL'), 'Reports exclude terminal output and input values');
+      assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);
+      assert.deepEqual(await page.locator('.terminal-quick-controls').boundingBox(), before, 'Copying a report must not change toolbar geometry');
+      assert.equal(requests.filter(request => request.method === 'POST').length, posts, 'Reports are not uploaded');
+      await cdp.detach();
+    } finally { await context.close(); }
+  });
   await t.test('history replays Codex-style cursor redraws at their original grids', async () => {
     const page = await browser.newPage();
     try {
