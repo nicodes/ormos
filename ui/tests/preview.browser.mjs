@@ -277,8 +277,8 @@ finally:
       await page.screenshot({ path: path.join(artifacts, 'android-keyboard-safe-area.png') });
       await page.evaluate(() => document.querySelector('#physical-keyboard').style.top = '500px');
       await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 0 } });
-      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 500);
-      assert.equal(await bottom(), 500, 'A browser-reported zero inset must not introduce an artificial gap');
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 476);
+      assert.equal(await bottom(), 476, 'A transient zero must retain the measured closed-keyboard inset');
       await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 0, width: 0, height: 0 } });
       await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 24 } });
       await page.evaluate(() => document.querySelector('#physical-keyboard').remove());
@@ -321,6 +321,52 @@ finally:
       assert.equal(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node), true);
       assert.deepEqual(await page.locator('.terminal-quick-controls').boundingBox(), before, 'Copying a report must not change toolbar geometry');
       assert.equal(requests.filter(request => request.method === 'POST').length, posts, 'Reports are not uploaded');
+      await cdp.detach();
+    } finally { await context.close(); }
+  });
+  await t.test('Chrome clearing both insets on keyboard open retains the measured closed inset', async () => {
+    const context = await browser.newContext({ viewport: { width: 448, height: 875 }, hasTouch: true, isMobile: true });
+    try {
+      const page = await context.newPage(), cdp = await context.newCDPSession(page);
+      await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 24, bottomMax: 24 } });
+      await page.goto(origin);
+      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      const toolbar = page.getByRole('toolbar', { name: 'Quick terminal controls' });
+      const bottom = () => toolbar.evaluate(node => node.getBoundingClientRect().bottom);
+      assert.equal(await bottom(), 851);
+      // The real report shows both insets becoming zero. Clear them before
+      // geometrychange too, covering Chrome's transition ordering.
+      await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 0, bottomMax: 0 } });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 875);
+      await toolbar.getByRole('button', { name: 'Keyboard', exact: true }).tap();
+      await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 524, width: 448, height: 351 } });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 500);
+      assert.equal(await page.locator('.app').evaluate(node => getComputedStyle(node).paddingBottom), '24px');
+      await page.evaluate(() => {
+        const layer = document.createElement('div'); layer.id = 'physical-keyboard';
+        layer.style.cssText = 'position:fixed;top:500px;bottom:0;left:0;right:0;z-index:100;background:#30271b;color:white;padding:12px';
+        layer.textContent = 'Android keyboard area'; document.body.append(layer);
+      });
+      await toolbar.getByRole('button', { name: 'More terminal keys', exact: true }).tap();
+      assert.equal(await bottom(), 500);
+      assert(await page.locator('.xterm-helper-textarea').evaluate(node => document.activeElement === node));
+      await page.screenshot({ path: path.join(artifacts, 'android-cleared-inset.png') });
+      await page.evaluate(() => document.querySelector('#physical-keyboard').remove());
+      await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 0, width: 0, height: 0 } });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 875);
+      // A new width has no measured inset: do not carry portrait padding
+      // into a genuinely zero-inset viewport.
+      await page.setViewportSize({ width: 480, height: 875 });
+      await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 524, width: 480, height: 351 } });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 524);
+      await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 0, width: 0, height: 0 } });
+      // A CSS inset change without a viewport event must be observed.
+      await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 24, bottomMax: 24 } });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 851);
+      await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+      await cdp.send('Emulation.setSafeAreaInsetsOverride', { insets: { bottom: 0, bottomMax: 0 } });
+      await cdp.send('Emulation.setVirtualKeyboardGeometryOverride', { keyboardRect: { x: 0, y: 524, width: 480, height: 351 } });
+      await page.waitForFunction(() => document.querySelector('.terminal-quick-controls').getBoundingClientRect().bottom === 500);
       await cdp.detach();
     } finally { await context.close(); }
   });

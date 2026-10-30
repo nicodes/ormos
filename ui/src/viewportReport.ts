@@ -34,7 +34,7 @@ export function installViewportReport() {
       safeArea: insets(safe), maximumSafeArea: insets(maximum), keyboardInsets: insets(keyboardInset),
       app: rect(app), toolbar: rect(bar),
       paddingBottom: appStyle?.paddingBottom,
-      viewportVariables: ["--viewport-height", "--viewport-top", "--viewport-bottom-occlusion", "--safe-area-bottom"].map(name => [name, getComputedStyle(document.documentElement).getPropertyValue(name)]),
+      viewportVariables: ["--viewport-height", "--viewport-top", "--viewport-bottom-occlusion", "--safe-area-bottom", "--keyboard-safe-area-bottom"].map(name => [name, getComputedStyle(document.documentElement).getPropertyValue(name)]),
       focused: focused ? { tag: focused.tagName, bounds: rect(focused), fontSize: getComputedStyle(focused).fontSize, inputMode: focused instanceof HTMLElement ? focused.inputMode : undefined, readOnly: focused instanceof HTMLTextAreaElement ? focused.readOnly : undefined } : null,
     };
   };
