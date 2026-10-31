@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export GOTOOLCHAIN=local
 export VERSION="${VERSION:-dev}"
 set -euo pipefail
 tmp="$(mktemp -d)"
@@ -11,16 +10,6 @@ tar -xzf "dist/ormos_${os_label}_${arch_label}.tar.gz" -C "$tmp"
 got="$("$tmp/ormos" --version)"
 echo "$got"
 
-# `ormos --version` prints the bare version and nothing else, so this is
-# an exact string match rather than a prefix. A requested version must
-# be reported exactly -- that is a release, and the archive claiming a
-# different version than the tag is the whole failure this guards.
-#
-# The default is not checked against the literal "dev". main.go falls
-# back to the module version in its build info when nothing was baked
-# in, so a pull request can legitimately report a pseudo-version.
-# Asserting "dev" here would be the check being wrong rather than the
-# binary.
 if [ "$VERSION" != "dev" ]; then
   if [ "$got" != "$VERSION" ]; then
     echo "::error::built binary reports '$got', expected '$VERSION'"

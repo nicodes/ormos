@@ -1,6 +1,10 @@
-name: Native Rust APIs
+name: Native Rust CLI and API
 'on':
   workflow_call:
+    inputs:
+      version:
+        type: string
+        default: dev
 permissions:
   contents: read
   attestations: read
@@ -22,6 +26,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
+      VERSION: ${{ inputs.version }}
       MISE_GITHUB_TOKEN: ${{ github.token }}
     steps:
     - name: Check out source
@@ -39,14 +44,18 @@ jobs:
       run: |-
         set -euo pipefail
         rustup component add --toolchain 1.94.0 rustfmt clippy
+        cargo fmt --all --check
+        cargo clippy -p ormos -p ormos-relay --all-features --all-targets --locked -- -D warnings
+        cargo test --workspace --all-features --locked
+        cargo build --locked --bin ormos
+        ORMOS_CLI="${CARGO_TARGET_DIR:-target}/debug/ormos" python3 -m unittest discover -s tests -p 'test_cli.py' -v
         cargo fmt --manifest-path api/Cargo.toml --check
         cargo clippy --locked --manifest-path api/Cargo.toml --all-targets -- -D warnings
         cargo test --locked --manifest-path api/Cargo.toml
-        bash scripts/profile-api-build.sh
         bash scripts/profile-build.sh
         bash scripts/profile-artifact-smoke.sh
         python3 scripts/profile-api-smoke.py
-    - name: Upload native API and source receipt
+    - name: Upload native CLI, API and source receipts
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: native-api-${{ matrix.platform }}

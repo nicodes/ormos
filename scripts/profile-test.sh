@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export GOTOOLCHAIN=local
 os_label="$(uname -s)"
 case "$(uname -m)" in x86_64|amd64) arch_label=x86_64 ;; aarch64|arm64) arch_label=arm64 ;; *) exit 1 ;; esac
 archive="dist/ormos_${os_label}_${arch_label}.tar.gz"
@@ -12,4 +11,6 @@ if [ -f "$archive" ]; then
 fi
 python3 -m unittest discover -s tests -p 'test_install.py' -v
 
-go test -race -count=1 ./...
+cargo test --workspace --all-features --locked
+cargo build --locked --bin ormos
+ORMOS_CLI="${CARGO_TARGET_DIR:-target}/debug/ormos" python3 -m unittest discover -s tests -p 'test_cli.py' -v

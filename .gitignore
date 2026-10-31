@@ -12,4 +12,4 @@ __pycache__/
 .artifacts/
 /.ci-tools/
 /api/target/
-/internal/nativeapi/payload.gz
+/target/

@@ -1,0 +1,103 @@
+[
+  {
+    "type": "SystemInfo",
+    "value": {
+      "id": "sys-1",
+      "name": "Desk",
+      "hostname": "desk.local",
+      "online": true,
+      "ip_addr": "192.0.2.1"
+    }
+  },
+  {
+    "type": "PortInfo",
+    "value": {
+      "project": "ormos",
+      "port": 8080,
+      "label": "web"
+    }
+  },
+  {
+    "type": "ProjectInfo",
+    "value": {
+      "id": "proj-1",
+      "name": "ormos",
+      "root_dir": "/code/ormos",
+      "ports": [
+        {
+          "id": "port-1",
+          "port": 8080,
+          "label": "web"
+        }
+      ]
+    }
+  },
+  {
+    "type": "TerminalSessionInfo",
+    "value": {
+      "id": "terminal-1",
+      "project_id": "proj-1",
+      "project_name": "ormos",
+      "session_id": "session-1"
+    }
+  },
+  {
+    "type": "TerminalSessionInfo",
+    "value": {
+      "id": "record",
+      "project_id": "proj-1",
+      "project_name": "ormos",
+      "session_id": "session-1",
+      "state": "running",
+      "generation": 3
+    }
+  },
+  {
+    "type": "PortEntry",
+    "value": {
+      "id": "port-1",
+      "port": 8080,
+      "label": "web"
+    }
+  },
+  {
+    "type": "DeviceStartRequest",
+    "value": {
+      "client_id": "client-1",
+      "hostname": "desk.local"
+    }
+  },
+  {
+    "type": "DeviceStartResponse",
+    "value": {
+      "user_code": "ABCD-EFGH",
+      "device_code": "device-1",
+      "verification_url": "https://ormos.dev/device",
+      "expires_in": 600,
+      "interval": 5
+    }
+  },
+  {
+    "type": "DevicePollRequest",
+    "value": {
+      "device_code": "device-1"
+    }
+  },
+  {
+    "type": "DevicePollResponse",
+    "value": {
+      "status": "approved",
+      "systemId": "sys-1",
+      "token": "pairing-token",
+      "name": "Desk"
+    }
+  },
+  {
+    "type": "ProvisionResponse",
+    "value": {
+      "systemId": "sys-1",
+      "token": "pairing-token",
+      "name": "Desk"
+    }
+  }
+]

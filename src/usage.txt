@@ -1,0 +1,21 @@
+ormos — a local terminal and app preview
+
+usage:
+  ormos                    serve the local web UI
+  ormos ui [options]       serve the local web UI with explicit options
+  ormos --help             show this
+  ormos --version          print the version
+
+UI options:
+  --port N                 terminal UI port (default 4242)
+  --cwd PATH               initial terminal directory (default home)
+  --hosts HOST:PORT,...     allowed UI hostnames, including their ports
+  --bind IP                UI bind address (default 127.0.0.1)
+
+Serve the loopback UI privately through Tailscale Serve for phone access.
+Enter a local HTTP app port; ormos forwards and exposes previews automatically.
+Use an HTTPS workspace for Godot and other apps requiring a secure context.
+There is no application account or login. Trusted network access is required.
+Terminals end when ormos stops; browser disconnects leave them running.
+
+Hosted relay commands are retired. Saved local UI entries and private access remain supported.
