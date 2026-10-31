@@ -81,6 +81,8 @@ def package(labels):
         directory = dist / name
         directory.mkdir()
         shutil.copy2(binary, directory / "ormos")
+        # Artifact downloads do not preserve Unix executable permissions.
+        (directory / "ormos").chmod(0o755)
         for file in ("README.md", "LICENSE"):
             shutil.copy2(root / file, directory / file)
         third_party = directory / "yamux-licenses.txt"
