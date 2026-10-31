@@ -1,0 +1,56 @@
+name: Native Rust APIs
+'on':
+  workflow_call:
+permissions:
+  contents: read
+  attestations: read
+jobs:
+  native:
+    name: API (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - runner: ubuntu-24.04
+          platform: Linux_x86_64
+        - runner: ubuntu-24.04-arm
+          platform: Linux_arm64
+        - runner: macos-15-intel
+          platform: Darwin_x86_64
+        - runner: macos-15
+          platform: Darwin_arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      MISE_GITHUB_TOKEN: ${{ github.token }}
+    steps:
+    - name: Check out source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+    - name: Set up development tools
+      uses: nicodes/tools/setup@091101094fedf5ce2e67c339c1c9c842d6a662dc
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Install static Linux linker
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+    - name: Verify native Rust API
+      run: |-
+        set -euo pipefail
+        rustup component add --toolchain 1.94.0 rustfmt clippy
+        cargo fmt --manifest-path api/Cargo.toml --check
+        cargo clippy --locked --manifest-path api/Cargo.toml --all-targets -- -D warnings
+        cargo test --locked --manifest-path api/Cargo.toml
+        bash scripts/profile-api-build.sh
+        bash scripts/profile-build.sh
+        bash scripts/profile-artifact-smoke.sh
+        python3 scripts/profile-api-smoke.py
+    - name: Upload native API and source receipt
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: native-api-${{ matrix.platform }}
+        path: .artifacts/native-api/*
+        if-no-files-found: error
+        include-hidden-files: true
+        retention-days: 7

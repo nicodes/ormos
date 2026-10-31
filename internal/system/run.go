@@ -96,7 +96,7 @@ usage:
   ormos --version          print the version
 
 UI options:
-  --port N                 terminal UI port (default 8481)
+  --port N                 terminal UI port (default 4242)
   --cwd PATH               initial terminal directory (default home)
   --hosts HOST:PORT,...     allowed UI hostnames, including their ports
   --bind IP                UI bind address (default 127.0.0.1)

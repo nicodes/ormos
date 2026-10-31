@@ -13,6 +13,12 @@ name: Release
 permissions: {}
 concurrency: release-${{ github.repository }}
 jobs:
+  native-api:
+    name: Native API
+    uses: ./.github/workflows/native-api.yml
+    permissions:
+      contents: read
+      attestations: read
   darwin:
     name: Build (macOS)
     runs-on: macos-latest
@@ -33,6 +39,7 @@ jobs:
       shell: bash
       run: |-
         set -euo pipefail
+        mise run install
         mise run lint-source
     - name: Check project
       shell: bash
@@ -43,9 +50,9 @@ jobs:
         mise run vuln
   release:
     name: Release
-    needs: darwin
+    needs: [darwin, native-api]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
@@ -95,8 +102,15 @@ jobs:
       uses: nicodes/tools/setup@091101094fedf5ce2e67c339c1c9c842d6a662dc
       env:
         GH_TOKEN: ${{ github.token }}
+    - name: Download native APIs
+      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+      with:
+        pattern: native-api-*
+        path: .artifacts/native-api
+        merge-multiple: true
     - name: Check project
       env:
+        ORMOS_BUILD_TARGETS: all
         VERSION: ${{ steps.release.outputs.version }}
         MISE_GITHUB_TOKEN: ${{ github.token }}
       shell: bash

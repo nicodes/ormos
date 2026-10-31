@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: d4095fd0fe07926197b29e461f1d7ea9d75afef21460ded7ad67ae8146f5e6d8 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 009fdfa45fd64192864b4edc22fcfad3ec4f2870023197ece46e5f9d5976e3e0 -->
 
 # ormos
 
@@ -22,7 +22,7 @@ Or with mise:
 mise use --global github:nicodes/ormos@latest
 ```
 
-The shell installer detects your platform, checks the archive's SHA-256 digest and binary version, and installs to `~/.local/bin` without sudo. It adds the standard user bin directory to Bash/Zsh startup files when absent from PATH; open a new terminal afterward. Mise manages its own installation directory and PATH through its shell activation. Neither method requires Go or Node.js.
+The shell installer detects your platform, checks the archive's SHA-256 digest and binary version, and installs to `~/.local/bin` without sudo. It adds the standard user bin directory to Bash/Zsh startup files when absent from PATH; open a new terminal afterward. Mise manages its own installation directory and PATH through its shell activation. Neither method requires Go, Rust or Node.js.
 
 Installation does not start ormos, install a service, or change Tailscale configuration. Rerun your chosen installation command to update; restart a running ormos process when ready to use the new binary.
 
@@ -93,5 +93,9 @@ git -C .ci-tools checkout --detach 091101094fedf5ce2e67c339c1c9c842d6a662dc
 mise install
 mise run check
 ```
+
+The local HTTP and WebSocket API is implemented in Rust/Axum under root `api/`. The distributed `ormos` executable embeds its platform-native API and starts it directly. The API owns terminal processes, policy decisions, replay and flow control, and preview forwarding. The independent Go CLI and relay SDK remain.
+
+Contributor builds need the pinned Rust, Go and Node.js tools. On Linux, install the system `musl-tools` package for static API release builds. `mise run build` creates the current machine’s archive; `mise run check` verifies it. CI builds and tests Linux and macOS on x86_64 and arm64, then assembles all four release archives from the matching native APIs. A source-only Go build can use a separately built API by setting `ORMOS_API_BINARY` to its absolute path.
 
 Native build and test commands retain source and output checks, with receipts in `.artifacts/verification`. Existing product release rules and artifacts remain owned by this repository. End users install the product’s published distribution.

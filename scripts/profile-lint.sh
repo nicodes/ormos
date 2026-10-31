@@ -10,3 +10,5 @@ if [ -n "$unformatted" ]; then
 fi
 
 go vet ./...
+cargo fmt --manifest-path api/Cargo.toml --check
+cargo clippy --locked --manifest-path api/Cargo.toml --all-targets -- -D warnings
