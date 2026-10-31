@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 009fdfa45fd64192864b4edc22fcfad3ec4f2870023197ece46e5f9d5976e3e0 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 40ca83ee441cb14ef9ef76f742bd5603329b0b2a227616b297dfca5350181e85 -->
 
 # ormos
 
@@ -94,8 +94,12 @@ mise install
 mise run check
 ```
 
-The local HTTP and WebSocket API is implemented in Rust/Axum under root `api/`. The distributed `ormos` executable embeds its platform-native API and starts it directly. The API owns terminal processes, policy decisions, replay and flow control, and preview forwarding. The independent Go CLI and relay SDK remain.
+The local HTTP and WebSocket API is implemented in Rust/Axum under root `api/`. The distributed `ormos` executable embeds its platform-native API and starts it directly. The API owns terminal processes, policy decisions, replay and flow control, and preview forwarding. The launcher and the reusable `ormos-relay` SDK are also implemented in Rust. Hosted relay CLI entry points remain retired.
 
-Contributor builds need the pinned Rust, Go and Node.js tools. On Linux, install the system `musl-tools` package for static API release builds. `mise run build` creates the current machine’s archive; `mise run check` verifies it. CI builds and tests Linux and macOS on x86_64 and arm64, then assembles all four release archives from the matching native APIs. A source-only Go build can use a separately built API by setting `ORMOS_API_BINARY` to its absolute path.
+Contributor builds need the pinned Rust and Node.js tools. On Linux, install the system `musl-tools` package for static release builds. `mise run build` creates the current machine’s archive; `mise run check` verifies it. CI builds and tests Linux and macOS on x86_64 and arm64, then assembles all four release archives from matching native launchers and APIs. A source-only `cargo build --locked --bin ormos` can use a separately built API by setting `ORMOS_API_BINARY` to its absolute path.
 
 Native build and test commands retain source and output checks, with receipts in `.artifacts/verification`. Existing product release rules and artifacts remain owned by this repository. End users install the product’s published distribution.
+
+The SDK crate lives in `relay/`. Its default features include control-plane DTOs, versioned stream framing, sealed terminal records, and binary WebSocket/Yamux transport. `client_session` and `server_session` own a background driver; retain the session while using its streams. Dropping the session cancels its I/O. Apply `transport::websocket_config()` when connecting or upgrading a WebSocket, then wrap it with `NetConn::new`. Stream opening is bounded to 30 seconds, graceful session closure to two minutes, and the inbound accept backlog to 64 streams. WebSocket keepalive detects an unresponsive peer.
+
+Each tunnel permits at most 128 active streams, each receive window is capped at 4 MiB, and the aggregate receive-window budget is 512 MiB. WebSocket messages are bounded to 8 MiB. The vendored Yamux source retains upstream attribution and includes compatibility adjustments for the existing 4 MiB Go-peer frames and per-stream window bound. Historical Go SDK tags remain available; the current source uses the Rust SDK.

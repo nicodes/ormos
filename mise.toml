@@ -2,22 +2,20 @@
 "rust" = "1.94.0"
 "trivy" = "0.74.0"
 "python" = "3.13.11"
-"go" = "1.27.3"
-"go:golang.org/x/vuln/cmd/govulncheck" = "1.7.0"
+"cargo:cargo-audit" = "0.22.2"
 "node" = "24.18.1"
 "actionlint" = "1.7.12"
 "shellcheck" = "0.11.0"
 
 [env]
 TOOLS_ROOT = "{{ get_env(name='TOOLS_ROOT', default=config_root ~ '/.ci-tools') }}"
-GOTOOLCHAIN = "local"
 CARGO_TARGET_DIR = "{{ get_env(name='CARGO_TARGET_DIR', default=config_root ~ '/.artifacts/rust-target') }}"
 CARGO_INCREMENTAL = "0"
 PYTHONDONTWRITEBYTECODE = "1"
 "VERSION" = "{{ get_env(name='VERSION', default='dev') }}"
 
 [tasks."install"]
-run = ["rustup component add --toolchain 1.94.0 rustfmt clippy", "go mod download", "cargo fetch --locked --manifest-path api/Cargo.toml", "npm ci --prefix ui"]
+run = ["rustup component add --toolchain 1.94.0 rustfmt clippy", "cargo fetch --locked", "cargo fetch --locked --manifest-path api/Cargo.toml", "npm ci --prefix ui"]
 
 [tasks."lint"]
 run = ["bash scripts/profile-lint.sh", "bash scripts/profile-web-check.sh", "actionlint"]
@@ -35,7 +33,7 @@ run = ["bash scripts/profile-artifact-smoke.sh", "bash scripts/profile-platform-
 depends = ["build"]
 
 [tasks."vuln"]
-run = ["govulncheck ./...", "trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --skip-dirs api/target --skip-dirs .artifacts api"]
+run = ["cargo audit --deny warnings", "trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --skip-dirs api/target --skip-dirs .artifacts api"]
 
 [tasks."clean"]
 run = ["python3 -c 'import shutil; [shutil.rmtree(p,ignore_errors=True) for p in (\"dist\",\".artifacts\",\"ui/node_modules\")]'"]
