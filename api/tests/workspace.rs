@@ -325,14 +325,38 @@ async fn preview_forwards_only_fixed_loopback_app_and_rechecks_policy() {
         fixture.client.get(&public).send().await.unwrap().status(),
         403
     );
+    // Hold an established connection to this route. A new dial after shutdown
+    // can hit an unrelated test that has already reused the ephemeral port.
+    let stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    let (mut sender, connection) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+            .await
+            .unwrap();
+    let connection = tokio::spawn(connection);
+    let response = sender
+        .send_request(
+            hyper::Request::builder()
+                .uri("/")
+                .header("host", format!("127.0.0.1:{port}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    axum::body::to_bytes(axum::body::Body::new(response.into_body()), 4096)
+        .await
+        .unwrap();
     fixture.close().await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), connection)
+        .await
+        .expect("owned preview connection remained open")
+        .unwrap();
+    assert!(sender.ready().await.is_err());
     let _ = stop.send(true);
     upstream.await.unwrap().unwrap();
-    assert!(
-        tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
-            .await
-            .is_err()
-    );
 }
 
 #[tokio::test]
