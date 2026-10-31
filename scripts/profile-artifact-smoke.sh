@@ -5,7 +5,9 @@ export VERSION="${VERSION:-dev}"
 set -euo pipefail
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-tar -xzf dist/ormos_Linux_x86_64.tar.gz -C "$tmp"
+os_label="$(uname -s)"
+case "$(uname -m)" in x86_64|amd64) arch_label=x86_64 ;; aarch64|arm64) arch_label=arm64 ;; *) exit 1 ;; esac
+tar -xzf "dist/ormos_${os_label}_${arch_label}.tar.gz" -C "$tmp"
 got="$("$tmp/ormos" --version)"
 echo "$got"
 
@@ -36,3 +38,5 @@ if [ "$protocol" != "4" ]; then
   exit 1
 fi
 
+
+"$tmp/ormos" ui --help | grep -F "local workspace"

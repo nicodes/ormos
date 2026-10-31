@@ -17,8 +17,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  native-api:
+    name: Native API
+    uses: ./.github/workflows/native-api.yml
   ci:
     name: Test
+    needs: native-api
     runs-on: ubuntu-24.04
     env:
       MISE_GITHUB_TOKEN: ${{ github.token }}
@@ -47,8 +51,16 @@ jobs:
         if-no-files-found: error
         retention-days: 7
         include-hidden-files: true
+    - name: Download native APIs
+      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+      with:
+        pattern: native-api-*
+        path: .artifacts/native-api
+        merge-multiple: true
     - name: Check project
       shell: bash
+      env:
+        ORMOS_BUILD_TARGETS: all
       run: |-
         set -euo pipefail
         mise run check
@@ -72,6 +84,7 @@ jobs:
       shell: bash
       run: |-
         set -euo pipefail
+        mise run install
         mise run lint-source
     - name: Check project
       shell: bash
