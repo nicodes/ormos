@@ -84,7 +84,7 @@ jobs:
     - name: Check out source
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up development tools
-      uses: nicodes/tools/setup@091101094fedf5ce2e67c339c1c9c842d6a662dc
+      uses: nicodes/tools/setup@f412061a7a3f0914db9e09d1159e69504aee8706
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Check source
@@ -116,7 +116,7 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
     - name: Set up development tools
-      uses: nicodes/tools/setup@091101094fedf5ce2e67c339c1c9c842d6a662dc
+      uses: nicodes/tools/setup@f412061a7a3f0914db9e09d1159e69504aee8706
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Download native APIs
@@ -158,11 +158,11 @@ jobs:
   publish:
     name: Publish release
     needs: release
-    uses: nicodes/tools/.github/workflows/cli-publish.yml@091101094fedf5ce2e67c339c1c9c842d6a662dc
+    uses: nicodes/tools/.github/workflows/cli-publish.yml@f412061a7a3f0914db9e09d1159e69504aee8706
     permissions:
       contents: write
     with:
-      tools-ref: 091101094fedf5ce2e67c339c1c9c842d6a662dc
+      tools-ref: f412061a7a3f0914db9e09d1159e69504aee8706
       binary: ormos
       tag: ${{ needs.release.outputs.tag }}
       artifact-id: ${{ needs.release.outputs.artifact-id }}
