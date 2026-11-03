@@ -84,7 +84,7 @@ jobs:
     - name: Check out source
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up development tools
-      uses: nicodes/tools/setup@f412061a7a3f0914db9e09d1159e69504aee8706
+      uses: nicodes/tools/setup@a1c0321f3b4917a7e99eca42e241e46670f6e1e1
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Check source
@@ -116,7 +116,7 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
     - name: Set up development tools
-      uses: nicodes/tools/setup@f412061a7a3f0914db9e09d1159e69504aee8706
+      uses: nicodes/tools/setup@a1c0321f3b4917a7e99eca42e241e46670f6e1e1
       env:
         GH_TOKEN: ${{ github.token }}
     - name: Download native APIs
@@ -158,7 +158,7 @@ jobs:
   publish:
     name: Publish release
     needs: release
-    uses: nicodes/tools/.github/workflows/cli-publish.yml@f412061a7a3f0914db9e09d1159e69504aee8706
+    uses: nicodes/tools/.github/workflows/cli-publish.yml@a1c0321f3b4917a7e99eca42e241e46670f6e1e1
     permissions:
       contents: write
     with:

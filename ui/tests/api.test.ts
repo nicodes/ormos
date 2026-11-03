@@ -51,3 +51,9 @@ test("API failures preserve HTTP status and clean up deadline state", async t =>
   await assert.rejects(request("/api/action", { action: "open" }), error => error instanceof APIError && error.status === 429 && error.message === "terminal limit");
   t.mock.timers.tick(30000); assert.equal(signal!.aborted, false);
 });
+
+test("structured failures retain machine metadata without changing retry behavior", async t => {
+  const send = t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({error:{code:"terminal_limit",message:"Close a terminal",request_id:"body-id"}}), {status:429,headers:{"X-Request-ID":"server-id"}}));
+  await assert.rejects(request("/api/action", {action:"open"}), error => error instanceof APIError && error.code === "terminal_limit" && error.requestId === "server-id" && error.message === "Close a terminal");
+  assert.equal(send.mock.callCount(),1);
+});

@@ -36,7 +36,7 @@ depends = ["build"]
 run = ["cargo audit --deny warnings", "trivy fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --skip-dirs api/target --skip-dirs .artifacts api"]
 
 [tasks."clean"]
-run = ["python3 -c 'import shutil; [shutil.rmtree(p,ignore_errors=True) for p in (\"dist\",\".artifacts\",\"ui/node_modules\")]'"]
+run = "python3 \"$TOOLS_ROOT/helpers/clean.py\" --path dist --path target --path .artifacts/build --path .artifacts/rust-target --path .artifacts/advisory-db --path ui/node_modules"
 
 [tasks."e2e"]
 run = ["bash scripts/profile-browser-check.sh"]
