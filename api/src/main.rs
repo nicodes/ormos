@@ -1,6 +1,7 @@
 use ormos_api::{config::Config, http::App, workspace::Workspace};
 #[tokio::main]
 async fn main() {
+    httpcontract::init_logging();
     if let Err(error) = run().await {
         eprintln!("ormos: {}", error.message);
         std::process::exit(1);

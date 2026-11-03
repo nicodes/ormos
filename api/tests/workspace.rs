@@ -537,3 +537,44 @@ async fn parser_credit_window_blocks_output_until_ack_without_blocking_resize() 
     drop(socket);
     fixture.close().await;
 }
+
+#[tokio::test]
+async fn health_and_refusals_share_the_public_http_contract_in_an_owned_workspace() {
+    let fixture = Fixture::new().await;
+    for path in ["/healthz", "/readyz"] {
+        let response = fixture
+            .client
+            .get(format!("{}{path}", fixture.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.headers().contains_key("x-request-id"));
+        let value: Value = response.json().await.unwrap();
+        assert!(value["revision"].as_str().is_some_and(|v| !v.is_empty()));
+        let head = fixture
+            .client
+            .head(format!("{}{path}", fixture.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.status(), 200);
+        assert!(head.bytes().await.unwrap().is_empty());
+    }
+    let response = fixture
+        .client
+        .get(format!("{}/api/system", fixture.url))
+        .header("host", "foreign.invalid")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 421);
+    let id = response.headers()["x-request-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let value: Value = response.json().await.unwrap();
+    assert_eq!(value["error"]["request_id"], id);
+    assert!(value["error"]["code"].is_string());
+    fixture.close().await;
+}

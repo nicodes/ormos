@@ -16,7 +16,7 @@ if [ "$os_label" = Linux ]; then
 fi
 # Build the committed UI export into each native API. The source drift check
 # separately rebuilds that export; release artifacts need no Node installation.
-cargo build --locked --manifest-path api/Cargo.toml --release --target "$rust_target"
+SOURCE_COMMIT="$(git rev-parse HEAD)" cargo build --locked --manifest-path api/Cargo.toml --release --target "$rust_target"
 mkdir -p .artifacts/native-api
 cp "${CARGO_TARGET_DIR:-api/target}/$rust_target/release/ormos-api" ".artifacts/native-api/ormos-api_${os_label}_${arch_label}"
 python3 - "$os_label" "$arch_label" <<'PY'

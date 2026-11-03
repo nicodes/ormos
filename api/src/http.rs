@@ -33,7 +33,10 @@ impl App {
         })
     }
     pub fn router(self: &Arc<Self>) -> Router {
-        Router::new().fallback(handle).with_state(self.clone())
+        Router::new()
+            .fallback(handle)
+            .layer(axum::middleware::from_fn(httpcontract::observe))
+            .with_state(self.clone())
     }
     pub async fn close(&self) {
         self.workspace.shutdown().await;
@@ -93,6 +96,34 @@ async fn dispatch(app: &Arc<App>, mut request: Request, authority: &str) -> Resu
     let method = request.method().clone();
     let workspace = &app.workspace;
     let read = method == Method::GET || method == Method::HEAD;
+    if read && matches!(path.as_str(), "/healthz" | "/readyz") {
+        let ready = path != "/readyz" || !*workspace.stop.borrow();
+        let revision = option_env!("SOURCE_COMMIT")
+            .or(option_env!("COMMIT"))
+            .unwrap_or("development");
+        let mut response = (
+            if ready {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            },
+            httpcontract::health(
+                if !ready {
+                    "unready"
+                } else if path == "/healthz" {
+                    "ok"
+                } else {
+                    "ready"
+                },
+                revision,
+            ),
+        )
+            .into_response();
+        if method == Method::HEAD {
+            *response.body_mut() = Body::empty();
+        }
+        return Ok(response);
+    }
     if read && path == "/api/system" {
         let policy = workspace.config.policy();
         let roots = policy

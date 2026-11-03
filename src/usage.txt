@@ -5,6 +5,7 @@ usage:
   ormos ui [options]       serve the local web UI with explicit options
   ormos --help             show this
   ormos --version          print the version
+  ormos --json --version   one structured metadata result (also help, protocol and build info)
 
 UI options:
   --port N                 terminal UI port (default 4242)

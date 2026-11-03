@@ -1,7 +1,7 @@
 export type TerminalRow = { id: string; alive: boolean; cwd: string };
 export class APIError extends Error {
   status: number;
-  constructor(message: string, status: number) { super(message); this.status = status; }
+  constructor(message: string, status: number, readonly code = "request_failed", readonly requestId = "") { super(message); this.status = status; }
 }
 export async function request<T>(path: string, body?: object, signal?: AbortSignal): Promise<T> {
   const controller = new AbortController();
@@ -14,7 +14,13 @@ export async function request<T>(path: string, body?: object, signal?: AbortSign
       signal: controller.signal, method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     } : { signal: controller.signal });
     const data = await response.json();
-    if (!response.ok) throw new APIError(data.error ?? `Request failed (${response.status})`, response.status);
+    if (!response.ok) {
+      const problem = data?.error;
+      const message = typeof problem?.message === "string" ? problem.message : typeof problem === "string" ? problem : `Request failed (${response.status})`;
+      throw new APIError(message.slice(0,1024), response.status,
+        typeof problem?.code === "string" ? problem.code.slice(0,64) : "request_failed",
+        response.headers?.get("X-Request-ID") || (typeof problem?.request_id === "string" ? problem.request_id.slice(0,128) : ""));
+    }
     return data as T;
   } finally {
     clearTimeout(timer);

@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 40ca83ee441cb14ef9ef76f742bd5603329b0b2a227616b297dfca5350181e85 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 965ff32a2c32cee802dd2185e56a42de3ebbffed191516778dc14ddc22adf177 -->
 
 # ormos
 
@@ -103,3 +103,11 @@ Native build and test commands retain source and output checks, with receipts in
 The SDK crate lives in `relay/`. Its default features include control-plane DTOs, versioned stream framing, sealed terminal records, and binary WebSocket/Yamux transport. `client_session` and `server_session` own a background driver; retain the session while using its streams. Dropping the session cancels its I/O. Apply `transport::websocket_config()` when connecting or upgrading a WebSocket, then wrap it with `NetConn::new`. Stream opening is bounded to 30 seconds, graceful session closure to two minutes, and the inbound accept backlog to 64 streams. WebSocket keepalive detects an unresponsive peer.
 
 Each tunnel permits at most 128 active streams, each receive window is capped at 4 MiB, and the aggregate receive-window budget is 512 MiB. WebSocket messages are bounded to 8 MiB. The vendored Yamux source retains upstream attribution and includes compatibility adjustments for the existing 4 MiB Go-peer frames and per-stream window bound. Historical Go SDK tags remain available; the current source uses the Rust SDK.
+
+## Contributor task interface
+
+Contributor tool versions and task entry points live in the native Mise configuration. Use `mise run lint` for source checks, `mise run test` for the applicable behavioral tests, and `mise run check` for the complete supported gate. `mise run clean` removes declared generated outputs while preserving source, credentials and retained data. This package has no separate Mise development service; use its native entry points directly.
+
+## Machine metadata
+
+Use `ormos --json --version`, `ormos --json --protocol-version`, `ormos --json --build-info` or `ormos --json --help` for one versioned JSON result on stdout. Invalid use returns a JSON error and exits 2. JSON mode refuses serving modes before launching the workspace. Local UI options retain their existing precedence; `ormos ui --config /absolute/path/config.json` explicitly selects configuration.

@@ -9,6 +9,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+httpcontract = { git = "https://github.com/nicodes/tools", rev = "185fa0d4fd80861af4c0012c6fb3d421fe8d8a2a" }
 axum = "=0.8.9"
 base64 = "0.22"
 bytes = "1"

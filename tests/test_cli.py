@@ -39,6 +39,23 @@ class LauncherTests(unittest.TestCase):
         self.assertTrue(version.stdout.strip())
         self.assertEqual(version.stderr, "")
 
+    def test_machine_metadata_is_one_result_and_service_modes_never_execute(self):
+        self.fixture("raise RuntimeError('API must not execute')\n")
+        initial = set(self.root.iterdir())
+        for command, field in [("--version","version"),("--protocol-version","protocol_version"),("--build-info","api_sha256"),("--help","help")]:
+            result=self.run_cli("--json",command)
+            self.assertEqual(result.returncode,0,result.stderr)
+            value=json.loads(result.stdout)
+            self.assertEqual(value["v"],1)
+            self.assertTrue(value["ok"])
+            self.assertIn(field,value["result"])
+            self.assertEqual(result.stderr,"")
+        for args in [(),("ui",),("relay",),("--config","/private"),("--version","extra")]:
+            result=self.run_cli("--json",*args)
+            self.assertEqual(result.returncode,2)
+            self.assertEqual(json.loads(result.stdout)["error"]["code"],"invalid_usage")
+        self.assertEqual(set(self.root.iterdir()),initial)
+
     def test_retired_entries_never_touch_state_or_execute_api(self):
         self.fixture("raise RuntimeError('API must not execute')\n")
         initial = set(self.root.iterdir())

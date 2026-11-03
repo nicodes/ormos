@@ -5,6 +5,37 @@ mod nativeapi;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn main() {
     let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--json") {
+        let result = match args.get(1).and_then(|arg| arg.to_str()) {
+            Some("--help" | "help") if args.len() == 2 => {
+                Ok(serde_json::json!({"help":include_str!("usage.txt")}))
+            }
+            Some("--version" | "version") if args.len() == 2 => Ok(
+                serde_json::json!({"version":env!("ORMOS_VERSION"),"commit":env!("ORMOS_COMMIT")}),
+            ),
+            Some("--protocol-version") if args.len() == 2 => {
+                Ok(serde_json::json!({"protocol_version":ormos_relay::STREAM_FENCE_VERSION}))
+            }
+            Some("--build-info") if args.len() == 2 => Ok(
+                serde_json::json!({"version":env!("ORMOS_VERSION"),"commit":env!("ORMOS_COMMIT"),"api_sha256":env!("ORMOS_API_DIGEST"),"bundled_api":cfg!(bundled_api)}),
+            ),
+            _ => Err(
+                "--json requires one finite metadata command: --help, --version, --protocol-version or --build-info",
+            ),
+        };
+        match result {
+            Ok(result) => println!("{}", serde_json::json!({"v":1,"ok":true,"result":result})),
+            Err(message) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"v":1,"ok":false,"error":{"code":"invalid_usage","message":message}})
+                );
+                eprintln!("error: {message}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if args.is_empty() {
         args.push("ui".into());
     }
