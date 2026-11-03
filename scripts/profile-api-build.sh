@@ -14,8 +14,9 @@ if [ "$os_label" = Linux ]; then
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
   export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 fi
-# Build the committed UI export into each native API. The source drift check
-# separately rebuilds that export; release artifacts need no Node installation.
+# Build the locked frontend into ignored staging before embedding it.
+npm ci --prefix app --no-audit --no-fund
+npm run build --prefix app
 SOURCE_COMMIT="$(git rev-parse HEAD)" cargo build --locked --manifest-path api/Cargo.toml --release --target "$rust_target"
 mkdir -p .artifacts/native-api
 cp "${CARGO_TARGET_DIR:-api/target}/$rust_target/release/ormos-api" ".artifacts/native-api/ormos-api_${os_label}_${arch_label}"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["relay", "vendor/yamux"]
+members = ["crates/relay", "vendor/yamux"]
 exclude = ["api"]
 resolver = "3"
 
@@ -11,7 +11,7 @@ rust-version = "1.94"
 publish = false
 
 [dependencies]
-ormos-relay = { path = "relay", default-features = false }
+ormos-relay = { path = "crates/relay", default-features = false }
 flate2 = "1.1.10"
 libc = "0.2.191"
 serde_json = "1.0.154"
