@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 965ff32a2c32cee802dd2185e56a42de3ebbffed191516778dc14ddc22adf177 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 4599a43c5911cdcda5bbefd87befd82a6f61d84b29ecf1762d4a962955baf558 -->
 
 # ormos
 
@@ -100,7 +100,7 @@ Contributor builds need the pinned Rust and Node.js tools. On Linux, install the
 
 Native build and test commands retain source and output checks, with receipts in `.artifacts/verification`. Existing product release rules and artifacts remain owned by this repository. End users install the product’s published distribution.
 
-The SDK crate lives in `relay/`. Its default features include control-plane DTOs, versioned stream framing, sealed terminal records, and binary WebSocket/Yamux transport. `client_session` and `server_session` own a background driver; retain the session while using its streams. Dropping the session cancels its I/O. Apply `transport::websocket_config()` when connecting or upgrading a WebSocket, then wrap it with `NetConn::new`. Stream opening is bounded to 30 seconds, graceful session closure to two minutes, and the inbound accept backlog to 64 streams. WebSocket keepalive detects an unresponsive peer.
+The SDK crate lives in `crates/relay/`. Its default features include control-plane DTOs, versioned stream framing, sealed terminal records, and binary WebSocket/Yamux transport. `client_session` and `server_session` own a background driver; retain the session while using its streams. Dropping the session cancels its I/O. Apply `transport::websocket_config()` when connecting or upgrading a WebSocket, then wrap it with `NetConn::new`. Stream opening is bounded to 30 seconds, graceful session closure to two minutes, and the inbound accept backlog to 64 streams. WebSocket keepalive detects an unresponsive peer.
 
 Each tunnel permits at most 128 active streams, each receive window is capped at 4 MiB, and the aggregate receive-window budget is 512 MiB. WebSocket messages are bounded to 8 MiB. The vendored Yamux source retains upstream attribution and includes compatibility adjustments for the existing 4 MiB Go-peer frames and per-stream window bound. Historical Go SDK tags remain available; the current source uses the Rust SDK.
 

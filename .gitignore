@@ -1,7 +1,7 @@
-# The web app's dependencies and local build state. internal/ui/dist is a
+# The web app's dependencies and local build state. internal/app/dist is a
 # COMMITTED export (see api/build.rs), so these are anchored at /ui.
-/ui/node_modules/
-/ui/dist/
+/app/node_modules/
+/app/dist/
 
 # Installer regression fixtures are Python scripts.
 __pycache__/

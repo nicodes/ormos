@@ -43,6 +43,8 @@ jobs:
     - name: Verify native Rust API
       run: |-
         set -euo pipefail
+        npm ci --prefix app --no-audit --no-fund
+        npm run build --prefix app
         rustup component add --toolchain 1.94.0 rustfmt clippy
         cargo fmt --all --check
         cargo clippy -p ormos -p ormos-relay --all-features --all-targets --locked -- -D warnings
