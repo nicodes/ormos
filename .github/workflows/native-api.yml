@@ -1,4 +1,4 @@
-name: Native Rust CLI and API
+name: "Native executables"
 'on':
   workflow_call:
     inputs:
@@ -55,7 +55,7 @@ jobs:
         bash scripts/profile-build.sh
         bash scripts/profile-artifact-smoke.sh
         python3 scripts/profile-api-smoke.py
-    - name: Upload native CLI, API and source receipts
+    - name: "Upload artifacts"
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: native-api-${{ matrix.platform }}
