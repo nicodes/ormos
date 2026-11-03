@@ -1,7 +1,14 @@
 export type TerminalRow = { id: string; alive: boolean; cwd: string };
 export class APIError extends Error {
   status: number;
-  constructor(message: string, status: number, readonly code = "request_failed", readonly requestId = "") { super(message); this.status = status; }
+  readonly code: string;
+  readonly requestId: string;
+  constructor(message: string, status: number, code = "request_failed", requestId = "") {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.requestId = requestId;
+  }
 }
 export async function request<T>(path: string, body?: object, signal?: AbortSignal): Promise<T> {
   const controller = new AbortController();
