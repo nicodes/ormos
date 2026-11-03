@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   native-api:
-    name: Native API
+    name: "Build native executables"
     uses: ./.github/workflows/native-api.yml
   ci:
     name: Test
@@ -51,7 +51,7 @@ jobs:
         if-no-files-found: error
         retention-days: 7
         include-hidden-files: true
-    - name: Download native APIs
+    - name: "Download artifacts"
       uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
       with:
         pattern: native-api-*

@@ -14,6 +14,7 @@ permissions: {}
 concurrency: release-${{ github.repository }}
 jobs:
   version:
+    timeout-minutes: 5
     name: Determine version
     runs-on: ubuntu-24.04
     permissions:
@@ -63,7 +64,7 @@ jobs:
         echo "version=$version" >> "$GITHUB_OUTPUT"
         echo "tag=$tag" >> "$GITHUB_OUTPUT"
   native-api:
-    name: Native API
+    name: "Build native executables"
     needs: version
     uses: ./.github/workflows/native-api.yml
     with:
@@ -119,7 +120,7 @@ jobs:
       uses: nicodes/tools/setup@a1c0321f3b4917a7e99eca42e241e46670f6e1e1
       env:
         GH_TOKEN: ${{ github.token }}
-    - name: Download native APIs
+    - name: "Download artifacts"
       uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
       with:
         pattern: native-api-*
