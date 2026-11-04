@@ -1,5 +1,4 @@
-# The web app's dependencies and local build state. internal/app/dist is a
-# COMMITTED export (see api/build.rs), so these are anchored at /ui.
+# Frontend dependencies and generated local build state; the UI stages under .artifacts/ui/.
 /app/node_modules/
 /app/dist/
 
@@ -11,5 +10,5 @@ __pycache__/
 
 .artifacts/
 /.ci-tools/
-/api/target/
+/crates/api/target/
 /target/

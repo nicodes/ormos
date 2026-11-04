@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/relay", "vendor/yamux"]
-exclude = ["api"]
+exclude = ["crates/api"]
 resolver = "3"
 
 [package]
