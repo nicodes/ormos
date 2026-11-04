@@ -51,9 +51,9 @@ jobs:
         cargo test --workspace --all-features --locked
         cargo build --locked --bin ormos
         ORMOS_CLI="${CARGO_TARGET_DIR:-target}/debug/ormos" python3 -m unittest discover -s tests -p 'test_cli.py' -v
-        cargo fmt --manifest-path api/Cargo.toml --check
-        cargo clippy --locked --manifest-path api/Cargo.toml --all-targets -- -D warnings
-        cargo test --locked --manifest-path api/Cargo.toml
+        cargo fmt --manifest-path crates/api/Cargo.toml --check
+        cargo clippy --locked --manifest-path crates/api/Cargo.toml --all-targets -- -D warnings
+        cargo test --locked --manifest-path crates/api/Cargo.toml
         bash scripts/profile-build.sh
         bash scripts/profile-artifact-smoke.sh
         python3 scripts/profile-api-smoke.py

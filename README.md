@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 4599a43c5911cdcda5bbefd87befd82a6f61d84b29ecf1762d4a962955baf558 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: aece483fe7b5b3d09120d5bd2c589724c6659b88df948ab7f7bd3358a40ef282 -->
 
 # ormos
 
@@ -94,7 +94,7 @@ mise install
 mise run check
 ```
 
-The local HTTP and WebSocket API is implemented in Rust/Axum under root `api/`. The distributed `ormos` executable embeds its platform-native API and starts it directly. The API owns terminal processes, policy decisions, replay and flow control, and preview forwarding. The launcher and the reusable `ormos-relay` SDK are also implemented in Rust. Hosted relay CLI entry points remain retired.
+The local HTTP and WebSocket API is implemented in Rust/Axum under `crates/api/`. The distributed `ormos` executable embeds its platform-native API and starts it directly. The API owns terminal processes, policy decisions, replay and flow control, and preview forwarding. The launcher and the reusable `ormos-relay` SDK are also implemented in Rust. Hosted relay CLI entry points remain retired.
 
 Contributor builds need the pinned Rust and Node.js tools. On Linux, install the system `musl-tools` package for static release builds. `mise run build` creates the current machine’s archive; `mise run check` verifies it. CI builds and tests Linux and macOS on x86_64 and arm64, then assembles all four release archives from matching native launchers and APIs. A source-only `cargo build --locked --bin ormos` can use a separately built API by setting `ORMOS_API_BINARY` to its absolute path.
 
