@@ -1,0 +1,181 @@
+version = 1
+recipe = "rust-cli"
+
+[[components.rust]]
+name = "api"
+manifest = "crates/api/Cargo.toml"
+binaries = ["ormos-api"]
+profile = "release"
+[components.rust.test]
+enabled = false
+[components.rust.lint]
+native_host = true
+
+[[components.rust]]
+name = "cli"
+manifest = "Cargo.toml"
+binaries = ["ormos"]
+profile = "release"
+workspace = true
+targets = ["x86_64-pc-windows-gnu"]
+[components.rust.build]
+workspace = false
+[components.rust.test]
+enabled = false
+[components.rust.lint]
+packages = ["ormos", "ormos-relay"]
+all_features = true
+native_host = true
+
+[[components.rust_tests]]
+name = "native-api-unit"
+component = "api"
+roles = ["api"]
+selectors = {enabled=true, native_host=true}
+
+[[components.rust_tests]]
+name = "native-owner-unit"
+component = "cli"
+roles = ["cli"]
+selectors = {enabled=true, workspace=true, all_features=true, native_host=true}
+
+[[components.native]]
+name = "api"
+role = "api"
+component = "api"
+binary = "ormos-api"
+output = ".artifacts/native-api/ormos-api_{platform}_{arch}"
+environment = {SOURCE_COMMIT="{commit}"}
+
+[[components.native]]
+name = "cli"
+role = "cli"
+component = "cli"
+binary = "ormos"
+output = ".artifacts/native-cli/ormos-cli_{platform}_{arch}"
+checks = ["tests/test_cli.py", "tests/embedded_api_test.py", "tests/artifact_contract_test.py"]
+[[components.native.needs]]
+component = "api"
+platform = "native"
+path_environment = "ORMOS_API_PAYLOAD"
+digest_environment = "ORMOS_API_DIGEST"
+compression = "gzip"
+output = ".artifacts/native-api/payload_{platform}_{arch}.gz"
+
+[[components.ui]]
+package = "app"
+output = ".artifacts/ui"
+required_files = ["index.html"]
+
+[components.browser]
+package = "app"
+
+[[components.build_checks]]
+runner = "python"
+path = "tests/build/platform_contract_test.py"
+timeout = 300
+
+[[node.packages]]
+directory = "app"
+manager = "npm"
+build = "build"
+typecheck = "typecheck"
+test = "test"
+
+[package]
+binary = "ormos"
+component = "cli"
+output = ".artifacts/build/ormos"
+profile = "release"
+files = ["README.md", "LICENSE", "yamux-licenses.txt"]
+file_sources = {"yamux-licenses.txt"="vendor/yamux/NOTICE"}
+extra_files = ["install.sh"]
+version_arguments = ["--version"]
+version_template = "{version_plain}"
+info_arguments = ["--build-info"]
+info_fields = {version="{version_plain}",commit="{commit}"}
+
+[[package.native_targets]]
+runner = "ubuntu-24.04"
+timeout_minutes = 30
+target = "x86_64-unknown-linux-musl"
+platform = "Linux"
+arch = "x86_64"
+extension = "tar.gz"
+
+[[package.native_targets]]
+runner = "ubuntu-24.04-arm"
+timeout_minutes = 30
+target = "aarch64-unknown-linux-musl"
+platform = "Linux"
+arch = "arm64"
+extension = "tar.gz"
+
+[[package.native_targets]]
+runner = "macos-15-intel"
+timeout_minutes = 30
+target = "x86_64-apple-darwin"
+platform = "Darwin"
+arch = "x86_64"
+extension = "tar.gz"
+
+[[package.native_targets]]
+runner = "macos-15"
+timeout_minutes = 30
+target = "aarch64-apple-darwin"
+platform = "Darwin"
+arch = "arm64"
+extension = "tar.gz"
+
+[artifacts]
+paths = ["dist", ".artifacts/build", ".artifacts/native-package", ".artifacts/ui"]
+environment = ["VERSION", "COMMIT", "DATE", "RUST_TARGET"]
+revision_environment = ["COMMIT"]
+evidence_paths = [".artifacts/security/rust-source.json"]
+
+[artifacts.binary_environment]
+ORMOS_CLI = ".artifacts/build/ormos"
+ORMOS_TEST_BINARY = ".artifacts/build/ormos"
+
+[lint]
+shell_paths = ["install.sh"]
+
+[security]
+deny_warnings = true
+rust_inventory_manifests = ["Cargo.toml", "crates/api/Cargo.toml"]
+
+[[tests.integration]]
+runner = "python"
+path = "tests/test_install.py"
+
+[[tests.integration]]
+runner = "python"
+path = "tests/test_cli.py"
+
+[[tests.integration]]
+runner = "python"
+path = "tests/embedded_api_test.py"
+
+[[tests.integration]]
+runner = "python"
+path = "tests/artifact_contract_test.py"
+
+[[tests.e2e]]
+runner = "node-test"
+path = "app/tests/preview.browser.mjs"
+cwd = "app"
+timeout = 300
+
+[ci]
+runner = "ubuntu-24.04"
+timeout_minutes = 45
+
+[publication]
+tag_prefix = "v"
+initial = "first"
+version_identity = "number"
+validation_timeout = 45
+acceptance_timeout = 30
+
+[clean]
+paths = ["dist", "target", ".artifacts/build", ".artifacts/rust-target", ".artifacts/native-package", ".artifacts/native-api", ".artifacts/native-cli", ".artifacts/native-archives", ".artifacts/advisory-db", ".artifacts/security", ".artifacts/ui", ".artifacts/playwright", "app/node_modules"]

@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import platform
 import re
 from pathlib import Path
 import shutil
@@ -183,13 +184,14 @@ else:
                     self.assertEqual(contents.count("# Ormos installer: user executables"), 1)
 
     def test_archive_from_the_shared_build_action(self):
-        fixture = os.environ.get("ORMOS_INSTALL_TEST_ARCHIVE")
-        if not fixture:
-            self.skipTest("Set ORMOS_INSTALL_TEST_ARCHIVE to validate an actual release build")
-        path = self.assets / "ormos_Linux_x86_64.tar.gz"
+        arch = "arm64" if platform.machine() in ("arm64", "aarch64") else "x86_64"
+        fixture = os.environ.get("ORMOS_INSTALL_TEST_ARCHIVE", str(ROOT / "dist" / f"ormos_{platform.system()}_{arch}.tar.gz"))
+        self.assertTrue(Path(fixture).is_file(), "Run make build before the real archive installer journey")
+        self.env.update(TEST_OS=platform.system(), TEST_ARCH=arch)
+        path = self.assets / f"ormos_{platform.system()}_{arch}.tar.gz"
         shutil.copyfile(fixture, path)
         (self.assets / "checksums.txt").write_text(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n")
-        version = os.environ.get("ORMOS_INSTALL_TEST_VERSION", "0.2.0")
+        version = os.environ.get("ORMOS_INSTALL_TEST_VERSION", os.environ.get("VERSION", "dev")).removeprefix("v")
         if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
             result = self.assert_failure_preserves_install("--version", "v0.2.0")
             self.assertIn(f"The binary reports {version}, expected 0.2.0", result.stderr)
