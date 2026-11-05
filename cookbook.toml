@@ -36,7 +36,9 @@ target_directory = ".artifacts/source-target"
 [components.rust.test]
 enabled = false
 [components.rust.lint]
-enabled = false
+binaries = ["ormos"]
+all_targets = false
+native_host = true
 
 [[components.rust_tests]]
 name = "native-api-unit"

@@ -1,5 +1,5 @@
 # Generated cookbook entrypoint. Change cookbook.toml and regenerate.
-# Recipe data SHA256: ac283f6f41e50d5385d3e736b19aa9a54cc83f949665da5d9ca279f8b7a4a7ef
+# Recipe data SHA256: 7e33e6a9ecb33fdf05908cb861f579b9c1bb3553c0b489253b541ccf1b00befe
 COOKBOOK_REF := d475b54c402754a5a37a44fbd65328551995025c
 COOKBOOK_RECIPE := rust-cli
 COOKBOOK_ROOT ?= .artifacts/cookbook/$(COOKBOOK_REF)
