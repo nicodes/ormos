@@ -21,14 +21,14 @@ concurrency:
   cancel-in-progress: false
 jobs:
   request:
-    uses: nicodes/tools/.github/workflows/cookbook-request-merge.yml@d85d4192afe468039deeb4418f9216226d279dba
+    uses: nicodes/tools/.github/workflows/cookbook-request-merge.yml@06d1d328e422dae581a8642c11ce81120cf96ffc
     permissions:
       contents: write
       pull-requests: read
       statuses: write
       actions: write
     with:
-      tools-ref: d85d4192afe468039deeb4418f9216226d279dba
+      tools-ref: 06d1d328e422dae581a8642c11ce81120cf96ffc
       pull-request: ${{ inputs.pull-request }}
       expected-head: ${{ inputs.expected-head }}
       expected-base: ${{ inputs.expected-base }}
