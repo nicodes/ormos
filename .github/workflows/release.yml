@@ -19,9 +19,9 @@ jobs:
     name: Select immutable release identity
     permissions:
       contents: read
-    uses: nicodes/tools/.github/workflows/cookbook-cli-identity.yml@e2d492bde205dbe49663ab197eac4089f92db895
+    uses: nicodes/tools/.github/workflows/cookbook-cli-identity.yml@d85d4192afe468039deeb4418f9216226d279dba
     with:
-      tools-ref: e2d492bde205dbe49663ab197eac4089f92db895
+      tools-ref: d85d4192afe468039deeb4418f9216226d279dba
       bump: ${{ inputs.bump }}
   validate:
     name: Validate release source and native archives
@@ -29,9 +29,10 @@ jobs:
     permissions:
       contents: read
       actions: read
-    uses: nicodes/tools/.github/workflows/cookbook-native.yml@e2d492bde205dbe49663ab197eac4089f92db895
+      pull-requests: read
+    uses: nicodes/tools/.github/workflows/cookbook-native.yml@d85d4192afe468039deeb4418f9216226d279dba
     with:
-      tools-ref: e2d492bde205dbe49663ab197eac4089f92db895
+      tools-ref: d85d4192afe468039deeb4418f9216226d279dba
       source: ${{ github.sha }}
       version: ${{ needs.identity.outputs.version }}
       date: ${{ needs.identity.outputs.date }}
@@ -51,7 +52,7 @@ jobs:
       artifact: ${{ steps.accepted.outputs.artifact-id }}
     env:
       SOURCE_SHA: ${{ github.sha }}
-      COOKBOOK_SHA: e2d492bde205dbe49663ab197eac4089f92db895
+      COOKBOOK_SHA: d85d4192afe468039deeb4418f9216226d279dba
       RELEASE_TAG: ${{ needs.identity.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -65,7 +66,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: nicodes/tools
-          ref: e2d492bde205dbe49663ab197eac4089f92db895
+          ref: d85d4192afe468039deeb4418f9216226d279dba
           path: _cookbook
           persist-credentials: false
       - name: Bootstrap caller-pinned Python
@@ -78,7 +79,7 @@ jobs:
           name: cookbook-full-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .
       - name: Recheck complete native and host proof and exact publication bytes
-        run: python3 _cookbook/cookbook/cli_release.py accept --source "$SOURCE_SHA" --tools "$COOKBOOK_SHA" --tag "$RELEASE_TAG"
+        run: python3 _cookbook/cookbook/cli_release.py accept --source "$SOURCE_SHA" --tools "$COOKBOOK_SHA" --tag "$RELEASE_TAG" --before-acceptance
       - name: Attest build provenance under the published source workflow identity
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
@@ -100,8 +101,9 @@ jobs:
     permissions:
       contents: write
       actions: read
-    uses: nicodes/tools/.github/workflows/cookbook-cli-publish.yml@e2d492bde205dbe49663ab197eac4089f92db895
+      attestations: read
+    uses: nicodes/tools/.github/workflows/cookbook-cli-publish.yml@d85d4192afe468039deeb4418f9216226d279dba
     with:
-      tools-ref: e2d492bde205dbe49663ab197eac4089f92db895
+      tools-ref: d85d4192afe468039deeb4418f9216226d279dba
       tag: ${{ needs.identity.outputs.tag }}
       artifact-id: ${{ needs.accept.outputs.artifact }}
