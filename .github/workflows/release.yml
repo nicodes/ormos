@@ -19,9 +19,9 @@ jobs:
     name: Select immutable release identity
     permissions:
       contents: read
-    uses: nicodes/tools/.github/workflows/cookbook-cli-identity.yml@d475b54c402754a5a37a44fbd65328551995025c
+    uses: nicodes/tools/.github/workflows/cookbook-cli-identity.yml@b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
     with:
-      tools-ref: d475b54c402754a5a37a44fbd65328551995025c
+      tools-ref: b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
       bump: ${{ inputs.bump }}
   validate:
     name: Validate release source and native archives
@@ -30,9 +30,9 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
-    uses: nicodes/tools/.github/workflows/cookbook-native.yml@d475b54c402754a5a37a44fbd65328551995025c
+    uses: nicodes/tools/.github/workflows/cookbook-native.yml@b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
     with:
-      tools-ref: d475b54c402754a5a37a44fbd65328551995025c
+      tools-ref: b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
       source: ${{ github.sha }}
       version: ${{ needs.identity.outputs.version }}
       date: ${{ needs.identity.outputs.date }}
@@ -52,7 +52,7 @@ jobs:
       artifact: ${{ steps.accepted.outputs.artifact-id }}
     env:
       SOURCE_SHA: ${{ github.sha }}
-      COOKBOOK_SHA: d475b54c402754a5a37a44fbd65328551995025c
+      COOKBOOK_SHA: b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
       RELEASE_TAG: ${{ needs.identity.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -66,7 +66,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: nicodes/tools
-          ref: d475b54c402754a5a37a44fbd65328551995025c
+          ref: b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
           path: _cookbook
           persist-credentials: false
       - name: Bootstrap caller-pinned Python
@@ -102,8 +102,8 @@ jobs:
       contents: write
       actions: read
       attestations: read
-    uses: nicodes/tools/.github/workflows/cookbook-cli-publish.yml@d475b54c402754a5a37a44fbd65328551995025c
+    uses: nicodes/tools/.github/workflows/cookbook-cli-publish.yml@b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
     with:
-      tools-ref: d475b54c402754a5a37a44fbd65328551995025c
+      tools-ref: b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
       tag: ${{ needs.identity.outputs.tag }}
       artifact-id: ${{ needs.accept.outputs.artifact }}
