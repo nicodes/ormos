@@ -1,0 +1,34 @@
+# Generated cookbook caller. Change recipe data and regenerate.
+name: Request merge
+'on':
+  workflow_dispatch:
+    inputs:
+      pull-request:
+        description: PR number to fully validate and merge when current
+        type: string
+        required: true
+      expected-head:
+        description: Exact head selected by a dependency policy decision; paired with expected-base
+        type: string
+        default: ''
+      expected-base:
+        description: Exact main selected by a dependency policy decision; paired with expected-head
+        type: string
+        default: ''
+permissions: {}
+concurrency:
+  group: cookbook-merge-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  request:
+    uses: nicodes/tools/.github/workflows/cookbook-request-merge.yml@b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
+    permissions:
+      contents: write
+      pull-requests: read
+      statuses: write
+      actions: write
+    with:
+      tools-ref: b112e2e3a2f5facbd17f6afec2f50b2d48d686a5
+      pull-request: ${{ inputs.pull-request }}
+      expected-head: ${{ inputs.expected-head }}
+      expected-base: ${{ inputs.expected-base }}

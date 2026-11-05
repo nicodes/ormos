@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: aece483fe7b5b3d09120d5bd2c589724c6659b88df948ab7f7bd3358a40ef282 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 21d504c39e7f7cb8c9cbf330b6f676674ded519db36ffac8bc3d940853d38dc4 -->
 
 # ormos
 
@@ -85,28 +85,26 @@ The terminal uses a blinking light-gray vertical-bar cursor.
 
 ## Contributor verification
 
-Tool versions and native tasks live in `mise.toml`. Prepare the pinned helper source and run the complete gate:
+`mise.toml` pins contributor SDKs. The generated root Makefile selects an immutable shared cookbook revision and binds it to `cookbook.toml`.
 
 ```sh
-git clone https://github.com/nicodes/tools.git .ci-tools
-git -C .ci-tools checkout --detach 091101094fedf5ce2e67c339c1c9c842d6a662dc
-mise install
-mise run check
+make help
+make setup
+make build
+make test
 ```
 
-The local HTTP and WebSocket API is implemented in Rust/Axum under `crates/api/`. The distributed `ormos` executable embeds its platform-native API and starts it directly. The API owns terminal processes, policy decisions, replay and flow control, and preview forwarding. The launcher and the reusable `ormos-relay` SDK are also implemented in Rust. Hosted relay CLI entry points remain retired.
+`make help` works offline before setup. `make setup` explicitly prepares pinned SDKs, locked dependencies and declared fixtures. `make build` compiles and packages the native outputs, then validates their source and artifact identity. `make test` runs the implemented checks against those current-source outputs. Run build again after changing source; tests do not install tools or build missing shipping artifacts.
 
-Contributor builds need the pinned Rust and Node.js tools. On Linux, install the system `musl-tools` package for static release builds. `mise run build` creates the current machine’s archive; `mise run check` verifies it. CI builds and tests Linux and macOS on x86_64 and arm64, then assembles all four release archives from matching native launchers and APIs. A source-only `cargo build --locked --bin ormos` can use a separately built API by setting `ORMOS_API_BINARY` to its absolute path.
+Use `make fmt` to apply formatting, `make test:lint`, `make test:unit`, `make test:security` or `make test:integration` to select a group. `make test:e2e` runs the declared browser journeys. `make clean` removes declared generated outputs. Build and test evidence stays in `.artifacts/verification`.
 
-Native build and test commands retain source and output checks, with receipts in `.artifacts/verification`. Existing product release rules and artifacts remain owned by this repository. End users install the product’s published distribution.
+Build owns the SolidJS export, Rust API payload, embedded launcher and current platform archive. The verified executable is `.artifacts/build/ormos`. CI retains all four Linux/macOS x86_64/arm64 archives and verifies their matching native launchers and APIs. Source, installer, embedded API, artifact contracts and browser Preview assertions remain product-owned. On Linux, static release builds require the declared musl C toolchain.
+
+The local HTTP and WebSocket API remains under `crates/api/`; the distributed executable embeds its matching native API. Hosted relay CLI entry points remain retired. End users install the published distribution.
 
 The SDK crate lives in `crates/relay/`. Its default features include control-plane DTOs, versioned stream framing, sealed terminal records, and binary WebSocket/Yamux transport. `client_session` and `server_session` own a background driver; retain the session while using its streams. Dropping the session cancels its I/O. Apply `transport::websocket_config()` when connecting or upgrading a WebSocket, then wrap it with `NetConn::new`. Stream opening is bounded to 30 seconds, graceful session closure to two minutes, and the inbound accept backlog to 64 streams. WebSocket keepalive detects an unresponsive peer.
 
 Each tunnel permits at most 128 active streams, each receive window is capped at 4 MiB, and the aggregate receive-window budget is 512 MiB. WebSocket messages are bounded to 8 MiB. The vendored Yamux source retains upstream attribution and includes compatibility adjustments for the existing 4 MiB Go-peer frames and per-stream window bound. Historical Go SDK tags remain available; the current source uses the Rust SDK.
-
-## Contributor task interface
-
-Contributor tool versions and task entry points live in the native Mise configuration. Use `mise run lint` for source checks, `mise run test` for the applicable behavioral tests, and `mise run check` for the complete supported gate. `mise run clean` removes declared generated outputs while preserving source, credentials and retained data. This package has no separate Mise development service; use its native entry points directly.
 
 ## Machine metadata
 

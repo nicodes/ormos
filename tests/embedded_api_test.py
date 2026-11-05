@@ -13,7 +13,7 @@ import urllib.request
 
 root = Path(__file__).resolve().parents[1]
 arch = "arm64" if platform.machine() in ("arm64", "aarch64") else "x86_64"
-binary = root / "dist" / f"ormos_{platform.system()}_{arch}" / "ormos"
+binary = Path(os.environ["ORMOS_CLI"])
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 with tempfile.TemporaryDirectory(prefix="ormos-native-smoke-") as directory:
     with socket.socket() as listener:

@@ -1,13 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
   "mode": "auto",
   "ci_workflow": "ci.yml",
   "required_checks": [
-    "Test",
-    "Test (macOS)"
+    "validate / Fast source checks / Make fast",
+    "Documentation policy"
   ],
-  "integration_job": "ci",
-  "dispatch_workflow": "ci.yml",
   "max_group_size": 10,
   "managed_dependencies": [
     "aviorstudio/gdam-actions/*",
@@ -34,5 +32,6 @@
     "github.com/jackc/pgx/*",
     "github.com/go-sql-driver/mysql",
     "go.mongodb.org/mongo-driver/*"
-  ]
+  ],
+  "request_workflow": "request-merge.yml"
 }
