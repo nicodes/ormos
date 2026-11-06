@@ -9,7 +9,7 @@ import tempfile
 import time
 import unittest
 
-BINARY = Path(os.environ.get("ORMOS_SOURCE_CLI", os.environ.get("ORMOS_CLI", "target/debug/ormos"))).resolve()
+BINARY = Path(os.environ.get("COOKBOOK_NATIVE_SOURCE_CLI_BINARY", os.environ.get("COOKBOOK_CLI_BINARY", "target/debug/ormos"))).resolve()
 USAGE = (Path(__file__).resolve().parents[1] / "src/usage.txt").read_text()
 
 
