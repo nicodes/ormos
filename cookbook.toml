@@ -84,8 +84,6 @@ compression = "gzip"
 output = ".artifacts/native-api/payload_{platform}_{arch}.gz"
 
 [[components.ui]]
-package = "app"
-output = ".artifacts/ui"
 required_files = ["index.html"]
 
 [components.browser]
@@ -105,9 +103,6 @@ test = "test"
 
 [package]
 binary = "ormos"
-component = "cli"
-output = ".artifacts/build/ormos"
-profile = "release"
 files = ["README.md", "LICENSE", "yamux-licenses.txt"]
 file_sources = {"yamux-licenses.txt"="vendor/yamux/NOTICE"}
 extra_files = ["install.sh"]
@@ -149,13 +144,7 @@ arch = "arm64"
 extension = "tar.gz"
 
 [artifacts]
-paths = ["dist", ".artifacts/build", ".artifacts/native-package", ".artifacts/ui"]
 evidence_paths = [".artifacts/security/rust-source.json"]
-
-[artifacts.binary_environment]
-ORMOS_CLI = ".artifacts/build/ormos"
-ORMOS_SOURCE_CLI = ".artifacts/native-source/ormos_{platform}_{arch}"
-ORMOS_TEST_BINARY = ".artifacts/build/ormos"
 
 [lint]
 shell_paths = ["install.sh"]

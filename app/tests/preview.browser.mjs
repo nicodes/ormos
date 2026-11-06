@@ -26,7 +26,7 @@ const close = server => new Promise((resolve, reject) => server.close(error => e
 
 // Uses the already-built release binary. Tests own ephemeral app ports and PTYs.
 test('isolated localhost previews retain navigation, terminal state and scrolling', { timeout: 90000 }, async t => {
-  assert(process.env.ORMOS_TEST_BINARY, 'Set ORMOS_TEST_BINARY to a built ormos executable.');
+  assert(process.env.COOKBOOK_CLI_BINARY, 'Set COOKBOOK_CLI_BINARY to a built ormos executable.');
   const home = await mkdtemp(path.join(tmpdir(), 'ormos-direct-'));
   const artifacts = process.env.ORMOS_TEST_ARTIFACTS || home;
   await mkdir(artifacts, { recursive: true });
@@ -63,7 +63,7 @@ finally:
   const firstPort = first.address().port;
   const secondPort = second.address().port;
   t.after(async () => { await close(first); await close(second); });
-  const child = spawn(globalThis.process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port)], {
+  const child = spawn(globalThis.process.env.COOKBOOK_CLI_BINARY, ['ui', '--port', String(port)], {
     env: { ...globalThis.process.env, HOME: home, XDG_CONFIG_HOME: home, SHELL: '/bin/sh' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -1241,7 +1241,7 @@ if (args.join(' ') === 'serve status --json') {
   const placeholder = await listen((_req, res) => res.end());
   const port = placeholder.address().port;
   await close(placeholder);
-  const child = spawn(process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port), '--hosts', 'box.test:'+port], {
+  const child = spawn(process.env.COOKBOOK_CLI_BINARY, ['ui', '--port', String(port), '--hosts', 'box.test:'+port], {
     env: { ...process.env, HOME: home, XDG_CONFIG_HOME: home, SHELL: '/bin/sh', PATH: bin+path.delimiter+process.env.PATH, TEST_SERVE_STATE: state, TEST_SERVE_CALLS: calls },
     stdio: 'ignore',
   });
@@ -1300,7 +1300,7 @@ if (import.meta.hot) import.meta.hot.accept('/message.js', module => { document.
   const appPort = vite.httpServer.address().port;
   const placeholder = await listen((_req, res) => res.end());
   const port = placeholder.address().port; await close(placeholder);
-  const child = spawn(process.env.ORMOS_TEST_BINARY, ['ui', '--port', String(port)], {
+  const child = spawn(process.env.COOKBOOK_CLI_BINARY, ['ui', '--port', String(port)], {
     env: { ...process.env, HOME: home, XDG_CONFIG_HOME: home, SHELL: '/bin/sh' }, stdio: 'ignore',
   });
   t.after(async () => { if (child.exitCode === null && child.signalCode === null) { const exited = once(child, 'exit'); child.kill('SIGTERM'); await exited; } });
