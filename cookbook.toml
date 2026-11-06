@@ -150,8 +150,6 @@ extension = "tar.gz"
 
 [artifacts]
 paths = ["dist", ".artifacts/build", ".artifacts/native-package", ".artifacts/ui"]
-environment = ["VERSION", "COMMIT", "DATE", "RUST_TARGET"]
-revision_environment = ["COMMIT"]
 evidence_paths = [".artifacts/security/rust-source.json"]
 
 [artifacts.binary_environment]
@@ -168,19 +166,12 @@ rust_inventory_manifests = ["Cargo.toml", "crates/api/Cargo.toml"]
 
 [[tests.integration]]
 runner = "python"
-path = "tests/test_install.py"
-
-[[tests.integration]]
-runner = "python"
-path = "tests/test_cli.py"
-
-[[tests.integration]]
-runner = "python"
-path = "tests/embedded_api_test.py"
-
-[[tests.integration]]
-runner = "python"
-path = "tests/artifact_contract_test.py"
+cases = [
+  {path="tests/test_install.py"},
+  {path="tests/test_cli.py"},
+  {path="tests/embedded_api_test.py"},
+  {path="tests/artifact_contract_test.py"},
+]
 
 [[tests.e2e]]
 runner = "node-test"
@@ -189,7 +180,6 @@ cwd = "app"
 timeout = 300
 
 [ci]
-runner = "ubuntu-24.04"
 timeout_minutes = 45
 
 [publication]
