@@ -450,9 +450,15 @@ finally:
       await page.getByRole('button', { name: 'Show terminal', exact: true }).click();
       assert.equal(sockets.length, 1, 'Returning to a mounted terminal must preserve its connection');
       // Only the terminal created by this context is closed.
+      const closingID = await page.evaluate(() => localStorage.getItem('ormos.activeTerminal'));
       await page.getByRole('button', { name: /Close Terminal/ }).click();
       // Closing the final tab automatically opens a replacement; stop it too.
-      await page.waitForFunction(() => document.querySelector('.status-dot.online'));
+      await page.waitForFunction(oldID => {
+        const tabs = JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]');
+        const active = localStorage.getItem('ormos.activeTerminal');
+        return tabs.every(row => row.id !== oldID) && !!active && active !== oldID
+          && !!document.querySelector('.tab.selected .status-dot.online');
+      }, closingID);
       await page.evaluate(async () => {
         for (const row of JSON.parse(localStorage.getItem('ormos.terminalTabs') || '[]')) await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'kill', id: row.id }) });
       });
