@@ -211,10 +211,19 @@ async fn real_http_shell_compressed_stream_resume_policy_and_shutdown() {
     }
     assert!(terminal.info().alive);
     std::fs::write(
-        fixture.directory.join("policy.json"),
-        b"{\"terminalsDisabled\":true}",
+        fixture.directory.join("policy.toml"),
+        b"terminalsDisabled = true\n",
     )
     .unwrap();
+    assert!(
+        fixture
+            .app
+            .workspace
+            .config
+            .policy()
+            .unwrap()
+            .terminals_disabled
+    );
     assert_eq!(
         fixture
             .post("/api/action", json!({"action":"open"}))
@@ -317,10 +326,14 @@ async fn preview_forwards_only_fixed_loopback_app_and_rechecks_policy() {
     assert_eq!(echoed.payload().as_ref(), b"preview-upgrade-proof");
     drop(socket);
     std::fs::write(
-        fixture.directory.join("policy.json"),
-        format!("{{\"deniedPorts\":[{target}]}}"),
+        fixture.directory.join("policy.toml"),
+        format!("deniedPorts = [{target}]\n"),
     )
     .unwrap();
+    assert_eq!(
+        fixture.app.workspace.config.policy().unwrap().denied_ports,
+        vec![target]
+    );
     assert_eq!(
         fixture.client.get(&public).send().await.unwrap().status(),
         403
