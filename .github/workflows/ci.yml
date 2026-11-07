@@ -21,15 +21,43 @@ concurrency:
   cancel-in-progress: true
 jobs:
   validate:
-    uses: nicodes/cookbook/.github/workflows/cookbook-ci.yml@bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+    uses: nicodes/cookbook/.github/workflows/cookbook-ci.yml@c78082564d14241f06257bb048c446a8915fbb55
     permissions:
       contents: read
       actions: read
       pull-requests: read
     with:
-      cookbook-ref: ${{ inputs.cookbook || 'bf42dc5a713550191a0b60cbb5ed7acb4f7c7095' }}
+      cookbook-ref: ${{ inputs.cookbook || 'c78082564d14241f06257bb048c446a8915fbb55' }}
       source: ${{ inputs.source || github.sha }}
-      merge-gate: ${{ vars.COOKBOOK_REQUEST_MERGE == 'enabled' }}
+      merge-gate: true
       recipe: rust-cli
       runner: ubuntu-24.04
       timeout-minutes: 45
+  complete:
+    if: github.event_name == 'pull_request'
+    uses: nicodes/cookbook/.github/workflows/cookbook-ci.yml@c78082564d14241f06257bb048c446a8915fbb55
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    with:
+      cookbook-ref: ${{ inputs.cookbook || 'c78082564d14241f06257bb048c446a8915fbb55' }}
+      source: ${{ inputs.source || github.sha }}
+      merge-gate: false
+      recipe: rust-cli
+      runner: ubuntu-24.04
+      timeout-minutes: 45
+  full-validation:
+    name: Full validation
+    if: always()
+    needs: [validate, complete]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    permissions: {}
+    steps:
+      - name: Require the complete current source validation
+        timeout-minutes: 1
+        uses: nicodes/cookbook/ci-result@c78082564d14241f06257bb048c446a8915fbb55
+        with:
+          event-name: ${{ github.event_name }}
+          needs: ${{ toJSON(needs) }}

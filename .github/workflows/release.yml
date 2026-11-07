@@ -19,9 +19,9 @@ jobs:
     name: Select immutable release identity
     permissions:
       contents: read
-    uses: nicodes/cookbook/.github/workflows/cookbook-cli-identity.yml@bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+    uses: nicodes/cookbook/.github/workflows/cookbook-cli-identity.yml@c78082564d14241f06257bb048c446a8915fbb55
     with:
-      cookbook-ref: bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+      cookbook-ref: c78082564d14241f06257bb048c446a8915fbb55
       bump: ${{ inputs.bump }}
   validate:
     name: Validate release source and native archives
@@ -30,9 +30,9 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
-    uses: nicodes/cookbook/.github/workflows/cookbook-native.yml@bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+    uses: nicodes/cookbook/.github/workflows/cookbook-native.yml@c78082564d14241f06257bb048c446a8915fbb55
     with:
-      cookbook-ref: bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+      cookbook-ref: c78082564d14241f06257bb048c446a8915fbb55
       source: ${{ github.sha }}
       version: ${{ needs.identity.outputs.version }}
       date: ${{ needs.identity.outputs.date }}
@@ -55,7 +55,7 @@ jobs:
       MISE_EXEC_AUTO_INSTALL: 'false'
       MISE_TASK_RUN_AUTO_INSTALL: 'false'
       SOURCE_SHA: ${{ github.sha }}
-      COOKBOOK_SHA: bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+      COOKBOOK_SHA: c78082564d14241f06257bb048c446a8915fbb55
       RELEASE_TAG: ${{ needs.identity.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -180,13 +180,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: nicodes/cookbook
-          ref: bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+          ref: c78082564d14241f06257bb048c446a8915fbb55
           path: .artifacts/recipe-sdks/_cookbook
           persist-credentials: false
       - name: Prepare separate immutable Cookbook and Tools sources
         uses: ./.artifacts/recipe-sdks/_cookbook/sdk-dependencies
         with:
-          cookbook-ref: bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+          cookbook-ref: c78082564d14241f06257bb048c446a8915fbb55
       - name: Bootstrap caller-pinned Python
         uses: ./.artifacts/recipe-sdks/_cookbook/sdk-setup
         with:
@@ -220,8 +220,8 @@ jobs:
       contents: write
       actions: read
       attestations: read
-    uses: nicodes/cookbook/.github/workflows/cookbook-cli-publish.yml@bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+    uses: nicodes/cookbook/.github/workflows/cookbook-cli-publish.yml@c78082564d14241f06257bb048c446a8915fbb55
     with:
-      cookbook-ref: bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
+      cookbook-ref: c78082564d14241f06257bb048c446a8915fbb55
       tag: ${{ needs.identity.outputs.tag }}
       artifact-id: ${{ needs.accept.outputs.artifact }}
