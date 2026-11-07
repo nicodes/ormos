@@ -111,10 +111,23 @@ impl Config {
         let file = match fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK)
-            .open(self.directory().join("policy.json"))
+            .open(self.directory().join("policy.toml"))
         {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Policy::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if self
+                    .directory()
+                    .join("policy.json")
+                    .symlink_metadata()
+                    .is_ok()
+                {
+                    return Err(fail(
+                        403,
+                        "legacy local policy requires explicit conversion to policy.toml; legacy JSON v1 must be converted manually; no automatic import",
+                    ));
+                }
+                return Ok(Policy::default());
+            }
             Err(_) => return Err(fail(403, "local policy unreadable")),
         };
         if !file
@@ -131,7 +144,10 @@ impl Config {
         if bytes.len() > 1 << 20 {
             return Err(fail(403, "local policy unreadable"));
         }
-        serde_json::from_slice(&bytes).map_err(|_| fail(403, "local policy unreadable"))
+        toml::from_str(
+            std::str::from_utf8(&bytes).map_err(|_| fail(403, "local policy unreadable"))?,
+        )
+        .map_err(|_| fail(403, "local policy unreadable"))
     }
     pub fn has_config(&self) -> bool {
         if self.default_config
@@ -302,6 +318,30 @@ pub fn origin(origin: &str, authority: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_policy_uses_toml_and_refuses_legacy_or_malformed_source() {
+        let root = std::env::temp_dir().join(format!("ormos-policy-toml-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let config = Config::parse(&[
+            "--cwd".into(),
+            root.to_string_lossy().into(),
+            "--config".into(),
+            root.join("config.json").to_string_lossy().into(),
+        ])
+        .unwrap();
+        assert!(!config.policy().unwrap().terminals_disabled);
+        fs::write(root.join("policy.json"), r#"{"terminalsDisabled":true}"#).unwrap();
+        assert!(config.policy().is_err());
+        assert!(!root.join("policy.toml").exists());
+        fs::write(root.join("policy.toml"), "terminalsDisabled = false\nallowedPorts = [5432]\ndeniedPorts = [8443]\nallowedRoots = []").unwrap();
+        let policy = config.policy().unwrap();
+        assert!(!policy.terminals_disabled);
+        assert!(policy.port(5432));
+        assert!(!policy.port(8443));
+        fs::write(root.join("policy.toml"), "terminalsDisabled = 1").unwrap();
+        assert!(config.policy().is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn private_listener_and_policy_boundaries() {
         assert!(host("127.0.0.1:4242", &[]));
