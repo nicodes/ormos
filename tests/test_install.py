@@ -186,7 +186,7 @@ else:
     def test_archive_from_the_shared_build_action(self):
         arch = "arm64" if platform.machine() in ("arm64", "aarch64") else "x86_64"
         fixture = os.environ.get("ORMOS_INSTALL_TEST_ARCHIVE", str(ROOT / "dist" / f"ormos_{platform.system()}_{arch}.tar.gz"))
-        self.assertTrue(Path(fixture).is_file(), "Run make build before the real archive installer journey")
+        self.assertTrue(Path(fixture).is_file(), "Run mise run build before the real archive installer journey")
         self.env.update(TEST_OS=platform.system(), TEST_ARCH=arch)
         path = self.assets / f"ormos_{platform.system()}_{arch}.tar.gz"
         shutil.copyfile(fixture, path)

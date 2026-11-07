@@ -11,7 +11,7 @@ name: Build & Test
         description: Exact source commit; defaults to this main revision
         type: string
         default: ''
-      tools:
+      cookbook:
         description: Accepted cookbook commit; defaults to the pinned recipe
         type: string
         default: ''
@@ -21,13 +21,13 @@ concurrency:
   cancel-in-progress: true
 jobs:
   validate:
-    uses: nicodes/tools/.github/workflows/cookbook-ci.yml@061da6e56a06a629317536bf9482dab8a2ed6505
+    uses: nicodes/cookbook/.github/workflows/cookbook-ci.yml@bf42dc5a713550191a0b60cbb5ed7acb4f7c7095
     permissions:
       contents: read
       actions: read
       pull-requests: read
     with:
-      tools-ref: ${{ inputs.tools || '061da6e56a06a629317536bf9482dab8a2ed6505' }}
+      cookbook-ref: ${{ inputs.cookbook || 'bf42dc5a713550191a0b60cbb5ed7acb4f7c7095' }}
       source: ${{ inputs.source || github.sha }}
       merge-gate: ${{ vars.COOKBOOK_REQUEST_MERGE == 'enabled' }}
       recipe: rust-cli
