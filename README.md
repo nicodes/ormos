@@ -1,4 +1,4 @@
-<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 9824014c533a2f097b3e0385d4130ebceab4faa412417a6649577f31fb2b8480 -->
+<!-- Generated from private documentation source. Do not edit directly. Source SHA256: 913861cb7b24b6129141bb1a2b0688fed229b4eb62d277e11ca63be301b40669 -->
 
 # ormos
 
@@ -87,18 +87,18 @@ The terminal uses a blinking light-gray vertical-bar cursor.
 
 ## Contributor verification
 
-`mise.toml` pins contributor SDKs. The generated root Makefile selects an immutable shared cookbook revision and binds it to `cookbook.toml`.
+`mise.toml` pins contributor SDKs. The canonical generated task block in root `mise.toml` selects an immutable shared cookbook revision and binds it to `cookbook.toml`.
 
 ```sh
-make help
-make setup
-make build
-make test
+mise run help
+mise run setup
+mise run build
+mise run test
 ```
 
-`make help` works offline before setup. `make setup` explicitly prepares pinned SDKs, locked dependencies and declared fixtures. `make build` compiles and packages the native outputs, then validates their source and artifact identity. `make test` runs the implemented checks against those current-source outputs. Run build again after changing source; tests do not install tools or build missing shipping artifacts.
+`mise run help` works offline before setup. `mise run setup` explicitly prepares pinned SDKs, locked dependencies and declared fixtures. `mise run build` compiles and packages the native outputs, then validates their source and artifact identity. `mise run test` runs the implemented checks against those current-source outputs. Run build again after changing source; tests do not install tools or build missing shipping artifacts.
 
-Use `make fmt` to apply formatting, `make test:lint`, `make test:unit`, `make test:security` or `make test:integration` to select a group. `make test:e2e` runs the declared browser journeys. `make clean` removes declared generated outputs. Build and test evidence stays in `.artifacts/verification`.
+Use `mise run fmt` to apply formatting, `mise run test:lint`, `mise run test:unit`, `mise run test:security` or `mise run test:integration` to select a group. `mise run test:e2e` runs the declared browser journeys. `mise run clean` removes declared generated outputs. Build and test evidence stays in `.artifacts/verification`.
 
 Build owns the SolidJS export, Rust API payload, embedded launcher and current platform archive. The verified executable is `.artifacts/build/ormos`. CI retains all four Linux/macOS x86_64/arm64 archives and verifies their matching native launchers and APIs. Source, installer, embedded API, artifact contracts and browser Preview assertions remain product-owned. On Linux, static release builds require the declared musl C toolchain.
 
