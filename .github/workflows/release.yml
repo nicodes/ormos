@@ -154,7 +154,7 @@ jobs:
         if: runner.os == 'Windows' && steps.sdk-private-host.outputs.found != 'true'
         id: sdk-private-python
         timeout-minutes: 5
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         env:
           MISE_AUTO_INSTALL: 'false'
           MISE_EXEC_AUTO_INSTALL: 'false'
