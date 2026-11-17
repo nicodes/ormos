@@ -14,12 +14,12 @@ httpcontract = { git = "https://github.com/nicodes/tools", rev = "185fa0d4fd8086
 axum = "=0.8.9"
 base64 = "0.22"
 bytes = "1"
-chrono = { version = "0.4", features = ["serde"] }
 flate2 = "1"
 futures-util = { version = "0.3", features = ["sink"] }
 http-body = "1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["http1", "tokio", "service"] }
+jiff = { version = "1", default-features = false, features = ["std"] }
 libc = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "query"] }
 serde = { version = "1", features = ["derive"] }

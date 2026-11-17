@@ -98,6 +98,7 @@ impl Terminal {
                 Ok(())
             });
         }
+        let started = format!("{:.0}", jiff::Timestamp::now());
         let mut child = command
             .spawn()
             .map_err(|_| fail(500, "could not start terminal"))?;
@@ -112,7 +113,7 @@ impl Terminal {
                     id: format!("t_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]),
                     shell: shell.into(),
                     cwd: cwd.to_string_lossy().into(),
-                    started: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    started,
                     alive: true,
                 },
                 history: History::default(),
@@ -302,6 +303,11 @@ mod tests {
         let term = Terminal::spawn("/bin/sh", &std::env::temp_dir())
             .await
             .unwrap();
+        let started = term.info().started;
+        assert_eq!(started.len(), 20);
+        assert!(started.ends_with('Z'));
+        let timestamp: jiff::Timestamp = started.parse().unwrap();
+        assert_eq!(timestamp.subsec_nanosecond(), 0);
         term.resize(101, 31).unwrap();
         term.input(b"printf 'ormos-rust-pty-proof\\n'\n")
             .await
