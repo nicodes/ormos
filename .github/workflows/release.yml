@@ -20,9 +20,9 @@ jobs:
     name: Plan
     permissions:
       contents: read
-    uses: nicodes/cookbook/.github/workflows/select-cli-release.yml@0c2b3eae9744bb4d798297cb988ce934d9878086
+    uses: nicodes/cookbook/.github/workflows/select-cli-release.yml@878c66558effe5e0d6772873a96ed75a147ec525
     with:
-      cookbook-ref: 0c2b3eae9744bb4d798297cb988ce934d9878086
+      cookbook-ref: 878c66558effe5e0d6772873a96ed75a147ec525
       bump: ${{ inputs.bump }}
   validate:
     name: Test
@@ -31,9 +31,9 @@ jobs:
       contents: read
       actions: read
       pull-requests: read
-    uses: nicodes/cookbook/.github/workflows/build-and-test-native.yml@0c2b3eae9744bb4d798297cb988ce934d9878086
+    uses: nicodes/cookbook/.github/workflows/build-and-test-native.yml@878c66558effe5e0d6772873a96ed75a147ec525
     with:
-      cookbook-ref: 0c2b3eae9744bb4d798297cb988ce934d9878086
+      cookbook-ref: 878c66558effe5e0d6772873a96ed75a147ec525
       source: ${{ github.sha }}
       version: ${{ needs.identity.outputs.version }}
       date: ${{ needs.identity.outputs.date }}
@@ -53,7 +53,7 @@ jobs:
       artifact: ${{ steps.accepted.outputs.artifact-id }}
     env:
       SOURCE_SHA: ${{ github.sha }}
-      COOKBOOK_SHA: 0c2b3eae9744bb4d798297cb988ce934d9878086
+      COOKBOOK_SHA: 878c66558effe5e0d6772873a96ed75a147ec525
       RELEASE_TAG: ${{ needs.identity.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -78,13 +78,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: nicodes/cookbook
-          ref: 0c2b3eae9744bb4d798297cb988ce934d9878086
+          ref: 878c66558effe5e0d6772873a96ed75a147ec525
           path: .artifacts/recipe-sdks/_cookbook
           persist-credentials: false
       - name: Prepare separate immutable Cookbook and Tools sources
         uses: ./.artifacts/recipe-sdks/_cookbook/sdk-dependencies
         with:
-          cookbook-ref: 0c2b3eae9744bb4d798297cb988ce934d9878086
+          cookbook-ref: 878c66558effe5e0d6772873a96ed75a147ec525
       - name: Download this execution's complete source acceptance
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -116,8 +116,8 @@ jobs:
       contents: write
       actions: read
       attestations: read
-    uses: nicodes/cookbook/.github/workflows/publish-cli.yml@0c2b3eae9744bb4d798297cb988ce934d9878086
+    uses: nicodes/cookbook/.github/workflows/publish-cli.yml@878c66558effe5e0d6772873a96ed75a147ec525
     with:
-      cookbook-ref: 0c2b3eae9744bb4d798297cb988ce934d9878086
+      cookbook-ref: 878c66558effe5e0d6772873a96ed75a147ec525
       tag: ${{ needs.identity.outputs.tag }}
       artifact-id: ${{ needs.accept.outputs.artifact }}
