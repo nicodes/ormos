@@ -170,6 +170,7 @@ timeout = 300
 
 [ci]
 timeout_minutes = 45
+rust_lockfile_audit = "Linux/arm64"
 
 [publication]
 tag_prefix = "v"
