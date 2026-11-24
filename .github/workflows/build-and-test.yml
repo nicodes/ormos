@@ -72,21 +72,21 @@ jobs:
     steps:
       - name: Prepare
         timeout-minutes: 20
-        uses: nicodes/cookbook/prepare@2e53a2dc1a80631580cfba8b3611219de83c7ce1
+        uses: nicodes/cookbook/prepare@cfa5fe4222b25f58534314aff03da36eb0d3be59
         with:
-          cookbook-ref: ${{ inputs.cookbook || '2e53a2dc1a80631580cfba8b3611219de83c7ce1' }}
+          cookbook-ref: ${{ inputs.cookbook || 'cfa5fe4222b25f58534314aff03da36eb0d3be59' }}
           source: ${{ inputs.source || github.sha }}
           target: ${{ matrix.target }}
       - name: Build
         timeout-minutes: ${{ matrix.timeout_minutes }}
-        uses: nicodes/cookbook/build@2e53a2dc1a80631580cfba8b3611219de83c7ce1
+        uses: nicodes/cookbook/build@cfa5fe4222b25f58534314aff03da36eb0d3be59
       - name: Test
         timeout-minutes: ${{ matrix.timeout_minutes }}
-        uses: nicodes/cookbook/test@2e53a2dc1a80631580cfba8b3611219de83c7ce1
+        uses: nicodes/cookbook/test@cfa5fe4222b25f58534314aff03da36eb0d3be59
       - name: Finish
         if: always()
         timeout-minutes: 5
-        uses: nicodes/cookbook/finish@2e53a2dc1a80631580cfba8b3611219de83c7ce1
+        uses: nicodes/cookbook/finish@cfa5fe4222b25f58534314aff03da36eb0d3be59
         with:
           status: ${{ job.status }}
           entry: ${{ matrix.id }}
