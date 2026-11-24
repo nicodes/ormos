@@ -8,6 +8,13 @@ run-name: "Build and test · ${{ github.event.pull_request.number && format('PR 
     types: [checks_requested]
   push:
     branches: [main]
+    paths:
+      - '.github/workflows/build-and-test.yml'
+      - 'cookbook.toml'
+      - 'mise.toml'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '**/.cargo/config.toml'
   workflow_dispatch:
     inputs:
       source:
@@ -23,29 +30,63 @@ concurrency:
   group: ci-${{ github.ref }}-${{ inputs.source || 'current' }}
   cancel-in-progress: true
 jobs:
-  validate:
-    name: Test
-    uses: nicodes/cookbook/.github/workflows/build-and-test-native.yml@4c2fb54b5a1fea02173ff0ab6cdcca4f53664daf
+  build-test:
+    name: Build and test (${{ matrix.platform }}-${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: 1-Linux-x86_64
+            runner: ubuntu-24.04
+            platform: Linux
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+            timeout_minutes: 75
+          - id: 1-Linux-arm64
+            runner: ubuntu-24.04-arm
+            platform: Linux
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+            timeout_minutes: 30
+          - id: 1-Darwin-x86_64
+            runner: macos-15-intel
+            platform: Darwin
+            arch: x86_64
+            target: x86_64-apple-darwin
+            timeout_minutes: 30
+          - id: 1-Darwin-arm64
+            runner: macos-15
+            platform: Darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+            timeout_minutes: 30
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     permissions:
       contents: read
       actions: read
       pull-requests: read
-    with:
-      cookbook-ref: ${{ inputs.cookbook || '4c2fb54b5a1fea02173ff0ab6cdcca4f53664daf' }}
-      source: ${{ inputs.source || github.sha }}
-      runner: ubuntu-24.04
-      timeout-minutes: 45
-  build-test:
-    name: Build and test
-    if: always()
-    needs: [validate]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 1
-    permissions: {}
+    env:
+      COOKBOOK_VALIDATION_TIMEOUT: '45'
+      COOKBOOK_CANDIDATE_COMMIT: ${{ github.event.pull_request.head.sha || inputs.source || github.sha }}
     steps:
-      - name: Require the complete current source validation
-        timeout-minutes: 1
-        uses: nicodes/cookbook/ci-result@4c2fb54b5a1fea02173ff0ab6cdcca4f53664daf
+      - name: Prepare
+        timeout-minutes: 20
+        uses: nicodes/cookbook/prepare@2e53a2dc1a80631580cfba8b3611219de83c7ce1
         with:
-          event-name: ${{ github.event_name }}
-          needs: ${{ toJSON(needs) }}
+          cookbook-ref: ${{ inputs.cookbook || '2e53a2dc1a80631580cfba8b3611219de83c7ce1' }}
+          source: ${{ inputs.source || github.sha }}
+          target: ${{ matrix.target }}
+      - name: Build
+        timeout-minutes: ${{ matrix.timeout_minutes }}
+        uses: nicodes/cookbook/build@2e53a2dc1a80631580cfba8b3611219de83c7ce1
+      - name: Test
+        timeout-minutes: ${{ matrix.timeout_minutes }}
+        uses: nicodes/cookbook/test@2e53a2dc1a80631580cfba8b3611219de83c7ce1
+      - name: Finish
+        if: always()
+        timeout-minutes: 5
+        uses: nicodes/cookbook/finish@2e53a2dc1a80631580cfba8b3611219de83c7ce1
+        with:
+          status: ${{ job.status }}
+          entry: ${{ matrix.id }}

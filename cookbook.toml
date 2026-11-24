@@ -169,6 +169,7 @@ cwd = "app"
 timeout = 300
 
 [ci]
+single_job = true
 timeout_minutes = 45
 rust_lockfile_audit = "Linux/arm64"
 
