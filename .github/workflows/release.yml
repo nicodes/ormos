@@ -16,21 +16,188 @@ concurrency:
   group: release-${{ github.repository }}
   cancel-in-progress: false
 jobs:
-  prepare:
-    name: Prepare release
+  plan:
+    name: Plan release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      date: ${{ steps.identity.outputs.date }}
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      COOKBOOK_SHA: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      RELEASE_BUMP: ${{ inputs.bump }}
+      GH_TOKEN: ${{ github.token }}
+      MISE_GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Require an accepted provider and explicit source dispatch
+        run: |
+          set -euo pipefail
+          [[ "$COOKBOOK_SHA" =~ ^[a-f0-9]{40}$ && "$GITHUB_REF" == refs/heads/main && "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          relation="$(gh api "repos/nicodes/cookbook/compare/$COOKBOOK_SHA...main" --jq .status)"
+          [[ "$relation" == ahead || "$relation" == identical ]]
+      - name: Check out exact source data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Prepare the provider interpreter without caller configuration
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.13.11'
+          check-latest: false
+      - name: Check out accepted Cookbook
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: nicodes/cookbook
+          ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          path: .artifacts/recipe-sdks/_cookbook
+          persist-credentials: false
+      - name: Prepare separate immutable Cookbook and Tools sources
+        uses: ./.artifacts/recipe-sdks/_cookbook/sdk-dependencies
+        with:
+          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      - name: Prepare tools
+        uses: ./.artifacts/recipe-sdks/_cookbook/sdk-setup
+        with:
+          tools: python
+      - name: Prepare pinned Rust audit tools
+        timeout-minutes: 15
+        uses: ./.artifacts/recipe-sdks/_cookbook/sdk-setup
+        with:
+          tools: python rust cargo:cargo-audit
+      - name: Audit Rust lockfiles
+        timeout-minutes: 15
+        run: python3 -I -B -c 'import pathlib,runpy,sys;p=pathlib.Path(sys.argv[1]);sys.argv=sys.argv[1:];sys.path.insert(0,str(p.parent));runpy.run_path(str(p),run_name="__main__")' .artifacts/recipe-sdks/_cookbook/cookbook/native_ci.py audit --source "$SOURCE_SHA" --cookbook-ref "$COOKBOOK_SHA"
+      - name: Select unused native release identity without mutation
+        id: identity
+        run: python3 -I -B -c 'import pathlib,runpy,sys;p=pathlib.Path(sys.argv[1]);sys.argv=sys.argv[1:];sys.path.insert(0,str(p.parent));runpy.run_path(str(p),run_name="__main__")' .artifacts/recipe-sdks/_cookbook/cookbook/cli_release.py identity --source "$SOURCE_SHA" --cookbook-ref "$COOKBOOK_SHA" --bump "$RELEASE_BUMP"
+  build-test:
+    name: Build and test (${{ matrix.platform }}-${{ matrix.arch }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: 1-Linux-x86_64
+            runner: ubuntu-24.04
+            platform: Linux
+            arch: x86_64
+            target: x86_64-unknown-linux-musl
+            timeout_minutes: 45
+          - id: 1-Linux-arm64
+            runner: ubuntu-24.04-arm
+            platform: Linux
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+            timeout_minutes: 45
+          - id: 1-Darwin-x86_64
+            runner: macos-15-intel
+            platform: Darwin
+            arch: x86_64
+            target: x86_64-apple-darwin
+            timeout_minutes: 45
+          - id: 1-Darwin-arm64
+            runner: macos-15
+            platform: Darwin
+            arch: arm64
+            target: aarch64-apple-darwin
+            timeout_minutes: 45
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     permissions:
       contents: read
       actions: read
       pull-requests: read
-    uses: nicodes/cookbook/.github/workflows/prepare-cli-release.yml@cfa5fe4222b25f58534314aff03da36eb0d3be59
-    with:
-      cookbook-ref: cfa5fe4222b25f58534314aff03da36eb0d3be59
-      bump: ${{ inputs.bump }}
-      runner: ubuntu-24.04
-      timeout-minutes: 45
+    env:
+      COOKBOOK_VALIDATION_TIMEOUT: '45'
+      COOKBOOK_CANDIDATE_COMMIT: ${{ github.sha }}
+      COOKBOOK_NATIVE_RELEASE: 'true'
+    steps:
+      - name: Prepare
+        timeout-minutes: 20
+        uses: nicodes/cookbook/prepare@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        with:
+          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          source: ${{ github.sha }}
+          target: ${{ matrix.target }}
+          version: ${{ needs.plan.outputs.version }}
+          date: ${{ needs.plan.outputs.date }}
+      - name: Build
+        timeout-minutes: ${{ matrix.timeout_minutes }}
+        uses: nicodes/cookbook/build@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      - name: Test
+        timeout-minutes: ${{ matrix.timeout_minutes }}
+        uses: nicodes/cookbook/test@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      - name: Export native packet
+        timeout-minutes: 15
+        uses: nicodes/cookbook/export-native@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        with:
+          entry: ${{ matrix.id }}
+      - name: Finish
+        if: always()
+        timeout-minutes: 5
+        uses: nicodes/cookbook/finish@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        with:
+          status: ${{ job.status }}
+          entry: ${{ matrix.id }}
+  build-test-host:
+    name: Build and test (integration)
+    needs: [plan, build-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 105
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    env:
+      COOKBOOK_VALIDATION_TIMEOUT: '45'
+      COOKBOOK_CANDIDATE_COMMIT: ${{ github.sha }}
+      COOKBOOK_NATIVE_WAVE: host
+      COOKBOOK_NATIVE_RELEASE: 'true'
+    steps:
+      - name: Prepare
+        timeout-minutes: 20
+        uses: nicodes/cookbook/prepare@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        with:
+          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          source: ${{ github.sha }}
+          target: x86_64-unknown-linux-musl
+          version: ${{ needs.plan.outputs.version }}
+          date: ${{ needs.plan.outputs.date }}
+          advisories: run
+      - name: Import native packets
+        timeout-minutes: 15
+        uses: nicodes/cookbook/import-native@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      - name: Build
+        timeout-minutes: 105
+        uses: nicodes/cookbook/build@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      - name: Test
+        id: test
+        timeout-minutes: 105
+        uses: nicodes/cookbook/test@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      - name: Upload accepted outputs and fresh evidence
+        timeout-minutes: 15
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: cookbook-full-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.test.outputs.artifact-paths }}
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+      - name: Finish
+        if: always()
+        timeout-minutes: 5
+        uses: nicodes/cookbook/finish@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        with:
+          status: ${{ job.status }}
   accept:
     name: Attest archives
-    needs: prepare
+    needs: [plan, build-test-host]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -42,8 +209,8 @@ jobs:
       artifact: ${{ steps.accepted.outputs.artifact-id }}
     env:
       SOURCE_SHA: ${{ github.sha }}
-      COOKBOOK_SHA: cfa5fe4222b25f58534314aff03da36eb0d3be59
-      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      COOKBOOK_SHA: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Require an accepted provider and explicit source dispatch
@@ -67,13 +234,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: nicodes/cookbook
-          ref: cfa5fe4222b25f58534314aff03da36eb0d3be59
+          ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
           path: .artifacts/recipe-sdks/_cookbook
           persist-credentials: false
       - name: Prepare separate immutable Cookbook and Tools sources
         uses: ./.artifacts/recipe-sdks/_cookbook/sdk-dependencies
         with:
-          cookbook-ref: cfa5fe4222b25f58534314aff03da36eb0d3be59
+          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
       - name: Download this execution's complete source acceptance
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -100,13 +267,54 @@ jobs:
           retention-days: 7
   publish:
     name: Publish
-    needs: [prepare, accept]
+    needs: [plan, accept]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
       actions: read
       attestations: read
-    uses: nicodes/cookbook/.github/workflows/publish-cli.yml@cfa5fe4222b25f58534314aff03da36eb0d3be59
-    with:
-      cookbook-ref: cfa5fe4222b25f58534314aff03da36eb0d3be59
-      tag: ${{ needs.prepare.outputs.tag }}
-      artifact-id: ${{ needs.accept.outputs.artifact }}
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      COOKBOOK_SHA: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Require an accepted provider and explicit source dispatch
+        run: |
+          set -euo pipefail
+          [[ "$COOKBOOK_SHA" =~ ^[a-f0-9]{40}$ && "$GITHUB_REF" == refs/heads/main && "$GITHUB_EVENT_NAME" == workflow_dispatch ]]
+          relation="$(gh api "repos/nicodes/cookbook/compare/$COOKBOOK_SHA...main" --jq .status)"
+          [[ "$relation" == ahead || "$relation" == identical ]]
+      - name: Check out exact source data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Prepare the provider interpreter without caller configuration
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.13.11'
+          check-latest: false
+      - name: Check out accepted Cookbook
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: nicodes/cookbook
+          ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          path: .artifacts/recipe-sdks/_cookbook
+          persist-credentials: false
+      - name: Prepare separate immutable Cookbook and Tools sources
+        uses: ./.artifacts/recipe-sdks/_cookbook/sdk-dependencies
+        with:
+          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      - name: Download exactly the accepted caller artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          artifact-ids: ${{ needs.accept.outputs.artifact }}
+          path: .artifacts/cli-input/publication
+          merge-multiple: true
+      - name: Stage only admitted release data without overlaying source or providers
+        run: python3 -I -B -c 'import pathlib,runpy,sys;p=pathlib.Path(sys.argv[1]);sys.argv=sys.argv[1:];sys.path.insert(0,str(p.parent));runpy.run_path(str(p),run_name="__main__")' .artifacts/recipe-sdks/_cookbook/cookbook/cli_inputs.py --input publication
+      - name: Recheck exact source proof and publish immutable native bytes
+        run: python3 -I -B -c 'import pathlib,runpy,sys;p=pathlib.Path(sys.argv[1]);sys.argv=sys.argv[1:];sys.path.insert(0,str(p.parent));runpy.run_path(str(p),run_name="__main__")' .artifacts/recipe-sdks/_cookbook/cookbook/cli_release.py publish --source "$SOURCE_SHA" --cookbook-ref "$COOKBOOK_SHA" --tag "$RELEASE_TAG"
