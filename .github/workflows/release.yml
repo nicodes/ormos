@@ -46,7 +46,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Prepare the provider interpreter without caller configuration
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.13.11'
           check-latest: false
@@ -226,7 +226,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Prepare the provider interpreter without caller configuration
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.13.11'
           check-latest: false
@@ -293,7 +293,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
       - name: Prepare the provider interpreter without caller configuration
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
         with:
           python-version: '3.13.11'
           check-latest: false
