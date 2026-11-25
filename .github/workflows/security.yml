@@ -21,19 +21,19 @@ jobs:
     steps:
       - name: Prepare
         timeout-minutes: 20
-        uses: nicodes/cookbook/prepare@cfa5fe4222b25f58534314aff03da36eb0d3be59
+        uses: nicodes/cookbook/prepare@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
         with:
-          cookbook-ref: cfa5fe4222b25f58534314aff03da36eb0d3be59
+          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
           source: ${{ github.sha }}
           advisories: run
           target: x86_64-unknown-linux-musl
       - name: Audit
         timeout-minutes: 45
-        uses: nicodes/cookbook/security@cfa5fe4222b25f58534314aff03da36eb0d3be59
+        uses: nicodes/cookbook/security@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
       - name: Finish
         if: always()
         timeout-minutes: 5
-        uses: nicodes/cookbook/finish@cfa5fe4222b25f58534314aff03da36eb0d3be59
+        uses: nicodes/cookbook/finish@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
         with:
           status: ${{ job.status }}
       - name: Report failure
