@@ -28,7 +28,7 @@ jobs:
       date: ${{ steps.identity.outputs.date }}
     env:
       SOURCE_SHA: ${{ github.sha }}
-      COOKBOOK_SHA: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      COOKBOOK_SHA: 7020748ab255d1200661e64b554419ac3839e220
       RELEASE_BUMP: ${{ inputs.bump }}
       GH_TOKEN: ${{ github.token }}
       MISE_GITHUB_TOKEN: ${{ github.token }}
@@ -54,13 +54,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: nicodes/cookbook
-          ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          ref: 7020748ab255d1200661e64b554419ac3839e220
           path: .artifacts/recipe-sdks/_cookbook
           persist-credentials: false
       - name: Prepare separate immutable Cookbook and Tools sources
         uses: ./.artifacts/recipe-sdks/_cookbook/sdk-dependencies
         with:
-          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          cookbook-ref: 7020748ab255d1200661e64b554419ac3839e220
       - name: Prepare tools
         uses: ./.artifacts/recipe-sdks/_cookbook/sdk-setup
         with:
@@ -120,28 +120,28 @@ jobs:
     steps:
       - name: Prepare
         timeout-minutes: 20
-        uses: nicodes/cookbook/prepare@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/prepare@7020748ab255d1200661e64b554419ac3839e220
         with:
-          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          cookbook-ref: 7020748ab255d1200661e64b554419ac3839e220
           source: ${{ github.sha }}
           target: ${{ matrix.target }}
           version: ${{ needs.plan.outputs.version }}
           date: ${{ needs.plan.outputs.date }}
       - name: Build
         timeout-minutes: ${{ matrix.timeout_minutes }}
-        uses: nicodes/cookbook/build@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/build@7020748ab255d1200661e64b554419ac3839e220
       - name: Test
         timeout-minutes: ${{ matrix.timeout_minutes }}
-        uses: nicodes/cookbook/test@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/test@7020748ab255d1200661e64b554419ac3839e220
       - name: Export native packet
         timeout-minutes: 15
-        uses: nicodes/cookbook/export-native@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/export-native@7020748ab255d1200661e64b554419ac3839e220
         with:
           entry: ${{ matrix.id }}
       - name: Finish
         if: always()
         timeout-minutes: 5
-        uses: nicodes/cookbook/finish@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/finish@7020748ab255d1200661e64b554419ac3839e220
         with:
           status: ${{ job.status }}
           entry: ${{ matrix.id }}
@@ -162,9 +162,9 @@ jobs:
     steps:
       - name: Prepare
         timeout-minutes: 20
-        uses: nicodes/cookbook/prepare@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/prepare@7020748ab255d1200661e64b554419ac3839e220
         with:
-          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          cookbook-ref: 7020748ab255d1200661e64b554419ac3839e220
           source: ${{ github.sha }}
           target: x86_64-unknown-linux-musl
           version: ${{ needs.plan.outputs.version }}
@@ -172,14 +172,14 @@ jobs:
           advisories: run
       - name: Import native packets
         timeout-minutes: 15
-        uses: nicodes/cookbook/import-native@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/import-native@7020748ab255d1200661e64b554419ac3839e220
       - name: Build
         timeout-minutes: 105
-        uses: nicodes/cookbook/build@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/build@7020748ab255d1200661e64b554419ac3839e220
       - name: Test
         id: test
         timeout-minutes: 105
-        uses: nicodes/cookbook/test@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/test@7020748ab255d1200661e64b554419ac3839e220
       - name: Upload accepted outputs and fresh evidence
         timeout-minutes: 15
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
@@ -192,7 +192,7 @@ jobs:
       - name: Finish
         if: always()
         timeout-minutes: 5
-        uses: nicodes/cookbook/finish@2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+        uses: nicodes/cookbook/finish@7020748ab255d1200661e64b554419ac3839e220
         with:
           status: ${{ job.status }}
   accept:
@@ -209,7 +209,7 @@ jobs:
       artifact: ${{ steps.accepted.outputs.artifact-id }}
     env:
       SOURCE_SHA: ${{ github.sha }}
-      COOKBOOK_SHA: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      COOKBOOK_SHA: 7020748ab255d1200661e64b554419ac3839e220
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -234,13 +234,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: nicodes/cookbook
-          ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          ref: 7020748ab255d1200661e64b554419ac3839e220
           path: .artifacts/recipe-sdks/_cookbook
           persist-credentials: false
       - name: Prepare separate immutable Cookbook and Tools sources
         uses: ./.artifacts/recipe-sdks/_cookbook/sdk-dependencies
         with:
-          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          cookbook-ref: 7020748ab255d1200661e64b554419ac3839e220
       - name: Download this execution's complete source acceptance
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -276,7 +276,7 @@ jobs:
       attestations: read
     env:
       SOURCE_SHA: ${{ github.sha }}
-      COOKBOOK_SHA: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+      COOKBOOK_SHA: 7020748ab255d1200661e64b554419ac3839e220
       RELEASE_TAG: ${{ needs.plan.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -301,13 +301,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: nicodes/cookbook
-          ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          ref: 7020748ab255d1200661e64b554419ac3839e220
           path: .artifacts/recipe-sdks/_cookbook
           persist-credentials: false
       - name: Prepare separate immutable Cookbook and Tools sources
         uses: ./.artifacts/recipe-sdks/_cookbook/sdk-dependencies
         with:
-          cookbook-ref: 2cdbf56cda3ed37d78be1b4e58cfe7ffcb943854
+          cookbook-ref: 7020748ab255d1200661e64b554419ac3839e220
       - name: Download exactly the accepted caller artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
